@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "vbn"
+version = "0.1.0"
+description = "Vectorized Bayesian Networks in PyTorch with TensorDict: mixed discrete/continuous CPDs, batched training, interventions, and inference."
+readme = "README.md"
+authors = [{name = "Giovanni Briglia"}]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+"torch>=2.2",
+"tensordict>=0.4.0",
+"networkx>=3.0",
+"numpy>=1.23",
+"matplotlib>=3.7",
+]
+
+
+[project.optional-dependencies]
+plots = ["seaborn>=0.12"]
+bench = ["pgmpy>=0.1.24"]
+dev = ["pytest>=7.0", "ruff>=0.5", "black>=24.0", "mypy>=1.8"]
+
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = {find = {where = ["src"], include=["vbn*"]}}
+
+
+[project.scripts]
+cbn-benchmark = "vbn.cli:benchmark"
