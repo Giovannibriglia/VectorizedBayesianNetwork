@@ -25,11 +25,6 @@ Fast, modular Bayesian Networks for **discrete** and **continuous** data — wit
 * [Why VBN?](#why-vbn)
 * [Quickstart](#quickstart)
 * [Repo Layout](#repo-layout)
-* [Learning](#learning)
-* [Inference (with `do`)](#inference-with-do)
-* [Save / Load](#save--load)
-* [Plotting](#plotting)
-* [Advanced](#advanced)
 * [Troubleshooting](#troubleshooting)
 * [Citation](#citation)
 
@@ -68,7 +63,7 @@ cards = {"X":3, "Z":2, "Y":4}
 bn = CausalBayesNet(G, types, cards)
 
 # Data
-N = 20_000
+N = 4096
 data = {
     "X": torch.randint(0,3,(N,)),
     "Z": torch.randint(0,2,(N,)),
