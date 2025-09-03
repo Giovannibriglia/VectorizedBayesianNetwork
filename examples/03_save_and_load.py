@@ -26,8 +26,8 @@ A = 1.0 * Y.float() + torch.randn(N) * 0.5
 df = pd.DataFrame({"X": X.numpy(), "Z": Z.numpy(), "Y": Y.numpy(), "A": A.numpy()})
 
 # Fit both discrete+continuous
-lp_disc = bn.fit_discrete_mle(df)
-lp_lg = bn.fit_continuous_gaussian(df)
+lp_disc = bn.fit("discrete_mle", df)
+lp_lg = bn.fit("continuous_gaussian", df)
 
 # Merge (optional): last-wins if overlapping families (here there is no conflict)
 from vbn.core import merge_learnparams

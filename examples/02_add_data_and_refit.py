@@ -25,8 +25,8 @@ A0 = 0.9 * Y0.float() + torch.randn(N0) * 0.6
 df0 = pd.DataFrame({"X": X0.numpy(), "Z": Z0.numpy(), "Y": Y0.numpy(), "A": A0.numpy()})
 
 # Fit once (discrete + LG)
-lp_disc = bn.fit_discrete_mle(df0)
-lp_lg = bn.fit_continuous_gaussian(df0)
+lp_disc = bn.fit("discrete_mle", df0)
+lp_lg = bn.fit("continuous_gaussian", df0)
 
 # ---------- add new data in three ways ----------
 # (1) pandas DataFrame

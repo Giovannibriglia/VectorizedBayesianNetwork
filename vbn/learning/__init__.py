@@ -1,4 +1,3 @@
-# vbn/learning.py
 from .continuous_mlp import ContinuousMLPLearner, materialize_lg_from_cont_mlp
 from .discrete_mle import DiscreteMLELearner
 from .discrete_mlp import DiscreteMLPLearner

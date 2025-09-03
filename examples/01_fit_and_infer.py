@@ -31,27 +31,29 @@ df = pd.DataFrame({"X": X.numpy(), "Z": Z.numpy(), "Y": Y.numpy(), "A": A.numpy(
 
 # ==================================================
 # 1) DISCRETE: tabular MLE
-lp_disc_mle: LearnParams = bn.fit_discrete_mle(df)
+lp_disc_mle: LearnParams = bn.fit("discrete_mle", df)
 print("[discrete MLE] tables:", list(lp_disc_mle.discrete_tables.keys()))
 
 # 2) DISCRETE: neural CPDs → materialize tabular
-lp_disc_mlp: LearnParams = bn.fit_discrete_mlp(df, hidden=64, epochs=5)
-lp_disc_mlp = bn.materialize_discrete_mlp(lp_disc_mlp)  # create tables
+lp_disc_mlp: LearnParams = bn.fit("discrete_mlp", df, hidden=64, epochs=5)
+lp_disc_mlp = bn.materialize("discrete_mlp", lp_disc_mlp)  # create tables
 print("[discrete MLP→tables] tables:", list(lp_disc_mlp.discrete_tables.keys()))
 
 # 3) CONTINUOUS: exact linear-Gaussian
-lp_cont_lg: LearnParams = bn.fit_continuous_gaussian(df)
+lp_cont_lg: LearnParams = bn.fit("continuous_gaussian", df)
 print("[continuous LG] nodes:", lp_cont_lg.lg.order if lp_cont_lg.lg else None)
 
 # 4) CONTINUOUS: MLP heads → materialize LG
-lp_cont_mlp: LearnParams = bn.fit_continuous_mlp(df, hidden=64, epochs=5)
-lp_cont_mlp = bn.materialize_lg_from_cont_mlp(lp_cont_mlp, data=df)
+lp_cont_mlp: LearnParams = bn.fit("continuous_mlp_gaussian", df, hidden=64, epochs=5)
+lp_cont_mlp = bn.materialize("continuous_mlp_gaussian", lp_cont_mlp, data=df)
 print("[continuous MLP→LG] nodes:", lp_cont_mlp.lg.order if lp_cont_mlp.lg else None)
 
 # ==================================================
 # Inference examples
 # (a) exact variable elimination on the discrete subgraph
-post_exact = bn.infer_discrete_exact(
+discrete_exact_inference = bn.setup_inference("discrete_exact")
+post_exact = bn.infer(
+    discrete_exact_inference,
     lp=lp_disc_mle,
     evidence={"X": torch.tensor([1]), "Z": torch.tensor([0])},
     query=["Y"],
@@ -59,17 +61,20 @@ post_exact = bn.infer_discrete_exact(
 print("[inference discrete exact] P(Y | X=1,Z=0):", post_exact["Y"].softmax(-1))
 
 # (b) approximate discrete (sampling) with do-intervention
-post_approx = bn.infer_discrete_approx(
+discrete_approx_inference = bn.setup_inference("discrete_approx")
+post_approx = bn.infer(
+    inference_obj=discrete_approx_inference,
     lp=lp_disc_mle,
-    evidence={"X": torch.tensor([1])},
+    evidence={"X": torch.tensor([1]), "Z": torch.tensor([0])},
     query=["Y"],
-    do={"Z": torch.tensor([1])},
-    num_samples=2000,
+    num_samples=1024,
 )
 print("[inference discrete approx] P(Y | X=1, do(Z=1)):", post_approx["Y"].softmax(-1))
 
 # (c) continuous exact Gaussian posterior: predict A given Y
-gauss_post = bn.infer_continuous_gaussian(
+continuous_gaussian_inference = bn.setup_inference("continuous_gaussian")
+gauss_post = bn.infer(
+    inference_obj=continuous_gaussian_inference,
     lp=lp_cont_lg,
     evidence={"Y": torch.tensor([2.0])},
     query=["A"],
@@ -81,14 +86,19 @@ print(f"[inference LG] A | Y=2 -> mean={float(mu_A):.3f}, std={float(std_A):.3f}
 lp_hybrid = merge_learnparams(lp_disc_mle, lp_cont_mlp)
 
 # (c) continuous exact Gaussian posterior (unchanged)
-gauss_post = bn.infer_continuous_gaussian(
-    lp=lp_cont_lg, evidence={"Y": torch.tensor([2.0])}, query=["A"]
+gauss_post = bn.infer(
+    continuous_gaussian_inference,
+    lp=lp_cont_lg,
+    evidence={"Y": torch.tensor([2.0])},
+    query=["A"],
 )
 mu_A, std_A = unpack_gaussian(gauss_post, "A")
 print(f"[inference LG] A | Y=2 -> mean={float(mu_A):.3f}, std={float(std_A):.3f}")
 
 # (d) continuous approximate — use the merged params that INCLUDE discrete CPDs
-gauss_approx = bn.infer_continuous_approx(
+continuous_approx_inference = bn.setup_inference("continuous_approx")
+gauss_approx = bn.infer(
+    continuous_approx_inference,
     lp=lp_hybrid,
     evidence={"Y": torch.tensor([3.0])},
     query=["A"],

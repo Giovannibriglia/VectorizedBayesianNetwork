@@ -45,7 +45,7 @@ class ContinuousMLPLearner(nn.Module):
         hidden: int = 128,
         n_layers: int = 3,
         lr: float = 1e-3,
-        epochs: int = 30,
+        epochs: int = 100,
         batch_size: int = 4096,
         dropout: float = 0.0,
         device=None,

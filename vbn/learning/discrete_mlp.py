@@ -46,7 +46,7 @@ class DiscreteMLPLearner(nn.Module):
         hidden: int = 64,
         n_layers: int = 2,
         lr: float = 1e-3,
-        epochs: int = 20,
+        epochs: int = 100,
         batch_size: int = 2048,
         dropout: float = 0.0,
         device=None,

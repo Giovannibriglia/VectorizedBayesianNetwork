@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
+
 TDLike = Union[TensorDict, Dict[str, torch.Tensor], pd.DataFrame]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,121 +142,94 @@ class CausalBayesNet:
                 out[k] = t.to(self.device).float()
         return out
 
-    def fit_discrete_mle(self, data: TDLike, **kw) -> LearnParams:
-        from .learning.discrete_mle import DiscreteMLELearner
+    def fit(self, method: str, data: TDLike, **kw) -> LearnParams:
+        from vbn import learning
 
-        data = self._normalize_fit_input(data)
-        return DiscreteMLELearner(
-            self.meta, device=self.device, dtype=self.dtype, **kw
-        ).fit(data)
+        if method == "discrete_mle":
+            return learning.DiscreteMLELearner(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            ).fit(data)
+        elif method == "discrete_mlp":
+            data = self._normalize_fit_input(data)
+            return learning.DiscreteMLPLearner(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            ).fit(data)
+        elif method == "continuous_gaussian":
+            data = self._normalize_fit_input(data)
+            return learning.GaussianLinearLearner(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            ).fit(data)
+        elif method == "continuous_mlp_gaussian":
+            data = self._normalize_fit_input(data)
+            return learning.ContinuousMLPLearner(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            ).fit(data)
+        else:
+            raise NotImplementedError(method)
 
-    def fit_discrete_mlp(self, data: TDLike, **kw) -> LearnParams:
-        from .learning.discrete_mlp import DiscreteMLPLearner
+    def materialize(self, method: str, lp: LearnParams, **kw) -> LearnParams:
+        from vbn import learning
 
-        data = self._normalize_fit_input(data)
-        return DiscreteMLPLearner(
-            self.meta, device=self.device, dtype=self.dtype, **kw
-        ).fit(data)
+        if method == "discrete_mlp":
+            return learning.DiscreteMLPLearner(
+                self.meta, device=self.device, dtype=self.dtype
+            ).materialize_tables(lp)
+        elif method == "continuous_mlp_gaussian":
+            pivot = kw.get("pivot", None)
+            data = kw.get("data", None)
+            norm_pivot = (
+                None
+                if pivot is None
+                else {
+                    k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
+                    for k, v in pivot.items()
+                }
+            )
+            norm_data = None if data is None else self._normalize_fit_input(data)
+            return learning.continuous_mlp.materialize_lg_from_cont_mlp(
+                lp, pivot=norm_pivot, data=norm_data
+            )
+        else:
+            raise NotImplementedError(method)
 
-    def fit_continuous_gaussian(self, data: TDLike, **kw) -> LearnParams:
-        from .learning.gaussian_linear import GaussianLinearLearner
+    def setup_inference(self, method: str, **kw):
+        from vbn import inference
 
-        data = self._normalize_fit_input(data)
-        return GaussianLinearLearner(
-            self.meta, device=self.device, dtype=self.dtype, **kw
-        ).fit(data)
+        if method == "discrete_exact":
+            return inference.DiscreteExactVEInference(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            )
+        elif method == "continuous_gaussian":
+            return inference.ContinuousLGInference(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            )
+        elif method == "discrete_approx":
+            return inference.DiscreteApproxInference(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            )
+        elif method == "continuous_approx":
+            return inference.ContinuousApproxInference(
+                self.meta, device=self.device, dtype=self.dtype, **kw
+            )
+        else:
+            raise NotImplementedError(method)
 
-    def fit_continuous_mlp(self, data: TDLike, **kw) -> LearnParams:
-        from .learning.continuous_mlp import ContinuousMLPLearner
-
-        data = self._normalize_fit_input(data)
-        return ContinuousMLPLearner(
-            self.meta, device=self.device, dtype=self.dtype, **kw
-        ).fit(data)
-
-    def materialize_discrete_mlp(self, lp: LearnParams) -> LearnParams:
-        from .learning.discrete_mlp import DiscreteMLPLearner
-
-        return DiscreteMLPLearner(
-            self.meta, device=self.device, dtype=self.dtype
-        ).materialize_tables(lp)
-
-    def materialize_lg_from_cont_mlp(
-        self,
+    @staticmethod
+    def infer(
+        inference_obj,
         lp: LearnParams,
-        pivot: Optional[Dict[str, torch.Tensor]] = None,
-        data: Optional[Dict[str, torch.Tensor] | pd.DataFrame] = None,
-    ) -> LearnParams:
-        from .learning.continuous_mlp import materialize_lg_from_cont_mlp as _mat
-
-        norm_pivot = (
-            None
-            if pivot is None
-            else {
-                k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
-                for k, v in pivot.items()
-            }
+        evidence: Dict[str, torch.Tensor],
+        query: List[str],
+        do: Optional[Dict[str, torch.Tensor]] = None,
+        return_samples: bool = False,
+        **kw,
+    ):
+        return inference_obj.posterior(
+            lp, evidence, query, do=do, return_samples=return_samples, **kw
         )
-        norm_data = None if data is None else self._normalize_fit_input(data)
-        return _mat(lp, pivot=norm_pivot, data=norm_data)
 
-    def infer_discrete_exact(
-        self,
-        lp: LearnParams,
-        evidence: Dict[str, torch.Tensor],
-        query: List[str],
-        do: Optional[Dict[str, torch.Tensor]] = None,
-    ):
-        from .inference.discrete_exact import DiscreteExactVEInference
-
-        return DiscreteExactVEInference(
-            self.meta, device=self.device, dtype=self.dtype
-        ).posterior(lp, evidence, query, do=do)
-
-    def infer_discrete_approx(
-        self,
-        lp: LearnParams,
-        evidence: Dict[str, torch.Tensor],
-        query: List[str],
-        do: Optional[Dict[str, torch.Tensor]] = None,
-        **kw,
-    ):
-        from .inference.discrete_approx import DiscreteApproxInference
-
-        return DiscreteApproxInference(
-            self.meta, device=self.device, dtype=self.dtype, **kw
-        ).posterior(lp, evidence, query, do=do)
-
-    def infer_continuous_gaussian(
-        self,
-        lp: LearnParams,
-        evidence: Dict[str, torch.Tensor],
-        query: List[str],
-        do: Optional[Dict[str, torch.Tensor]] = None,
-    ):
-        from .inference.continuous_gaussian import ContinuousLGInference
-
-        return ContinuousLGInference(
-            self.meta, device=self.device, dtype=self.dtype
-        ).posterior(lp, evidence, query, do=do)
-
-    def infer_continuous_approx(
-        self,
-        lp: LearnParams,
-        evidence: Dict[str, torch.Tensor],
-        query: List[str],
-        do: Optional[Dict[str, torch.Tensor]] = None,
-        **kw,
-    ):
-        from .inference.continuous_approx import ContinuousApproxInference
-
-        return ContinuousApproxInference(
-            self.meta, device=self.device, dtype=self.dtype, **kw
-        ).posterior(lp, evidence, query, do=do)
-
-        # --- IO helpers ---
-
-    def save_params(self, lp: LearnParams, path: str) -> None:
+    @staticmethod
+    def save_params(lp: LearnParams, path: str) -> None:
         from .io import save_learnparams
 
         save_learnparams(path, lp)

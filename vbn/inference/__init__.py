@@ -1,4 +1,3 @@
-# vbn/inference/__init__.py
 from .continuous_approx import ContinuousApproxInference
 from .continuous_gaussian import ContinuousLGInference
 from .discrete_approx import DiscreteApproxInference

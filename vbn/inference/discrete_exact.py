@@ -8,9 +8,12 @@ import torch.nn.functional as F
 from .. import utils as U
 from ..core import BNMeta, LearnParams
 
+from .base import BaseInference
 
-class DiscreteExactVEInference:
-    def __init__(self, meta: BNMeta, device=None, dtype=torch.float32):
+
+class DiscreteExactVEInference(BaseInference):
+    def __init__(self, meta: BNMeta, device=None, dtype=torch.float32, **kwargs):
+        super().__init__(meta, device, dtype)
         self.meta = meta
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -24,7 +27,12 @@ class DiscreteExactVEInference:
         evidence: Dict[str, torch.Tensor],
         query: List[str],
         do: Optional[Dict[str, torch.Tensor]] = None,
+        return_samples: bool = False,
+        **kwargs,
     ):
+
+        num_samples = kwargs.get("num_samples", 512)
+
         assert lp.discrete_tables is not None, "Need tabular CPDs."
         do = do or {}
         # Build factors
@@ -54,7 +62,7 @@ class DiscreteExactVEInference:
                 else:
                     # batched delta: [B, C]
                     t = F.one_hot(val, num_classes=C).to(self.dtype)
-                factors[child] = t if B is None else t  # [C] or [B, C]
+                factors[child] = t  # [C] or [B, C]
                 var_axes[child] = [child]
                 continue
 
@@ -84,7 +92,8 @@ class DiscreteExactVEInference:
                         t = t.unsqueeze(0).expand(B, *t.shape)
                     t = t.movedim(1 + ax, -1)
                     t = t.gather(
-                        -1, idx.view(B, *([1] * (t.ndim - 2)), 1).expand_as(t[..., :1])
+                        -1,
+                        idx.view(B, *([1] * (t.ndim - 2)), 1).expand_as(t[..., :1]),
                     ).squeeze(-1)
                     factors[name] = t
                 else:
@@ -93,7 +102,7 @@ class DiscreteExactVEInference:
                 va.pop(ax)
                 var_axes[name] = va
 
-        # Eliminate non-query, non-evidence variables (do-variables are fine to eliminate; delta enforces value)
+        # Eliminate non-query, non-evidence variables
         qset, eset = set(query), set([k for k in evidence.keys() if k not in do])
         elim = [
             v
@@ -124,17 +133,16 @@ class DiscreteExactVEInference:
         )
 
         # Compute each query marginal directly (sum out everything else), no reshape.
-        out = {}
+        out: Dict[str, torch.Tensor] = {}
         if not query:
-            return out
+            return out if not return_samples else (out, {})
 
         base = 1 if B else 0
         axes_set = set(axes)
 
         for q in query:
             if q not in axes_set:
-                # If a query got fully summed out (shouldn't happen in a proper graph),
-                # fall back to a uniform over its card to stay sane.
+                # If a query got fully summed out, fall back to uniform over its card
                 card_q = int(self.meta.cards[q])
                 if B is None:
                     out[q] = torch.full(
@@ -146,7 +154,6 @@ class DiscreteExactVEInference:
                     )
                 continue
 
-            # aq = axes.index(q)
             # Sum over all NON-q variable axes
             sum_dims = [base + i for i, a in enumerate(axes) if a != q]
             marg = t if not sum_dims else t.sum(dim=tuple(sum_dims))
@@ -155,4 +162,23 @@ class DiscreteExactVEInference:
             marg = marg / denom  # [B?, card_q]
             out[q] = marg
 
-        return out
+        if not return_samples:
+            return out
+
+        # ---- sampling from marginals (independent across queries) ----
+        if num_samples <= 0:
+            num_samples = 1
+        samples: Dict[str, torch.Tensor] = {}
+        for q, probs in out.items():
+            if probs.ndim == 1:  # [C]
+                samp = torch.multinomial(
+                    probs, num_samples=num_samples, replacement=True
+                )  # [n_samples]
+            else:  # [B, C]
+                # torch.multinomial vectorized over rows -> [B, n_samples]
+                samp = torch.multinomial(
+                    probs, num_samples=num_samples, replacement=True
+                )
+            samples[q] = samp.to(self.device)
+
+        return out, samples

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 
 # ───────── general helpers ─────────
@@ -181,3 +182,45 @@ def unpack_gaussian(result, var_name: str):
         var_tensor = cov[..., 0, 0].squeeze()
     std = var_tensor.clamp_min(0).sqrt()
     return mu, std
+
+
+def infer_types_and_cards(data, threshold_unique=20):
+    """
+    Infer variable types and cardinalities from data.
+
+    Args:
+        data (dict | pd.DataFrame):
+            Mapping from variable name -> tensor/series/array.
+        threshold_unique (int):
+            If a variable has <= threshold_unique unique values, treat it as discrete.
+            Otherwise, continuous.
+
+    Returns:
+        types (dict): {var: "discrete"/"continuous"}
+        cards (dict): {var: cardinality (only for discrete vars)}
+    """
+    types, cards = {}, {}
+
+    for var, values in data.items():
+        # Convert pandas -> numpy
+        if isinstance(values, pd.Series):
+            values = values.values
+        # Convert to torch tensor if not already
+        if not isinstance(values, torch.Tensor):
+            values = torch.as_tensor(values)
+
+        unique_vals = torch.unique(values)
+
+        if values.dtype in (torch.float32, torch.float64):
+            # Heuristic: treat small set of unique values as categorical
+            if unique_vals.numel() <= threshold_unique:
+                types[var] = "discrete"
+                cards[var] = unique_vals.numel()
+            else:
+                types[var] = "continuous"
+        else:
+            # For integer/bool types → always discrete
+            types[var] = "discrete"
+            cards[var] = unique_vals.numel()
+
+    return types, cards
