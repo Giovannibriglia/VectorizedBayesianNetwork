@@ -41,60 +41,19 @@ Fast, modular Bayesian Networks for **discrete** and **continuous** data — wit
 
 ---
 
-## Why VBN?
-
-* **One pass per node, not per data point**: continuous exact inference uses canonical Gaussians (single Cholesky).
-* **Vectorized**: batched evidences and sampled particles fly through the graph in parallel.
-* **Neural CPDs**: categorical MLPs for discrete nodes; Gaussian MLPs (mean/logvar) for continuous nodes.
-* **Interventions everywhere**: `do(...)` cuts edges and clamps values consistently across backends.
-
----
 
 ## Quickstart
 
-```python
-import networkx as nx, torch
-from vbn.core import CausalBayesNet, merge_learnparams
+We provide three example scripts in `examples/`:
 
-# Graph
-G = nx.DiGraph([("X","Y"), ("Z","Y"), ("Y","A"), ("X","A")])
-types = {"X":"discrete","Z":"discrete","Y":"discrete","A":"continuous"}
-cards = {"X":3, "Z":2, "Y":4}
-bn = CausalBayesNet(G, types, cards)
+1. **01\_fit\_and\_infer.py** – learn discrete and continuous CPDs (MLE, MLP, linear-Gaussian) on synthetic data and run exact/approximate inference.
+2. **02\_add\_data\_and\_refit.py** – update a fitted model with new data (DataFrame, dict, or TensorDict) and incrementally refit parameters.
+3. **03\_save\_and\_load.py** – save learned parameters to disk, reload them, and plot CPDs from the saved model.
 
-# Data
-N = 4096
-data = {
-    "X": torch.randint(0,3,(N,)),
-    "Z": torch.randint(0,2,(N,)),
-    "Y": torch.randint(0,4,(N,)),
-    "A": torch.randn(N) + 0.3,
-}
+Run any example with:
 
-# Learn
-lp_disc = bn.fit_discrete_mle(data, laplace_alpha=0.5)       # tabular CPDs
-lp_cont = bn.fit_continuous_mlp(data, epochs=10, hidden=64)  # Gaussian MLPs
-lp_all  = merge_learnparams(lp_disc, lp_cont)
-
-# Discrete exact (with do)
-postY = bn.infer_discrete_exact(lp_disc,
-                                evidence={"Z": torch.tensor(1)},
-                                query=["Y"],
-                                do={"X": torch.tensor(2)})
-
-# Continuous exact Gaussian (linearize the MLPs → LG once)
-lp_lg = bn.materialize_lg_from_cont_mlp(lp_cont, data=data)
-mu, cov = bn.infer_continuous_gaussian(lp_lg,
-                                       evidence={"A": torch.tensor(1.0)},
-                                       query=["A"],
-                                       do={"A": torch.tensor(0.5)})
-
-# Continuous approximate (works directly on MLPs + discrete CPDs)
-postA = bn.infer_continuous_approx(lp_all,
-                                   evidence={"Z": torch.tensor(1)},
-                                   query=["A"],
-                                   do={"X": torch.tensor(2)},
-                                   num_samples=4096)
+```bash
+python examples/01_fit_and_infer.py
 ```
 
 ---
@@ -102,11 +61,15 @@ postA = bn.infer_continuous_approx(lp_all,
 ## Repo Layout
 
 ```
+examples/
+  01_fit_and_infer.py
+  02_add_data_and_refit.py
+  03_save_and_load.py
 vbn/
   core.py           # BNMeta, LearnParams, CausalBayesNet facade, merge_learnparams(...)
   utils.py          # vectorized helpers (factor ops, pivots, pdfs)
   io.py             # save/load LearnParams (TensorDict-friendly)
-  plot.py           # DAG, CPDs, posteriors, LG params, diagnostics
+  plotting.py           # DAG, CPDs, posteriors, LG params, diagnostics
 
   learning/
     discrete_mle.py       # Maximum-likelihood tabular CPDs (Laplace smoothing)

@@ -1,4 +1,5 @@
 import networkx as nx
+import pandas as pd
 import torch
 from vbn.core import CausalBayesNet, merge_learnparams
 from vbn.plotting import (
@@ -22,8 +23,20 @@ data = {
     "X": torch.randint(0, 3, (N,)),
     "Z": torch.randint(0, 2, (N,)),
     "Y": torch.randint(0, 4, (N,)),
-    "A": torch.randn(N) + 0.3,
 }
+# append a dict
+bn.add_data(
+    {
+        "X": torch.randint(0, 3, (1000,)),
+        "Z": torch.randint(0, 2, (1000,)),
+        "Y": torch.randint(0, 4, (1000,)),
+    },
+    update_params=True,
+)
+
+# append a DataFrame
+df = pd.DataFrame({"X": [0, 1, 2], "Z": [1, 0, 1], "Y": [3, 2, 1]})
+bn.add_data(df, update_params=True)
 
 # Learn discrete MLE (tabular)
 lp_disc = bn.fit_discrete_mle(data, laplace_alpha=0.5)

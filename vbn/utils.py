@@ -2,13 +2,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 # ───────── general helpers ─────────
-
-
-def to_long(x: torch.Tensor) -> torch.Tensor:
-    return x if x.dtype == torch.long else x.to(torch.long)
 
 
 def make_strides(cards: List[int]) -> List[int]:
@@ -135,3 +132,52 @@ def normal_pdf(
     x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor, eps: float = 1e-12
 ) -> torch.Tensor:
     return torch.exp(normal_logpdf(x, mean, var, eps))
+
+
+def to_long(x):
+    # Accept torch.Tensor, pandas.Series, numpy arrays, lists
+    if not isinstance(x, torch.Tensor):
+        # pandas Series / numpy arrays / lists → numpy array → tensor
+        x = torch.as_tensor(np.asarray(x))
+    return x.long()
+
+
+def to_float(x, dtype: torch.dtype = torch.float32):
+    if not isinstance(x, torch.Tensor):
+        x = torch.as_tensor(np.asarray(x))
+    # Keep device if already a tensor with device; otherwise default cpu
+    return x.to(dtype)
+
+
+def unpack_gaussian(result, var_name: str):
+    """
+    Supports two shapes:
+      1) (mean_dict, cov_matrix)   – your current return
+      2) {var: {"mean": ..., "std": ...}} – future/dict style
+    Returns: (mean, std) as 1D tensors (squeezed).
+    """
+    # Case 2: dict-of-dicts
+    if (
+        isinstance(result, dict)
+        and var_name in result
+        and isinstance(result[var_name], dict)
+    ):
+        mu = result[var_name]["mean"].squeeze()
+        std = result[var_name]["std"].squeeze()
+        return mu, std
+
+    # Case 1: tuple -> (mean_dict, cov)
+    mean_dict, cov = result  # means is a dict[str, Tensor]; cov is a Tensor or dict
+    mu = mean_dict[var_name].squeeze()
+
+    # cov can be:
+    #  - a full matrix (… x k x k) for the queried vars in the same order you passed
+    #  - a dict[var] -> variance
+    if isinstance(cov, dict):
+        var_tensor = cov[var_name].squeeze()
+    else:
+        # If you queried a single variable like ["A"], it's the [0,0] entry.
+        # Handle possible batch dims with ellipsis.
+        var_tensor = cov[..., 0, 0].squeeze()
+    std = var_tensor.clamp_min(0).sqrt()
+    return mu, std
