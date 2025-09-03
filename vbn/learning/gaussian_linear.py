@@ -12,16 +12,15 @@ from ..core import BNMeta, LearnParams, LGParams
 class GaussianLinearLearner(torch.nn.Module):
     """Per-node linear regression y = b + W_par^T x_par + eps, eps~N(0, sigma2)."""
 
-    def __init__(
-        self, meta: BNMeta, ridge: float = 1e-6, device=None, dtype=torch.float32
-    ):
+    def __init__(self, meta: BNMeta, device=None, dtype=torch.float32, **kwargs):
         super().__init__()
         self.meta = meta
-        self.ridge = ridge
+
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.dtype = dtype
+        self.ridge = kwargs.get("ridge", 1e-6)
 
     @torch.no_grad()
     def fit(self, data: Dict[str, torch.Tensor]) -> LearnParams:

@@ -43,27 +43,23 @@ class DiscreteMLPLearner(nn.Module):
     def __init__(
         self,
         meta: BNMeta,
-        hidden: int = 64,
-        n_layers: int = 2,
-        lr: float = 1e-3,
-        epochs: int = 100,
-        batch_size: int = 2048,
-        dropout: float = 0.0,
         device=None,
         dtype=torch.float32,
+        **kwargs,
     ):
         super().__init__()
         self.meta = meta
-        self.hidden = hidden
-        self.n_layers = n_layers
-        self.lr = lr
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.dropout = dropout
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.dtype = dtype
+
+        self.hidden = kwargs.get("hidden", 128)
+        self.n_layers = kwargs.get("n_layers", 3)
+        self.lr = kwargs.get("lr", 1e-3)
+        self.epochs = kwargs.get("epochs", 50)
+        self.batch_size = kwargs.get("batch_size", 1024)
+        self.dropout = kwargs.get("dropout", 0.0)
 
     def _build_onehot_inputs(
         self, pa: List[str], data: Dict[str, torch.Tensor]

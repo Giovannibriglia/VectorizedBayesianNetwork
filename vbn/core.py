@@ -284,17 +284,29 @@ class CausalBayesNet:
 
     # ---- 2) extend the in-memory dataset -----------------------------------
 
+    # --- NEW: tiny helper to build strides given parent cards ---
+    def _make_strides(self, cards: List[int], device, dtype=torch.long) -> torch.Tensor:
+        if not cards:
+            return torch.empty(0, device=device, dtype=dtype)
+        s = [1] * len(cards)
+        # row-major: stride[j] = product_{k>j} cards[k]
+        for i in range(len(cards) - 2, -1, -1):
+            s[i] = s[i + 1] * cards[i + 1]
+        return torch.tensor(s, device=device, dtype=dtype)
+
     @torch.no_grad()
     def add_data(
         self,
         new_data: TDLike,
         validate: bool = True,
         update_params: bool = False,
+        return_lp: bool = False,  # <-- NEW
         **partial_fit_kwargs,
     ):
         """
         Append rows to the model's dataset.
         If update_params=True, also perform an incremental parameter update.
+        If return_lp=True, return a LearnParams snapshot reflecting all data seen so far.
         """
         td_new = self._to_tensordict(new_data, device=self.device)
         if validate:
@@ -310,6 +322,83 @@ class CausalBayesNet:
 
         if update_params:
             self.partial_fit(td_new, **partial_fit_kwargs)
+
+        if return_lp:
+            # Make sure probs and LG params are materialized
+            self._finalize_incremental_updates()
+            return self._to_learnparams()  # <-- NEW
+        # default: keep old behavior (no return)
+
+    # --- NEW: convert the current incremental buffers into a LearnParams ---
+    @torch.no_grad()
+    def _to_learnparams(self) -> LearnParams:
+        # Discrete tables
+        disc_tables: Optional[Dict[str, DiscreteCPDTable]] = {}
+        for node, ntype in self.types.items():
+            if ntype != "discrete":
+                continue
+            if not hasattr(self, "tabular_probs") or node not in self.tabular_probs:
+                continue
+            probs = self.tabular_probs[node]
+            pars = self.parents.get(node, [])
+            child_card = int(self.cards[node]) if self.cards else int(probs.shape[-1])
+            if probs.ndim == 1:
+                probs = probs.view(1, -1)  # [1, C] for parentless nodes
+
+            parent_cards = [int(self.cards[p]) for p in pars] if self.cards else []
+            strides = self._make_strides(parent_cards, device=self.device)
+
+            disc_tables[node] = DiscreteCPDTable(
+                probs=probs.to(device=self.device, dtype=self.dtype),
+                parent_names=pars,
+                parent_cards=parent_cards,
+                child_card=child_card,
+                strides=strides,
+            )
+        if not disc_tables:
+            disc_tables = None
+
+        # Linear-Gaussian block (continuous subgraph only)
+        cont_order = [n for n in self.variables if self.types.get(n) == "continuous"]
+        if cont_order and hasattr(self, "lin_weights"):
+            name2idx = {n: i for i, n in enumerate(cont_order)}
+            nc = len(cont_order)
+            W = torch.zeros((nc, nc), device=self.device, dtype=self.dtype)
+            b = torch.zeros((nc,), device=self.device, dtype=self.dtype)
+            sigma2 = torch.full((nc,), 1e-9, device=self.device, dtype=self.dtype)
+            for i, child in enumerate(cont_order):
+                beta = self.lin_weights.get(child, None)
+                if beta is None:
+                    continue
+                # beta = [bias, coeff(parent_0), coeff(parent_1), ...]
+                b[i] = beta[0].to(self.device, self.dtype)
+                # Only continuous parents go into LG W
+                cont_pars = [
+                    p
+                    for p in self.parents.get(child, [])
+                    if self.types.get(p) == "continuous"
+                ]
+                for j, p in enumerate(cont_pars):
+                    pi = name2idx[p]
+                    W[i, pi] = beta[1 + j].to(self.device, self.dtype)
+                if hasattr(self, "lin_noise_var") and child in self.lin_noise_var:
+                    sigma2[i] = torch.as_tensor(
+                        self.lin_noise_var[child], device=self.device, dtype=self.dtype
+                    )
+            lg = LGParams(order=cont_order, name2idx=name2idx, W=W, b=b, sigma2=sigma2)
+        else:
+            lg = None
+
+        # Build the LearnParams (neural CPDs, if any, remain as-is in memory—none are created here)
+        lp = LearnParams(
+            meta=self.meta,
+            discrete_tables=disc_tables,
+            discrete_mlps=None,
+            lg=lg,
+            cont_mlps=None,
+            cont_mlp_meta=None,
+        )
+        return lp
 
     def _validate_batch(self, td: TensorDict):
         for var in self.variables:

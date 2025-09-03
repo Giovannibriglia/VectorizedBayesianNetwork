@@ -13,16 +13,16 @@ from ..core import BNMeta, DiscreteCPDTable, LearnParams
 class DiscreteMLELearner(torch.nn.Module):
     """Maximum-likelihood tabular CPDs with Laplace smoothing."""
 
-    def __init__(
-        self, meta: BNMeta, laplace_alpha: float = 1.0, device=None, dtype=torch.float32
-    ):
+    def __init__(self, meta: BNMeta, device=None, dtype=torch.float32, **kwargs):
         super().__init__()
         self.meta = meta
-        self.laplace_alpha = laplace_alpha
+
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.dtype = dtype
+
+        self.laplace_alpha = kwargs.get("laplace_alpha", 1.0)
 
     @torch.no_grad()
     def fit(self, data: Dict[str, torch.Tensor]) -> LearnParams:
