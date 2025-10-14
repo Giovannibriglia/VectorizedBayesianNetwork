@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -27,109 +27,138 @@ class ContinuousLGInference(BaseInference):
         do: Optional[Dict[str, torch.Tensor]] = None,
         return_samples: bool = False,
         **kwargs,
-    ) -> (
-        Tuple[Dict[str, torch.Tensor], torch.Tensor]
-        | Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]
     ):
         """
+        Closed-form Linear-Gaussian posterior for a single continuous query node.
         Returns:
-            mu_dict: {q_i: posterior mean (scalar tensor on device)}
-            cov:     posterior covariance over queries, shape [k, k] (k=len(query_in_graph))
-
-            If return_samples=True:
-              (mu_dict, cov, samples_dict)
-              where samples_dict[q_i] has shape [n_samples].
+          if return_samples:
+              (pdfs_dict, samples_dict, weights)
+              - pdfs_dict[q]:   [B, S]  Normal pdf evaluated at returned samples
+              - samples_dict[q]:[B, S]  samples from N(mean, std^2)
+              - weights:        [B, S]  (all ones here)
+          else:
+              out_dict where out_dict[q] = {"mean": [B], "var": [B]}
+        Notes:
+          - Only continuous parents are used (discrete parents ignored here).
+          - `evidence`/`do` values can be scalar, [B], or [B,1]; they are broadcast to B.
+          - If `do` contains the query `q`, the posterior is a delta at that value.
         """
+        import math
 
-        num_samples = kwargs.get("num_samples", 512)
+        device, dtype = self.device, self.dtype
+        num_samples = int(kwargs.get("num_samples", 0) or 0)
 
-        assert lp.lg is not None, "Need LGParams."
-        do = do or {}
+        assert len(query) == 1, "LG posterior supports exactly one query node."
+        q_name = query[0]
+        assert (
+            lp.lg is not None and q_name in lp.lg.name2idx
+        ), f"Query '{q_name}' not in LG block."
 
-        # Apply interventions: cut incoming edges; set mean=b=c; tiny variance
-        W = lp.lg.W.clone()
-        b = lp.lg.b.clone()
-        sigma2 = lp.lg.sigma2.clone().to(self.device, self.dtype)
-        for nm, val in do.items():
-            if nm in lp.lg.name2idx:
-                i = lp.lg.name2idx[nm]
-                W[i, :] = 0.0
-                b[i] = val.to(device=self.device, dtype=self.dtype).reshape(())
-                sigma2[i] = torch.tensor(
-                    1e-12, device=self.device, dtype=self.dtype
-                )  # huge precision
-
-        order = lp.lg.order
-        name2idx = lp.lg.name2idx
-        n = len(order)
-        identity = torch.eye(n, device=self.device, dtype=self.dtype)
-        M = identity - W.to(self.device, self.dtype)
-        invD = torch.diag_embed(1.0 / (sigma2 + 1e-20))
-        J = M.transpose(-1, -2) @ invD @ M  # precision of joint
-        h = (
-            M.transpose(-1, -2) @ (invD @ b.to(self.device, self.dtype).unsqueeze(-1))
-        ).squeeze(-1)
-
-        # Keep only evidence variables present in LGParams
-        e_names = [nm for nm in evidence.keys() if nm in name2idx]
-        e_idx = torch.tensor(
-            [name2idx[nm] for nm in e_names], device=self.device, dtype=torch.long
-        )
-        e_val = (
-            torch.stack(
-                [evidence[nm].to(self.device, self.dtype).reshape(()) for nm in e_names]
+        # ---------- helpers ----------
+        def _to_1d(x: torch.Tensor) -> torch.Tensor:
+            x = x.to(device=device, dtype=(dtype if x.is_floating_point() else None))
+            if x.ndim == 0:  # scalar -> [1]
+                return x.view(1)
+            if x.ndim == 2 and x.shape[1] == 1:  # [B,1] -> [B]
+                return x.view(-1)
+            if x.ndim == 1:  # [B]
+                return x
+            raise ValueError(
+                f"Expected tensor scalar / [B] / [B,1]; got shape {tuple(x.shape)}"
             )
-            if e_idx.numel() > 0
-            else torch.empty(0, device=self.device, dtype=self.dtype)
+
+        def _first_dim(x: torch.Tensor):
+            return x.shape[0] if x.ndim >= 1 else None
+
+        ev = {k: v.to(device=device) for k, v in (evidence or {}).items()}
+        do = {} if do is None else {k: v.to(device=device) for k, v in do.items()}
+
+        # Detect batch size B
+        B_cands = []
+        for v in list(ev.values()) + list(do.values()):
+            b = _first_dim(v)
+            if b is not None:
+                B_cands.append(b)
+        B = B_cands[0] if B_cands else 1
+        if B_cands:
+            assert all(b == B for b in B_cands), f"Inconsistent batch sizes: {B_cands}"
+
+        # ---------- LG params ----------
+        lg = lp.lg
+        name2idx = lg.name2idx
+        W = lg.W.to(device, dtype)  # [n, n]
+        b = lg.b.to(device, dtype)  # [n]
+        sigma2 = lg.sigma2.to(device, dtype)  # [n]
+
+        q_idx = name2idx[q_name]
+        cont_pa_all = [p for p in self.meta.parents.get(q_name, []) if p in name2idx]
+
+        # If intervened on q: degenerate at value
+        if q_name in do:
+            xq = _to_1d(do[q_name])
+            if xq.shape[0] == 1 and B > 1:
+                xq = xq.expand(B)
+            mean = xq
+            var = torch.zeros_like(mean, dtype=dtype, device=device)
+
+            if return_samples and num_samples > 0:
+                samples = mean.view(B, 1).expand(B, num_samples)  # [B,S]
+            else:
+                samples = mean.view(B, 1)  # [B,1]
+            # Dirac delta at xq → set pdfs to ones for convenience
+            pdfs = torch.ones_like(samples, dtype=dtype, device=device)
+            if return_samples:
+                return {q_name: pdfs}, {q_name: samples}, torch.ones_like(samples)
+            else:
+                return {q_name: {"mean": mean, "var": var}}
+
+        # Collect *continuous* parents’ values (do overrides evidence)
+        parent_vals = []
+        used_parents = []
+        for p in cont_pa_all:
+            if p in do:
+                xp = _to_1d(do[p])
+            elif p in ev:
+                xp = _to_1d(ev[p])
+            else:
+                # You can either raise or treat as zero-mean. Here we raise to avoid silent bias.
+                raise KeyError(
+                    f"Missing continuous parent '{p}' for LG query '{q_name}'."
+                )
+            if xp.shape[0] == 1 and B > 1:
+                xp = xp.expand(B)
+            parent_vals.append(xp)  # [B]
+            used_parents.append(p)
+
+        # Mean and variance for q | parents
+        if len(parent_vals) == 0:
+            mean = b[q_idx].expand(B)  # [B]
+        else:
+            Xp = torch.stack(parent_vals, dim=-1)  # [B, d]
+            w_qp = W[q_idx, [name2idx[p] for p in used_parents]]  # [d]
+            mean = (Xp * w_qp).sum(dim=-1) + b[q_idx]  # [B]
+
+        var = sigma2[q_idx].expand(B)  # [B]
+        std = torch.sqrt(var.clamp_min(1e-12))  # [B]
+
+        if not return_samples or num_samples <= 0:
+            return {q_name: {"mean": mean, "var": var}}
+
+        # Sample and compute pdf for each sample (analytic Normal)
+        # shapes: mean/std [B] -> [B,1] for broadcasting
+        mean_b1 = mean.view(B, 1)
+        std_b1 = std.view(B, 1)
+        eps = torch.randn(B, num_samples, device=device, dtype=dtype)  # [B,S]
+        samples = mean_b1 + std_b1 * eps  # [B,S]
+
+        z = (samples - mean_b1) / (std_b1 + 1e-12)
+        # log N(x | mu, std) = -0.5*z^2 - log(std) - 0.5*log(2π)
+        log_p = (
+            -0.5 * (z * z) - torch.log(std_b1 + 1e-12) - 0.5 * math.log(2.0 * math.pi)
         )
+        pdfs = torch.exp(log_p)  # [B,S]
 
-        # Queries present in the LG
-        q_names = [nm for nm in query if nm in name2idx]
-        q_idx = torch.tensor(
-            [name2idx[nm] for nm in q_names], device=self.device, dtype=torch.long
-        )
+        # weights are uniform here (no importance correction needed)
+        weights = torch.ones_like(samples, dtype=dtype, device=device)
 
-        if q_idx.numel() == 0:
-            # nothing to infer within this LG
-            empty_cov = torch.empty(0, 0, device=self.device, dtype=self.dtype)
-            return ({}, empty_cov) if not return_samples else ({}, empty_cov, {})
-
-        # Reorder as [q, e] to compute conditional
-        perm = torch.cat([q_idx, e_idx], dim=0)
-        Jp = J.index_select(0, perm).index_select(1, perm)
-        hp = h.index_select(0, perm)
-
-        k = q_idx.numel()
-        Juu = Jp[:k, :k] + 1e-8 * torch.eye(
-            k, device=self.device, dtype=self.dtype
-        )  # stabilizer
-        Jue = Jp[:k, k:]
-        hu = hp[:k]
-
-        # Posterior natural params for q | e:  J_post = Juu,   h_post = hu - Jue * e
-        eta = hu - (Jue @ e_val if e_val.numel() else 0.0)
-
-        # Solve Juu * mu = eta  via Cholesky
-        L = torch.linalg.cholesky(Juu)
-        mu = torch.cholesky_solve(eta.unsqueeze(-1), L).squeeze(-1)  # [k]
-        cov = torch.cholesky_inverse(L)  # [k, k]
-
-        mu_dict = {nm: mu[i] for i, nm in enumerate(q_names)}
-
-        if not return_samples:
-            return mu_dict, cov
-
-        # ---- Sample from N(mu, cov) for the queried block ----
-        # Use MultivariateNormal with a tiny jitter for extra safety
-        jitter = 1e-10
-        cov_safe = cov + jitter * torch.eye(k, device=self.device, dtype=self.dtype)
-        dist = torch.distributions.MultivariateNormal(
-            loc=mu, covariance_matrix=cov_safe
-        )
-        S = max(int(num_samples), 1)
-        draws = dist.sample((S,))  # [S, k]
-
-        samples_dict: Dict[str, torch.Tensor] = {
-            nm: draws[:, i] for i, nm in enumerate(q_names)
-        }
-        return mu_dict, cov, samples_dict
+        return {q_name: pdfs}, {q_name: samples}, weights
