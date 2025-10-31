@@ -89,12 +89,20 @@ class VBNParallelTrainer(nn.Module):
         return {p: batch[p] for p in self.vbn.parents.get(node, [])}
 
     def nll(self, batch: Dict[str, Tensor]) -> Tensor:
-        return torch.stack(
-            [
-                cpd.training_loss(batch[n], self._parents(batch, n))
-                for n, cpd in self.cpds.items()
-            ]
-        ).sum()
+        losses = []
+        for n, cpd in self.cpds.items():
+            y = batch[n]
+            parents = self._parents(batch, n)
+            if hasattr(cpd, "training_loss"):
+                loss = cpd.training_loss(y, parents)
+            elif hasattr(cpd, "log_prob"):
+                loss = (-cpd.log_prob(y, parents)).mean()
+            else:
+                raise AttributeError(
+                    f"CPD '{n}' has neither training_loss nor log_prob."
+                )
+            losses.append(loss)
+        return torch.stack(losses).sum()
 
     @torch.no_grad()
     def fit(self, data: Dict[str, Tensor]) -> None:

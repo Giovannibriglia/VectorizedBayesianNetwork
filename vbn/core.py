@@ -185,6 +185,29 @@ class VBN:
             self, evidence=evidence, n=n_samples, do=do, device=self.device, **kw
         )
 
+    def _is_linear_gaussian_node(self, n: str) -> bool:
+        cpd = self.cpd.get(n)
+        # Robust check: either class name or required attributes
+        return (
+            cpd is not None
+            and hasattr(cpd, "W")
+            and hasattr(cpd, "b")
+            and hasattr(cpd, "sigma2")
+        )
+
+    def _vars_kind(self, vars_set):
+        kinds = []
+        for v in vars_set:
+            s = self.nodes.get(v, {})
+            t = s.get("type")
+            if t == "discrete":
+                kinds.append("discrete")
+            elif t == "gaussian" and s.get("dim", 1) == 1:
+                kinds.append("gaussian_scalar")
+            else:
+                kinds.append("other")
+        return set(kinds)
+
     def posterior(
         self,
         query,
@@ -194,12 +217,27 @@ class VBN:
         method: str | None = None,
         **kwargs,
     ):
-        if method is not None and (
-            self._inference_obj is None or method != self.inference_method
-        ):
+        involved = set(query) | set(evidence or {}) | set(do or {})
+
+        if method is None:
+            kinds = self._vars_kind(involved)
+
+            if kinds <= {"discrete"}:
+                method = "ve"
+            elif kinds <= {"gaussian_scalar"}:
+                # NEW: only use GaussianExact if EVERY involved continuous node
+                # that could appear in the Gaussian solve is truly linear-Gaussian.
+                all_lg = all(
+                    (self.nodes.get(v, {}).get("type") != "gaussian")
+                    or self._is_linear_gaussian_node(v)
+                    for v in involved
+                )
+                method = "gaussian" if all_lg else (self.inference_method or "lw")
+            else:
+                method = self.inference_method or "lw"
+
+        if self._inference_obj is None or method != self.inference_method:
             self.set_inference(method, **kwargs)
-        elif self._inference_obj is None:
-            self.set_inference("lw", **kwargs)
 
         backend = self._inference_obj
         call_kw = dict(bn=self, query=query, evidence=evidence, do=do)
@@ -208,4 +246,6 @@ class VBN:
         for k, v in kwargs.items():
             if k not in ("device",):
                 call_kw[k] = v
+        return backend.posterior(**call_kw)
+
         return backend.posterior(**call_kw)

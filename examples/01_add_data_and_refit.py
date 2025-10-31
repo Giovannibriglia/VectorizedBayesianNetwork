@@ -68,8 +68,10 @@ def posterior_mean(value) -> float:
     raise TypeError(f"Unexpected posterior value type: {type(value)}")
 
 
-def posterior_expectation(bn, node: str, do: dict, n_samples: int = 10240) -> float:
-    post = bn.posterior([node], do=do, n_samples=n_samples)
+def posterior_expectation(
+    bn, node: str, do: dict, n_samples: int = 10240, method: str | None = None
+) -> float:
+    post = bn.posterior([node], do=do, n_samples=n_samples, method=method)
     return posterior_mean(post[node])
 
 
@@ -146,7 +148,11 @@ def demo_linear_gaussian(device: str):
     bn.fit({"X": X1, "R": R1})
 
     m1 = posterior_expectation(
-        bn, "R", do={"X": torch.tensor([1.0], device=device)}, n_samples=10240
+        bn,
+        "R",
+        do={"X": torch.tensor([1.0], device=device)},
+        n_samples=20000,
+        method="lw",
     )
     print(f"LG  1) E[R|do(X=1)] ≈ {m1:.4f}")
 
