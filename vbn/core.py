@@ -181,6 +181,7 @@ class VBN:
     ):
         from .sampling import sample_conditional as _samplec
 
+        # NOTE: pass n=..., not n_samples=...
         return _samplec(
             self, evidence=evidence, n=n_samples, do=do, device=self.device, **kw
         )

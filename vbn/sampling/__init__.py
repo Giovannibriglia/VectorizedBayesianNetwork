@@ -56,5 +56,6 @@ def sample_conditional(
     do: Optional[Dict[str, Tensor]] = None,
     **kw,
 ):
-    # forward to SMC with clean constructor vs call kwargs split
+    # Users (or wrappers) might pass method="smc"; ensure we don't double-set it
+    kw.pop("method", None)
     return sample(bn, n=n, do=do, method="smc", evidence=evidence, **kw)
