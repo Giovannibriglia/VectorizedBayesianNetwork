@@ -24,7 +24,7 @@ class SMC(InferenceBackend):
     def _resample(self, xdict: Dict[str, torch.Tensor], w):
         N = w.shape[0]
         w = (w / w.sum().clamp_min(1e-12)).detach()
-        # systematic
+        # systematic resampling
         u0 = torch.rand(1, device=self.device) / N
         cum = torch.cumsum(w, dim=0)
         idx = torch.searchsorted(cum, (u0 + torch.arange(N, device=self.device) / N))
@@ -103,3 +103,72 @@ class SMC(InferenceBackend):
             else:
                 out[q] = (w.view(-1, 1) * val).sum(dim=0)
         return out
+
+    @torch.no_grad()
+    def sample(
+        self,
+        bn,
+        n: int,
+        evidence: Optional[Dict[str, torch.Tensor]] = None,
+        do: Optional[Dict[str, torch.Tensor]] = None,
+        **kw,
+    ):
+        """
+        Conditional sampling via SMC with evidence & interventions.
+        Ensures evidence tensors are broadcast to particle batch N before scoring.
+        """
+        device = bn.device
+        evidence = {k: v.to(device) for k, v in (evidence or {}).items()}
+        do = {k: v.to(device) for k, v in (do or {}).items()}
+        order = bn.topo_order
+
+        N = int(n)
+        w = torch.ones(N, device=device)
+        samples: Dict[str, torch.Tensor] = {}
+
+        for node in order:
+            spec = bn.nodes[node]
+            is_disc = spec.get("type") == "discrete"
+            D = 1 if is_disc else int(spec.get("dim", 1))
+
+            if node in do:
+                v = do[node]
+                # broadcast intervention to [N,1] or [N,D]
+                if is_disc:
+                    v = v.view(1, 1).long().expand(N, 1)
+                else:
+                    v = v.view(1, D).float().expand(N, D)
+                samples[node] = v
+            else:
+                # sample from CPD given current parents
+                parents = {p: samples[p] for p in bn.parents.get(node, [])}
+                samp = bn.cpd[node].sample(parents, n_samples=1).squeeze(1)
+                if is_disc:
+                    samp = samp.long().view(-1, 1)
+                samples[node] = samp
+
+            if node in evidence:
+                # --- broadcast evidence to particle batch ---
+                y = evidence[node]
+                if is_disc:
+                    yB = y.view(1, 1).long().expand(N, 1)
+                else:
+                    yB = y.view(1, D).float().expand(N, D)
+
+                # score weights with broadcasted parents & targets
+                parents = {p: samples[p] for p in bn.parents.get(node, [])}
+                lp = bn.cpd[node].log_prob(
+                    yB, parents
+                )  # shape [N] (or [N,1] -> squeeze)
+                if lp.ndim > 1:
+                    lp = lp.squeeze(-1)
+                w *= lp.exp().clamp_min(1e-12)
+
+                # clamp stored sample to evidence values
+                samples[node] = yB
+
+            # resample if ESS low
+            if self._ess(w) < 0.5 * N:
+                samples, w = self._resample(samples, w)
+
+        return samples

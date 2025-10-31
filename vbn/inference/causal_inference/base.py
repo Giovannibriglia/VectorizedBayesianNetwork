@@ -31,28 +31,24 @@ class CausalQuery:
             query, evidence=evidence, do=do, method=self.exact_method
         )
 
-    def _expect(
-        self,
-        var: str,
-        evidence: Optional[Dict[str, Tensor]] = None,
-        do: Optional[Dict[str, Tensor]] = None,
-    ) -> Tensor:
-        """E[var | evidence, do].
-        - Gaussian nodes: try exact Gaussian backend; fallback to MC.
-        - Discrete or other: MC fallback.
-        """
+    def _expect(self, var, evidence=None, do=None) -> Tensor:
         spec = self.bn.nodes[var]
-        if spec["type"] == "gaussian":
-            try:
+        t = spec.get("type")
+        try:
+            if t == "discrete":
+                # E[Y] from categorical: sum k * P(Y=k | ...)
+                out = self.bn.posterior([var], evidence=evidence, do=do, method="ve")
+                p = out[var].view(-1)
+                vals = torch.arange(p.numel(), device=self.device, dtype=p.dtype)
+                return (p * vals).sum()
+            if t == "gaussian" and spec.get("dim", 1) == 1:
                 out = self.bn.posterior(
-                    [var], evidence=evidence, do=do, method="gaussian_exact"
+                    [var], evidence=evidence, do=do, method="gaussian"
                 )
-                m = out[var]["mean"]  # dict with "mean"/"var"
-                return m.squeeze()
-            except Exception:
-                pass  # fallback to MC below
-
-        # MC fallback (works for any type)
+                return out[var]["mean"].squeeze()
+        except Exception:
+            pass
+        # fallback MC
         draws = self.bn.sample_conditional(
             evidence=evidence or {}, do=do, n_samples=4096
         )

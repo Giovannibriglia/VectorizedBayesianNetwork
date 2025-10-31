@@ -8,12 +8,19 @@ import torch
 from .base import CausalQuery, Tensor
 
 
+def _as_col(t: torch.Tensor) -> torch.Tensor:
+    t = t.to(dtype=torch.get_default_dtype())
+    if t.ndim == 0:
+        return t.view(1, 1)
+    if t.ndim == 1:
+        return t.view(-1, 1)
+    return t  # assume already [B, d]
+
+
 class CounterfactualLG(CausalQuery):
     r"""
     Linear-Gaussian counterfactuals via Abduction–Action–Prediction.
-    For a node Y with SE: Y = W·Pa(Y) + b + ε, ε ~ N(0, σ²)
-    Given factual (observed) assignments for parents and Y, abduct ε̂,
-    then predict Y^{do(X=x')} by reusing ε̂ under the intervention.
+    Works with LinearGaussianCPD that expects `forward(parents_dict)`.
     """
 
     @torch.no_grad()
@@ -25,24 +32,43 @@ class CounterfactualLG(CausalQuery):
         intervened_parents: Dict[str, Tensor],
     ) -> Tensor:
         device = self.device
-        cpd = self.bn.cpd[y]
-        assert (
-            hasattr(cpd, "W") and hasattr(cpd, "b") and hasattr(cpd, "sigma2")
-        ), "CounterfactualLG requires LinearGaussianCPD."
-        # build X_f and X_cf from factual/intervened parent tensors (concat in CPD order)
-        par_names = list(cpd.parents.keys())  # matches W’s column order
+        cpd = self.bn.cpd[y]  # LinearGaussianCPD
 
-        def build_X(vals: Dict[str, Tensor]):
-            cols = [vals[p].to(device).view(1, -1).float() for p in par_names]
-            return (
-                torch.cat(cols, dim=1) if cols else torch.zeros((1, 0), device=device)
-            )
+        # Parent order used by the CPD/trainer
+        par_names = list(self.bn.parents.get(y, []))
 
-        X_f = build_X(factual_parents)
-        X_cf = build_X(intervened_parents)
+        # Normalize parent dicts -> ensure tensors are on device and 2D [B, d]
+        def norm_parents(pdict: Dict[str, Tensor]) -> Dict[str, torch.Tensor]:
+            out = {}
+            for p in par_names:
+                v = pdict[p].to(device)
+                out[p] = _as_col(v).float()
+            # broadcast batch B if needed
+            B = max(out[p].shape[0] for p in par_names) if par_names else 1
+            for p in par_names:
+                if out[p].shape[0] == 1 and B > 1:
+                    out[p] = out[p].expand(B, out[p].shape[1]).clone()
+            return out
 
-        mean_f = (X_f @ cpd.W.to(device) + cpd.b.to(device)).view(1, -1)
-        eps_hat = factual_y.to(device).view(1, -1) - mean_f  # abduct noise
-        mean_cf = (X_cf @ cpd.W.to(device) + cpd.b.to(device)).view(1, -1)
-        y_cf = mean_cf + eps_hat  # reuse noise
+        par_f = norm_parents(factual_parents)
+        par_cf = norm_parents(intervened_parents)
+
+        # y_f -> [B,1]
+        y_f = factual_y.to(device)
+        if y_f.ndim == 0:
+            y_f = y_f.view(1, 1)
+        elif y_f.ndim == 1:
+            y_f = y_f.view(-1, 1)
+        else:
+            y_f = y_f.view(y_f.shape[0], -1)
+        if y_f.shape[1] != 1:
+            raise ValueError("CounterfactualLG expects scalar Y (dim==1).")
+
+        # Abduction: eps_hat = y_f - E[Y | factual parents]
+        mu_f = cpd.forward(par_f).view(-1, 1)  # calls CPD with parents dict
+        eps_hat = y_f - mu_f
+
+        # Prediction under intervention: Y_cf = E[Y | intervened parents] + eps_hat
+        mu_cf = cpd.forward(par_cf).view(-1, 1)
+        y_cf = mu_cf + eps_hat
         return y_cf.squeeze()
