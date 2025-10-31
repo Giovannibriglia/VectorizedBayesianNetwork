@@ -1,3 +1,8 @@
+# TODO
+- temporal bn
+- dynamic bn
+
+
 # VectorizedBayesianNetwork (VBN)
 
 Fast, modular Bayesian Networks for **discrete** and **continuous** data — with **vectorized** exact & approximate inference, **neural CPDs**, `do(·)` interventions, plotting, and lightweight save/load.

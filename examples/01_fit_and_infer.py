@@ -1,187 +1,155 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
-import matplotlib.pyplot as plt
-import networkx as nx
-import numpy as np
-import pandas as pd
+import math
+from typing import Dict, List
+
 import torch
 
-from vbn.core import CausalBayesNet, LearnParams, merge_learnparams
-from vbn.utils import unpack_gaussian
-
-# --------------------- toy BN ---------------------
-# X -> Y <- Z, and Y -> A (continuous)
-G = nx.DiGraph([("X", "Y"), ("Z", "Y"), ("Y", "A")])
-types = {"X": "discrete", "Z": "discrete", "Y": "discrete", "A": "continuous"}
-cards = {"X": 3, "Z": 2, "Y": 4}
-
-bn = CausalBayesNet(G, types, cards)
-
-# --------------------- data gen -------------------
-N = 8000
-rng = np.random.default_rng(0)
-X = torch.tensor(rng.integers(0, 3, size=N))
-Z = torch.tensor(rng.integers(0, 2, size=N))
-# Y depends on X, Z
-Y = (X + 2 * Z + torch.tensor(rng.integers(0, 2, size=N))) % 4
-# A ~ 0.8*Y + noise
-A = 0.8 * Y.float() + torch.randn(N) * 0.7
-
-df = pd.DataFrame({"X": X.numpy(), "Z": Z.numpy(), "Y": Y.numpy(), "A": A.numpy()})
-
-# ==================================================
-# 1) DISCRETE: tabular MLE
-lp_disc_mle: LearnParams = bn.fit("discrete_mle", df)
-print("[discrete MLE] tables:", list(lp_disc_mle.discrete_tables.keys()))
-
-# 2) DISCRETE: neural CPDs → materialize tabular
-lp_disc_mlp: LearnParams = bn.fit("discrete_mlp", df, hidden=64, epochs=5)
-lp_disc_mlp = bn.materialize("discrete_mlp", lp_disc_mlp)  # create tables
-print("[discrete MLP→tables] tables:", list(lp_disc_mlp.discrete_tables.keys()))
-
-# 3) CONTINUOUS: exact linear-Gaussian
-lp_cont_lg: LearnParams = bn.fit("continuous_gaussian", df)
-print("[continuous LG] nodes:", lp_cont_lg.lg.order if lp_cont_lg.lg else None)
-
-# 4) CONTINUOUS: MLP heads → materialize LG
-lp_cont_mlp: LearnParams = bn.fit("continuous_mlp_gaussian", df, hidden=64, epochs=5)
-lp_cont_mlp = bn.materialize("continuous_mlp_gaussian", lp_cont_mlp, data=df)
-print("[continuous MLP→LG] nodes:", lp_cont_mlp.lg.order if lp_cont_mlp.lg else None)
-
-# ==================================================
-# Inference examples
-# (a) exact variable elimination on the discrete subgraph
-discrete_exact_inference = bn.setup_inference("discrete_exact")
-post_exact = bn.infer(
-    discrete_exact_inference,
-    lp=lp_disc_mle,
-    evidence={"X": torch.tensor([1]), "Z": torch.tensor([0])},
-    query=["Y"],
-)
-print("[inference discrete exact] P(Y | X=1,Z=0):", post_exact["Y"].softmax(-1))
-
-# (b) approximate discrete (sampling) with do-intervention
-discrete_approx_inference = bn.setup_inference("discrete_approx")
-post_approx = bn.infer(
-    inference_obj=discrete_approx_inference,
-    lp=lp_disc_mle,
-    evidence={"X": torch.tensor([1]), "Z": torch.tensor([0])},
-    query=["Y"],
-    num_samples=1024,
-)
-print("[inference discrete approx] P(Y | X=1, do(Z=1)):", post_approx["Y"].softmax(-1))
-
-# (c) continuous exact Gaussian posterior: predict A given Y
-continuous_gaussian_inference = bn.setup_inference("continuous_gaussian")
-gauss_post = bn.infer(
-    inference_obj=continuous_gaussian_inference,
-    lp=lp_cont_lg,
-    evidence={"Y": torch.tensor([2.0])},
-    query=["A"],
-)
-mu_A, std_A = unpack_gaussian(gauss_post, "A")
-print(f"[inference LG] A | Y=2 -> mean={float(mu_A):.3f}, std={float(std_A):.3f}")
-
-# merge discrete CPDs + continuous MLP params
-lp_hybrid = merge_learnparams(lp_disc_mle, lp_cont_mlp)
-
-# (c) continuous exact Gaussian posterior (unchanged)
-gauss_post = bn.infer(
-    continuous_gaussian_inference,
-    lp=lp_cont_lg,
-    evidence={"Y": torch.tensor([2.0])},
-    query=["A"],
-)
-mu_A, std_A = unpack_gaussian(gauss_post, "A")
-print(f"[inference LG] A | Y=2 -> mean={float(mu_A):.3f}, std={float(std_A):.3f}")
-
-# (d) continuous approximate — use the merged params that INCLUDE discrete CPDs
-continuous_approx_inference = bn.setup_inference("continuous_approx")
-gauss_approx = bn.infer(
-    continuous_approx_inference,
-    lp=lp_hybrid,
-    evidence={"Y": torch.tensor([3.0])},
-    query=["A"],
-    num_samples=4000,
-)
-print("gauss_approx: ", gauss_approx)
-mu_A2 = gauss_approx["A"]["mean"]
-std_A2 = gauss_approx["A"]["var"].sqrt()
-print(f"[inference approx] A | Y=3 -> mean={mu_A2.item():.3f}, std={std_A2.item():.3f}")
+# Your integrated VBN with parallel fit support
+from vbn import VBN
 
 
-# ==================================================
-# Plotting helpers
-def plot_discrete_table(table, title="P(child | parents)"):
-    probs = table.probs.detach().cpu().float().numpy()  # [Pcfg, C] or [C]
-    plt.figure()
-    if probs.ndim == 1:
-        plt.bar(range(len(probs)), probs)
-        plt.xlabel("child value")
-        plt.ylabel("prob")
-    else:
-        # show all parent-config rows as grouped bars
-        Pcfg, C = probs.shape
-        xs = np.arange(C)
-        width = 0.8 / Pcfg
-        for i in range(Pcfg):
-            plt.bar(xs + i * width, probs[i], width=width, label=f"pcfg={i}")
-        plt.xlabel("child value")
-        plt.ylabel("prob")
-        plt.legend()
-    plt.title(title)
-    plt.tight_layout()
+def make_synthetic_dataset(N: int, device: str) -> Dict[str, torch.Tensor]:
+    """
+    Ground truth:
+      S ∈ {0,...,4} (uniform)
+      X | S = s  ~  Normal(mu_s, 0.4^2),   mu_s = 0.8*s - 1.0
+      R | X = x  =  f(x) + ε,  with f(x) = sin(2x) + 0.25*x^2,  ε ~ Normal(0, 0.10^2)
+    """
+    S = torch.randint(0, 5, (N,), device=device)
+    mu_s = 0.8 * S.float() - 1.0
+    X = mu_s + 0.4 * torch.randn(N, device=device)
+    fX = torch.sin(2 * X) + 0.25 * (X**2)
+    R = fX + 0.10 * torch.randn(N, device=device)
+
+    # shapes: S:(N,), X:(N,1), R:(N,1)
+    return {"S": S, "X": X.unsqueeze(-1), "R": R.unsqueeze(-1)}
 
 
-def plot_lg_node(lp_lg: LearnParams, node: str, df: pd.DataFrame):
-    """Scatter y vs LG mean prediction; handles CPU/CUDA device safely."""
-    if lp_lg.lg is None:
-        print("No LG params available.")
-        return
+@torch.no_grad()
+def true_E_R_do_S(
+    s_vals: List[int], n_mc: int = 200000, device: str = "cpu"
+) -> Dict[int, float]:
+    """Monte-Carlo ground truth for E[R | do(S=s)] under the known generative process."""
+    out = {}
+    for s in s_vals:
+        mu_s = 0.8 * torch.tensor(float(s), device=device) - 1.0
+        X = mu_s + 0.4 * torch.randn(n_mc, device=device)
+        fX = torch.sin(2 * X) + 0.25 * (X**2)
+        R = fX + 0.10 * torch.randn(n_mc, device=device)
+        out[s] = float(R.mean().item())
+    return out
 
-    pars = bn.parents[node]
-    # build tensors on CPU first (cheap), then move to beta.device
-    y = torch.as_tensor(df[node].values, dtype=torch.float32)
 
-    if pars:
-        Xp = [
-            torch.as_tensor(df[p].values, dtype=torch.float32).view(-1, 1) for p in pars
-        ]
-        X = torch.cat(
-            [torch.ones((len(df), 1), dtype=torch.float32), *Xp], dim=1
-        )  # [N, 1+|P|]
-    else:
-        X = torch.ones((len(df), 1), dtype=torch.float32)
+@torch.no_grad()
+def bn_E_R_do_S(bn: VBN, s_vals: List[int], n_mc: int = 16384) -> Dict[int, float]:
+    """Estimate E[R | do(S=s)] by sampling from the BN."""
+    out = {}
+    for s in s_vals:
+        do = {"S": torch.tensor([s], device=bn.device)}
+        samples = bn.sample(n_samples=n_mc, do=do)
+        # samples["R"]: (n_mc, 1) or (n_mc,) depending on your sampler — handle both
+        R = samples["R"].reshape(n_mc, -1)
+        out[s] = float(R.mean().item())
+    return out
 
-    beta = bn.lin_weights.get(node, None) if hasattr(bn, "lin_weights") else None
-    if beta is None:
-        print(
-            "No online lin_weights found; run `bn.add_data(..., update_params=True)` first."
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.set_default_device(device)
+
+    # ── Define BN structure: S → X → R
+    nodes = {
+        "S": {"type": "discrete", "card": 5},
+        "X": {"type": "gaussian", "dim": 1},
+        "R": {"type": "gaussian", "dim": 1},
+    }
+    parents = {"S": [], "X": ["S"], "R": ["X"]}
+
+    # ── Create datasets
+    train = make_synthetic_dataset(N=50_000, device=device)
+    test = make_synthetic_dataset(N=10_000, device=device)
+
+    # ── Prepare ground-truth interventions E[R | do(S=s)]
+    s_vals = list(range(5))
+    gt = true_E_R_do_S(s_vals, n_mc=250_000, device=device)
+
+    # ── Build three models that differ ONLY in R|X:
+    #     (all use S ~ mle, X|S ~ linear_gaussian)
+    configs = {
+        "R|X: linear_gaussian": {"R": "linear_gaussian"},
+        "R|X: kde": {"R": "kde"},
+        "R|X: gp_svgp": {"R": "gp_svgp"},
+    }
+
+    results = {}
+    for label, learner_map_R in configs.items():
+        # Compose full learner map: S->mle, X->linear_gaussian, R->(variant)
+        learner_map = {"S": "mle", "X": "linear_gaussian", **learner_map_R}
+
+        bn = VBN(
+            nodes=nodes,
+            parents=parents,
+            device=device,
+            learner_map=learner_map,
+            # defaults: linear/mle do 0 extra steps; kde/gp_svgp do minibatch steps automatically
+            default_steps_svgp_kde=600,
+            default_steps_others=0,
+            default_batch_size=4096,
+            default_lr=1e-3,
         )
-        return
 
-    # ensure same device & dtype
-    X = X.to(device=beta.device, dtype=beta.dtype)
-    yhat = (X @ beta).detach().cpu().numpy()
+        # Parallel learning inside VBN.fit()
+        bn.fit(train)  # offline init + (optional) minibatch joint optimization
 
-    plt.figure()
-    plt.scatter(
-        range(len(yhat)), y.numpy(), s=6, alpha=0.4, label="observed", c="orange"
+        # Interventional means
+        est = bn_E_R_do_S(bn, s_vals, n_mc=32_768)
+
+        # Simple error metric vs ground truth curve
+        rmse = math.sqrt(sum((est[s] - gt[s]) ** 2 for s in s_vals) / len(s_vals))
+
+        # Also report test NLL proxy: Monte-Carlo estimate of -log p(R|X) on test (for comparison).
+        # We estimate via per-sample log_prob at each node that involves R (here only R|X).
+        # (This is a rough cross-model comparison; KDE returns conditional log-densities.)
+        with torch.no_grad():
+            par_R = {"X": test["X"]}
+            y_R = test["R"]
+            nll_R = -bn.cpd["R"].log_prob(y_R, par_R).mean().item()
+
+        results[label] = {"curve": est, "rmse_vs_true_do": rmse, "test_nll_R": nll_R}
+
+    # ── Pretty print comparison
+    print("\n=== Ground-truth E[R | do(S=s)] ===")
+    for s in s_vals:
+        print(f"s={s}: {gt[s]: .4f}")
+
+    print("\n=== Model comparison ===")
+    for label, res in results.items():
+        print(f"\n[{label}]")
+        for s in s_vals:
+            print(f"  s={s}:  E_hat={res['curve'][s]: .4f}   (true {gt[s]: .4f})")
+        print(f"  RMSE vs true do-curve: {res['rmse_vs_true_do']:.4f}")
+        print(f"  Test NLL for R|X (lower is better): {res['test_nll_R']:.4f}")
+
+    # ── Optional: demonstrate streaming update (partial_fit)
+    # simulate a tiny new batch; update and re-evaluate one intervention
+    new_batch = make_synthetic_dataset(N=4_096, device=device)
+    # Pick a model to update, e.g., KDE:
+    bn_kde = VBN(
+        nodes,
+        parents,
+        device=device,
+        learner_map={"S": "mle", "X": "linear_gaussian", "R": "kde"},
     )
-    plt.plot(yhat, lw=2, label="LG mean", c="blue", alpha=0.6)
-    plt.title(f"{node}: observed vs. LG mean (ordered by sample index)")
-    plt.xlabel("sample index")
-    plt.ylabel(node)
-    plt.legend(loc="best")
-    plt.tight_layout()
+    bn_kde.fit(train)
+    before = bn_E_R_do_S(bn_kde, [2], n_mc=16_384)[2]
+    bn_kde.partial_fit(new_batch)  # online update
+    after = bn_E_R_do_S(bn_kde, [2], n_mc=16_384)[2]
+    print(
+        f"\n[KDE] streaming update demo at do(S=2): before={before:.4f}, after={after:.4f}"
+    )
 
 
-# Show a discrete CPD (Y|X,Z) from the MLE fit
-plot_discrete_table(lp_disc_mle.discrete_tables["Y"], "P(Y|X,Z) – MLE")
-
-# If you already ran add_data/partial_fit elsewhere, bn.lin_weights['A'] exists.
-# Here we’ll quickly touch bn.partial_fit to populate online buffers for plotting:
-bn.add_data(df.iloc[:2048], update_params=True)
-plot_lg_node(lp_cont_lg, "A", df.iloc[:1000])
-
-plt.show()
+if __name__ == "__main__":
+    main()

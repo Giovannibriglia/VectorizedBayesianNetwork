@@ -1,12 +1,11 @@
-from .continuous_mlp import ContinuousMLPLearner, materialize_lg_from_cont_mlp
-from .discrete_mle import DiscreteMLELearner
-from .discrete_mlp import DiscreteMLPLearner
-from .gaussian_linear import GaussianLinearLearner
+from vbn.learning.nonparametric.gp_svgp import SVGPRegCPD
+from vbn.learning.nonparametric.kde import KDECPD
+from vbn.learning.parametric.linear_gaussian import LinearGaussianCPD
+from vbn.learning.parametric.mle import MLECategoricalCPD
 
-__all__ = [
-    "DiscreteMLELearner",
-    "DiscreteMLPLearner",
-    "GaussianLinearLearner",
-    "ContinuousMLPLearner",
-    "materialize_lg_from_cont_mlp",
-]
+CPD_REGISTRY = {
+    "mle": MLECategoricalCPD,
+    "linear_gaussian": LinearGaussianCPD,
+    "kde": KDECPD,
+    "gp_svgp": SVGPRegCPD,
+}

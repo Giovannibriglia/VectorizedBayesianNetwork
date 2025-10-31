@@ -1,361 +1,272 @@
+# vbn/plotting.py
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
-import networkx as nx
-
+import numpy as np
 import torch
 
-from .core import BNMeta, DiscreteCPDTable, LGParams
+Tensor = torch.Tensor
+
+# --------------------------- helpers ---------------------------
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+def _to_np(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 
-def _as_cpu(x: torch.Tensor) -> torch.Tensor:
-    return x.detach().cpu()
+def _with_ci(
+    mean: np.ndarray,
+    std: Optional[np.ndarray] = None,
+    n: Optional[int] = None,
+    z: float = 1.96,
+):
+    if std is None:  # assume bernoulli variance for proportions
+        p = np.clip(mean, 1e-9, 1 - 1e-9)
+        var = p * (1 - p)
+        if n is None:
+            n = 1
+        std = np.sqrt(var / max(n, 1))
+    return mean, z * std
 
 
-def _ensure_1d(t: torch.Tensor) -> torch.Tensor:
-    return t.reshape(-1)
+# --------------------------- LEARNING ---------------------------
 
 
-def _parent_config_grid(parent_cards: List[int]) -> torch.Tensor:
+def plot_learning_curves(
+    log: Dict[str, Sequence[float]], title: str = "Learning Curves"
+):
     """
-    Return a grid of parent configurations as [P, len(parent_cards)] where
-    P = product(parent_cards). Values are 0..card-1.
+    log: {"train_nll":[...], "val_nll":[...], "train_mae":[...], ...}
     """
-    if not parent_cards:
-        return torch.zeros(1, 0, dtype=torch.long)
-    ranges = [torch.arange(k, dtype=torch.long) for k in parent_cards]
-    meshes = torch.meshgrid(*ranges, indexing="ij")
-    grid = torch.stack([m.reshape(-1) for m in meshes], dim=1)  # [P, n_par]
-    return grid
+    plt.figure()
+    for k, v in log.items():
+        plt.plot(v, label=k)
+    plt.xlabel("epoch")
+    plt.ylabel("metric")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
 
 
-def _cov_ellipse_points(
-    mu: torch.Tensor, Sigma: torch.Tensor, n_std: float = 2.0, n_pts: int = 200
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def plot_cpd_discrete_heatmap(
+    cpt: Tensor, parent_cards: Sequence[int], node_card: int, title="CPD heatmap"
+):
     """
-    Ellipse points (x,y) for 2D Gaussian with mean mu[2], cov Sigma[2,2].
+    Displays a CPT as a heatmap. Rows are parent assignments (flattened), columns are child categories.
+    cpt: [prod(parent_cards), K] or canonical viewable to that shape
     """
-    vals, vecs = torch.linalg.eigh(Sigma)
-    vals = torch.clamp(vals, min=1e-16)
-    axes_len = n_std * torch.sqrt(vals)
-    theta = torch.atan2(vecs[1, 0], vecs[0, 0])
-    t = torch.linspace(0, 2 * math.pi, n_pts)
-    circ = torch.stack([torch.cos(t), torch.sin(t)], dim=0)  # [2, n_pts]
-    R = torch.tensor(
-        [[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]],
-        dtype=Sigma.dtype,
-    )
-    pts = (R @ (axes_len.unsqueeze(1) * circ)) + mu.unsqueeze(1)
-    return pts[0], pts[1]
+    K = int(node_card)
+    prodC = int(np.prod(parent_cards)) if len(parent_cards) else 1
+    M = _to_np(cpt).reshape(prodC, K)
+    plt.figure()
+    plt.imshow(M, aspect="auto")
+    plt.colorbar()
+    plt.xlabel("child category")
+    plt.ylabel("parent assignment (flattened)")
+    plt.title(title)
+    plt.tight_layout()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Graph
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def draw_graph(
-    meta: BNMeta,
-    pos: Optional[Dict[str, Tuple[float, float]]] = None,
-    with_labels: bool = True,
-    node_size: int = 900,
-    figsize: Tuple[int, int] = (6, 4),
-) -> plt.Figure:
+def plot_calibration(
+    prob: np.ndarray, y_true: np.ndarray, n_bins: int = 10, title="Calibration"
+):
     """
-    Draw the DAG using networkx. Discrete nodes are drawn as squares, continuous as circles.
+    Reliability diagram for binary prob. predictions.
+    prob: predicted P(Y=1)
+    y_true: {0,1}
     """
-    G = meta.G
-    if pos is None:
-        pos = nx.spring_layout(G, seed=3)
-
-    fig, ax = plt.subplots(figsize=figsize)
-    disc = [n for n in G.nodes if meta.types[n] == "discrete"]
-    cont = [n for n in G.nodes if meta.types[n] == "continuous"]
-
-    nx.draw_networkx_edges(
-        G,
-        pos=pos,
-        ax=ax,
-        arrows=True,
-        arrowstyle="->",
-        min_source_margin=10,
-        min_target_margin=10,
-    )
-    if disc:
-        nx.draw_networkx_nodes(
-            G, pos=pos, nodelist=disc, ax=ax, node_shape="s", node_size=node_size
-        )
-    if cont:
-        nx.draw_networkx_nodes(
-            G, pos=pos, nodelist=cont, ax=ax, node_shape="o", node_size=node_size
-        )
-    if with_labels:
-        nx.draw_networkx_labels(G, pos=pos, ax=ax)
-
-    ax.axis("off")
-    ax.set_title("Bayesian Network")
-    fig.tight_layout()
-    return fig
+    prob = _to_np(prob).ravel()
+    y = _to_np(y_true).ravel()
+    bins = np.linspace(0, 1, n_bins + 1)
+    idx = np.digitize(prob, bins) - 1
+    bin_centers, acc, conf = [], [], []
+    for b in range(n_bins):
+        m = idx == b
+        if not np.any(m):
+            continue
+        p_hat = prob[m].mean()
+        a_hat = y[m].mean()
+        bin_centers.append(p_hat)
+        acc.append(a_hat)
+        conf.append(p_hat)
+    plt.figure()
+    plt.plot([0, 1], [0, 1], "--")
+    plt.scatter(conf, acc)
+    plt.xlabel("predicted probability")
+    plt.ylabel("empirical accuracy")
+    plt.title(title)
+    plt.tight_layout()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Discrete CPDs
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------- INFERENCE ---------------------------
 
 
-def plot_discrete_table(
-    table: DiscreteCPDTable, var_name: str, figsize: Tuple[int, int] = (6, 4)
-) -> plt.Figure:
+def plot_posterior_bars(
+    exact: np.ndarray,
+    approx: Dict[str, np.ndarray],
+    labels: Optional[Sequence[str]] = None,
+    title: str = "Posterior comparison",
+):
     """
-    Show a discrete CPD as either bars (no parents) or heatmap (with parents).
-    probs shape is [P, C] where P=#parent configs (1 if no parents).
+    Bar chart comparing categorical posterior across methods vs exact baseline.
+    exact: [K]
+    approx: {"lw":[K], "smc":[K], "lbp":[K], ...}
     """
-    P, C = table.probs.shape
-    fig, ax = plt.subplots(figsize=figsize)
-    probs = _as_cpu(table.probs)
+    exact = _to_np(exact).ravel()
+    K = exact.shape[0]
+    if labels is None:
+        labels = [f"k={i}" for i in range(K)]
 
-    if P == 1:
-        ax.bar(range(C), _ensure_1d(probs[0]))
-        ax.set_xlabel(var_name)
-        ax.set_ylabel("P({}=k)".format(var_name))
-        ax.set_xticks(range(C))
-        ax.set_title(f"CPD: P({var_name})")
-    else:
-        im = ax.imshow(probs, aspect="auto", interpolation="nearest")
-        ax.set_xlabel(f"{var_name} = k (0..{C - 1})")
-        ax.set_ylabel("Parent config index")
-        ax.set_title(f"CPD: P({var_name} | parents)")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    methods = ["exact"] + list(approx.keys())
+    X = np.arange(K)
+    w = 0.8 / len(methods)
 
-        # Parent legend (optional): show first few configs as ticklabels
-        grid = _parent_config_grid(table.parent_cards)
-        if grid.shape[0] == P and P <= 20:  # avoid overcrowding
-            labels = [",".join(str(v.item()) for v in row) for row in grid]
-            ax.set_yticks(range(P))
-            ax.set_yticklabels(labels, fontsize=8)
-
-    fig.tight_layout()
-    return fig
+    plt.figure()
+    plt.bar(X - 0.4 + w / 2, exact, width=w, label="exact")
+    for i, (name, p) in enumerate(approx.items(), start=1):
+        plt.bar(X - 0.4 + w / 2 + i * w, _to_np(p).ravel(), width=w, label=name)
+    plt.xticks(X, labels)
+    plt.ylabel("probability")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
 
 
-def plot_discrete_marginal(
-    probs: torch.Tensor, var_name: str, figsize: Tuple[int, int] = (6, 4)
-) -> plt.Figure:
+def plot_speed_accuracy_frontier(
+    rows: List[Tuple[str, float, float]], title="Speed–Accuracy Frontier", xlog=True
+):
     """
-    Plot a marginal distribution over a discrete variable.
-    Accepts shape [C] or [B, C] (batched). If batched, plots mean ± band across batches.
+    rows: list of (method, time_seconds, kl_to_exact)
     """
-    p = _as_cpu(probs)
-    fig, ax = plt.subplots(figsize=figsize)
-    if p.ndim == 1:
-        ax.bar(range(p.numel()), p)
-    else:
-        # summarize across batches
-        mean = p.mean(dim=0)
-        std = p.std(dim=0)
-        xs = torch.arange(mean.numel())
-        ax.bar(xs, mean)
-        ax.errorbar(xs, mean, yerr=std, fmt="none", capsize=3, linewidth=1)
-
-    ax.set_title(f"Marginal P({var_name})")
-    ax.set_xlabel(var_name)
-    ax.set_ylabel("Probability")
-    ax.set_xticks(range(p.shape[-1]))
-    fig.tight_layout()
-    return fig
+    methods, times, kls = zip(*rows)
+    times = np.array(times)
+    kls = np.array(kls)
+    plt.figure()
+    plt.scatter(times, kls)
+    for m, t, k in rows:
+        plt.annotate(m, (t, k))
+    if xlog:
+        plt.xscale("log")
+    plt.yscale("log")
+    plt.xlabel("time [s]")
+    plt.ylabel("KL(exact || method)")
+    plt.title(title)
+    plt.tight_layout()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Continuous Gaussian posterior (Linear-Gaussian inference output)
-# ──────────────────────────────────────────────────────────────────────────────
+def plot_lbp_convergence(residuals: Sequence[float], title="LBP convergence"):
+    plt.figure()
+    plt.semilogy(residuals)
+    plt.xlabel("iteration")
+    plt.ylabel("message residual (log)")
+    plt.title(title)
+    plt.tight_layout()
 
 
-def plot_continuous_gaussian(
-    mu: Dict[str, torch.Tensor],
-    Sigma: torch.Tensor,
-    query_order: Sequence[str],
-    dims: Optional[Sequence[str]] = None,
-    n_std: float = 2.0,
-    grid_points: int = 400,
-    figsize: Tuple[int, int] = (6, 4),
-) -> plt.Figure:
+def plot_smc_ess(ess_traj: Sequence[float], N: int, title="SMC ESS trajectory"):
+    plt.figure()
+    plt.plot(ess_traj)
+    plt.axhline(0.5 * N, linestyle="--")  # threshold
+    plt.xlabel("topological step")
+    plt.ylabel("ESS")
+    plt.title(title)
+    plt.tight_layout()
+
+
+# --------------------------- SAMPLING ---------------------------
+
+
+def plot_discrete_freq_vs_truth(
+    freqs: np.ndarray, truth: np.ndarray, title="Discrete: sample freq vs truth"
+):
     """
-    Visualize Gaussian posterior:
-      - If len(dims)==1: plots the 1D pdf along that dimension.
-      - If len(dims)==2: plots 2D covariance ellipse (n_std).
-    `mu` is {name: tensor()}, `Sigma` is [k,k] aligned with `query_order`.
+    freqs, truth: [K]
     """
-    # Build mean vector in the order
-    k = len(query_order)
-    if k == 0:
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.text(0.5, 0.5, "Empty query", ha="center", va="center")
-        ax.axis("off")
-        return fig
-
-    mu_vec = torch.stack([mu[n].reshape(()) for n in query_order])
-    Sigma = Sigma
-
-    if dims is None:
-        dims = [query_order[0]]
-
-    if len(dims) == 1:
-        i = query_order.index(dims[0])
-        m = mu_vec[i].item()
-        v = Sigma[i, i].item()
-        x = torch.linspace(
-            m - 4.0 * math.sqrt(v + 1e-12), m + 4.0 * math.sqrt(v + 1e-12), grid_points
-        )
-        y = torch.exp(-0.5 * (x - m) ** 2 / max(v, 1e-12)) / math.sqrt(
-            2 * math.pi * max(v, 1e-12)
-        )
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.plot(_as_cpu(x), _as_cpu(y))
-        ax.set_title(f"Posterior N({dims[0]})")
-        ax.set_xlabel(dims[0])
-        ax.set_ylabel("density")
-        fig.tight_layout()
-        return fig
-
-    if len(dims) == 2:
-        i, j = query_order.index(dims[0]), query_order.index(dims[1])
-        mu2 = mu_vec[[i, j]]
-        S2 = Sigma[[i, j]][:, [i, j]]
-        fig, ax = plt.subplots(figsize=figsize)
-        ex, ey = _cov_ellipse_points(mu2, S2, n_std=n_std)
-        ax.plot(_as_cpu(ex), _as_cpu(ey))
-        ax.scatter([mu2[0].item()], [mu2[1].item()], marker="x")
-        ax.set_title(f"Posterior N({dims[0]}, {dims[1]}) – {n_std}σ ellipse")
-        ax.set_xlabel(dims[0])
-        ax.set_ylabel(dims[1])
-        fig.tight_layout()
-        return fig
-
-    # If more than 2 dims specified, show pair (first two)
-    return plot_continuous_gaussian(
-        mu, Sigma, query_order, dims=dims[:2], n_std=n_std, figsize=figsize
-    )
+    freqs = _to_np(freqs).ravel()
+    truth = _to_np(truth).ravel()
+    X = np.arange(len(freqs))
+    w = 0.35
+    plt.figure()
+    plt.bar(X - w / 2, truth, width=w, label="truth")
+    plt.bar(X + w / 2, freqs, width=w, label="samples")
+    plt.ylabel("probability")
+    plt.xticks(X, [f"k={i}" for i in X])
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Linear-Gaussian params inspection
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def plot_lg_params(
-    lg: LGParams,
-    figsize_W: Tuple[int, int] = (5, 4),
-    figsize_sigma: Tuple[int, int] = (5, 3),
-) -> Tuple[plt.Figure, plt.Figure]:
+def plot_continuous_pdf_vs_samples(
+    x_grid: np.ndarray,
+    pdf: np.ndarray,
+    samples: np.ndarray,
+    title="Continuous: pdf vs samples",
+):
     """
-    Heatmap of W and bar plot of sigma^2 for the continuous subgraph.
+    Plots analytic 1D pdf and histogram of samples.
     """
-    W = _as_cpu(lg.W)
-    s2 = _as_cpu(lg.sigma2)
-    names = lg.order
-
-    figW, axW = plt.subplots(figsize=figsize_W)
-    im = axW.imshow(W, aspect="auto", interpolation="nearest")
-    axW.set_title("Linear-Gaussian weights W (child row, parent col)")
-    axW.set_xlabel("Parent index")
-    axW.set_ylabel("Child index")
-    axW.set_xticks(range(len(names)))
-    axW.set_xticklabels(names, rotation=90, fontsize=8)
-    axW.set_yticks(range(len(names)))
-    axW.set_yticklabels(names, fontsize=8)
-    figW.colorbar(im, ax=axW, fraction=0.046, pad=0.04)
-    figW.tight_layout()
-
-    figS, axS = plt.subplots(figsize=figsize_sigma)
-    axS.bar(range(len(s2)), s2)
-    axS.set_title("Node noise variances σ²")
-    axS.set_xlabel("Node")
-    axS.set_ylabel("σ²")
-    axS.set_xticks(range(len(names)))
-    axS.set_xticklabels(names, rotation=90, fontsize=8)
-    figS.tight_layout()
-
-    return figW, figS
+    x_grid = _to_np(x_grid)
+    pdf = _to_np(pdf)
+    samples = _to_np(samples).ravel()
+    plt.figure()
+    plt.plot(x_grid, pdf, label="analytic")
+    plt.hist(samples, bins=40, density=True, alpha=0.4, label="samples")
+    plt.xlabel("x")
+    plt.ylabel("density")
+    plt.title(title)
+    plt.legend(loc="best")
+    plt.tight_layout()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Samples & approximate posterior diagnostics
-# ──────────────────────────────────────────────────────────────────────────────
+def plot_rmse_vs_n(
+    ns: Sequence[int],
+    rmses_mc: Sequence[float],
+    rmses_qmc: Optional[Sequence[float]] = None,
+    title="RMSE vs N",
+):
+    plt.figure()
+    plt.loglog(ns, rmses_mc, marker="o", label="MC")
+    if rmses_qmc is not None:
+        plt.loglog(ns, rmses_qmc, marker="o", label="QMC")
+    plt.xlabel("N samples")
+    plt.ylabel("RMSE")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
 
 
-def plot_continuous_samples(
-    samples: torch.Tensor, title: str = "Samples", figsize: Tuple[int, int] = (6, 4)
-) -> plt.Figure:
+def plot_autocorr(x: np.ndarray, max_lag: int = 100, title="Autocorrelation"):
     """
-    Plot a simple trace (if 1D) or scatter (if 2D) of samples.
-    `samples` shape: [S] or [S,2]. If [B,S] or [B,S,2], only the first batch is used.
+    x: [N] chain from Gibbs / MCMC
     """
-    x = _as_cpu(samples)
-    if x.ndim == 2 and x.shape[0] > 1:  # [B,S]
-        x = x[0]
-    if x.ndim == 3 and x.shape[0] > 1:  # [B,S,2]
-        x = x[0]
-
-    fig, ax = plt.subplots(figsize=figsize)
-    if x.ndim == 1:
-        ax.plot(range(len(x)), x)
-        ax.set_xlabel("sample idx")
-        ax.set_ylabel("value")
-    elif x.ndim == 2 and x.shape[1] == 2:
-        ax.scatter(x[:, 0], x[:, 1], s=10)
-        ax.set_xlabel("x1")
-        ax.set_ylabel("x2")
-    else:
-        ax.plot(range(x.shape[-2]), x[..., 0])
-        ax.set_xlabel("sample idx")
-        ax.set_ylabel("value[0]")
-    ax.set_title(title)
-    fig.tight_layout()
-    return fig
+    x = _to_np(x).ravel()
+    x = (x - x.mean()) / (x.std() + 1e-12)
+    ac = np.correlate(x, x, mode="full")
+    ac = ac[ac.size // 2 :]
+    ac = ac / ac[0]
+    plt.figure()
+    plt.plot(np.arange(min(max_lag, len(ac))), ac[:max_lag])
+    plt.xlabel("lag")
+    plt.ylabel("autocorrelation")
+    plt.title(title)
+    plt.tight_layout()
 
 
-def plot_weight_histogram(
-    weights: torch.Tensor,
-    title: str = "Importance weights",
-    figsize: Tuple[int, int] = (5, 3),
-) -> plt.Figure:
-    """
-    Histogram of (possibly batched) importance weights.
-    weights: [S] or [B,S] tensor.
-    """
-    w = _as_cpu(weights)
-    if w.ndim == 2:
-        w = w[0]
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.hist(w.numpy(), bins=30)
-    ax.set_title(title)
-    ax.set_xlabel("weight")
-    ax.set_ylabel("count")
-    fig.tight_layout()
-    return fig
+def plot_ate_bar(ey_do_a0, ey_do_a1, title="Interventional effect on Y"):
 
+    if isinstance(ey_do_a0, torch.Tensor):
+        ey_do_a0 = ey_do_a0.detach().cpu().item()
+    if isinstance(ey_do_a1, torch.Tensor):
+        ey_do_a1 = ey_do_a1.detach().cpu().item()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Discrete posteriors (from exact/approx)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def plot_discrete_posteriors(
-    out: Dict[str, torch.Tensor], figsize: Tuple[int, int] = (6, 4)
-) -> Dict[str, plt.Figure]:
-    """
-    Plot per-variable posterior marginals returned by discrete exact/approx:
-      out[var] is [C] or [B,C]. Returns {var: fig}.
-    """
-    figs: Dict[str, plt.Figure] = {}
-    for var, p in out.items():
-        figs[var] = plot_discrete_marginal(p, var, figsize=figsize)
-    return figs
+    means = np.array([ey_do_a0, ey_do_a1])
+    plt.figure()
+    plt.bar([0, 1], means, color=["#4682B4", "#CD5C5C"])
+    plt.xticks([0, 1], ["do(A=0)", "do(A=1)"])
+    plt.ylabel("E[Y]")
+    plt.title(title)
+    plt.tight_layout()

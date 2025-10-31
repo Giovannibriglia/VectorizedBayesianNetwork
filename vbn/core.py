@@ -1,672 +1,378 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Optional
 
-import networkx as nx
-import pandas as pd
+import numpy as np
 import torch
-import torch.nn as nn
-from tensordict import TensorDict
+from torch import nn
+
+from .inference import INFERENCE_BACKENDS
+from .learning import CPD_REGISTRY
+from .learning.base import BaseCPD
+from .utils import Tensor, topo_sort
 
 
-TDLike = Union[TensorDict, Dict[str, torch.Tensor], pd.DataFrame]
+class VBN:
+    """Minimal BN core with *integrated* parallel learning.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared metadata + parameter containers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class BNMeta:
-    G: nx.DiGraph
-    types: Dict[str, Literal["discrete", "continuous"]]
-    cards: Optional[Dict[str, int]]  # required for discrete nodes
-    order: List[str]  # topological order
-    parents: Dict[str, List[str]]
-
-    @staticmethod
-    def from_graph(
-        G: nx.DiGraph, types: Dict[str, str], cards: Optional[Dict[str, int]] = None
-    ) -> "BNMeta":
-        order = list(nx.topological_sort(G))
-        parents = {n: list(G.predecessors(n)) for n in G.nodes()}
-        return BNMeta(G=G, types=types, cards=cards, order=order, parents=parents)
-
-
-@dataclass
-class DiscreteCPDTable:
+    nodes: Dict[name, {"type": "discrete"|"gaussian", "card"|"dim": int}]
+    parents: Dict[name, List[parent_name]]
+    cpd: Dict[name, CPD]
     """
-    Tabular CPD for a single discrete node.
-    probs shape: [n_parent_configs, child_card] (or [1, C] if no parents)
-    """
-
-    probs: torch.Tensor
-    parent_names: List[str]
-    parent_cards: List[int]
-    child_card: int
-    strides: torch.Tensor  # [n_parents], to map parent assignment -> row index
-
-
-@dataclass
-class LGParams:
-    """
-    Linear-Gaussian params for the continuous subgraph only.
-    Names and indices refer only to continuous nodes (respecting topo order).
-    """
-
-    order: List[str]
-    name2idx: Dict[str, int]
-    W: torch.Tensor  # [nc, nc], strictly upper-triangular under topo order
-    b: torch.Tensor  # [nc]
-    sigma2: torch.Tensor  # [nc]
-
-
-@dataclass
-class LearnParams:
-    """
-    A single container for all families; you can fill any subset.
-    """
-
-    meta: BNMeta
-    # Discrete CPDs (tabular)
-    discrete_tables: Optional[Dict[str, DiscreteCPDTable]] = None
-    # Discrete neural CPDs (per-node models)
-    discrete_mlps: Optional[Dict[str, nn.Module]] = None
-    # Continuous: linear-Gaussian parameters (exact)
-    lg: Optional[LGParams] = None
-    # Continuous MLP CPDs (mean/logvar heads) + their parent meta
-    cont_mlps: Optional[Dict[str, nn.Module]] = None
-    cont_mlp_meta: Optional[Dict[str, Dict]] = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Thin BN facade wiring learners and inference backends
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class CausalBayesNet:
 
     def __init__(
         self,
-        G: nx.DiGraph,
-        types: Dict[str, str],
-        cards: Optional[Dict[str, int]] = None,
-        device: Optional[torch.device] = None,
-        dtype: torch.dtype = torch.float32,
+        nodes: Dict[str, Dict],
+        parents: Dict[str, List[str]],
+        device=None,
+        inference_method: str | None = None,
+        seed: int | None = None,
+        # ── NEW: learning knobs (optional) ─────────────────────────────────────
+        learner_map: Optional[
+            Dict[str, str]
+        ] = None,  # node -> kind ("mle","linear_gaussian","kde","gp_svgp")
+        default_batch_size: int = 2048,
+        default_steps_svgp_kde: int = 500,  # run minibatch steps automatically if gp_svgp/kde appear
+        default_steps_others: int = 0,  # keep 0 to preserve classic behavior for MLE/linear_gaussian
+        default_lr: float = 1e-3,
+        default_clip_grad: float = 1.0,
+        default_shuffle: bool = True,
+        **inf_kw,
     ):
-        self.meta = BNMeta.from_graph(G, types, cards)
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = (
+            torch.device(device)
+            if device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.dtype = dtype
+        self.nodes = nodes
+        self.parents = parents
+        self.topo_order = topo_sort({n: parents.get(n, []) for n in nodes})
+        self.cpd: Dict[str, object] = {}
+        self._inference_obj = None
+        self.inference_method = inference_method
 
-    @property
-    def variables(self) -> List[str]:
-        # choose topo order to keep parents-before-children where needed
-        return self.meta.order
+        # learning config
+        self._learner_map = learner_map or {}  # node -> kind
+        self._trainer: Optional[VBNParallelTrainer] = None
+        self._dl_defaults = dict(
+            batch_size=default_batch_size,
+            steps_svgp_kde=default_steps_svgp_kde,
+            steps_others=default_steps_others,
+            lr=default_lr,
+            clip_grad=default_clip_grad,
+            shuffle=default_shuffle,
+        )
 
-    @property
-    def types(self) -> Dict[str, str]:
-        return self.meta.types
+        if seed is not None:
+            self.seed = seed
+            self.set_seed(seed)
 
-    @property
-    def parents(self) -> Dict[str, List[str]]:
-        return self.meta.parents
+        if inference_method is not None:
+            self.set_inference(inference_method, **inf_kw)
 
-    @property
-    def cards(self) -> Optional[Dict[str, int]]:
-        return self.meta.cards
+    # ─────────────────────────────────────────────────────────────────────────
+    # RNG / inference wiring
+    # ─────────────────────────────────────────────────────────────────────────
+    def set_seed(self, seed):
+        self.seed = seed
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
 
-    def _normalize_fit_input(self, data: TDLike) -> Dict[str, torch.Tensor]:
-        """Accepts DataFrame or dict; returns dict[str, Tensor] on self.device with proper dtypes."""
-        if isinstance(data, pd.DataFrame):
-            cols = [k for k in self.variables if k in data.columns]
-            if not cols:
-                raise ValueError("DataFrame has no columns matching BN variables.")
-            mapping = {k: torch.as_tensor(data[k].values) for k in cols}
-        elif isinstance(data, dict):
-            mapping = {
-                k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
-                for k, v in data.items()
-            }
-        else:
-            raise TypeError("fit_* expects a dict[str, Tensor] or a pandas.DataFrame")
+    def set_inference(self, method: str = "lw", **kwargs):
+        cls = INFERENCE_BACKENDS.get(method)
+        if cls is None:
+            raise ValueError(f"Unknown inference method: {method}")
+        self._inference_obj = cls(device=self.device, **kwargs)
+        self.inference_method = method
+        return self
 
-        # dtype/device normalization
-        out = {}
-        for k, t in mapping.items():
-            if self.types.get(k, "discrete") == "discrete":
-                out[k] = t.to(self.device).long()
-            else:
-                out[k] = t.to(self.device).float()
-        return out
+    # ─────────────────────────────────────────────────────────────────────────
+    # CPD / learner wiring
+    # ─────────────────────────────────────────────────────────────────────────
+    def set_cpd(self, name: str, cpd) -> None:
+        """Manual CPD injection (kept for back-compat)."""
+        self.cpd[name] = cpd
+        # If a trainer already exists, mirror the CPD into it next time we build.
 
-    def fit(self, method: str, data: TDLike, **kw) -> LearnParams:
-        from vbn import learning
+    def set_learners(self, mapping: Dict[str, str]) -> None:
+        """Override auto learner selection per node (kind ∈ CPD_REGISTRY)."""
+        for node, kind in mapping.items():
+            if kind not in CPD_REGISTRY:
+                raise ValueError(f"Unknown CPD kind '{kind}' for node '{node}'.")
+        self._learner_map.update(mapping)
+        # Invalidate trainer so it can be rebuilt with the new mapping
+        self._trainer = None
 
-        if method == "discrete_mle":
-            return learning.DiscreteMLELearner(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            ).fit(data)
-        elif method == "discrete_mlp":
-            data = self._normalize_fit_input(data)
-            return learning.DiscreteMLPLearner(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            ).fit(data)
-        elif method == "continuous_gaussian":
-            data = self._normalize_fit_input(data)
-            return learning.GaussianLinearLearner(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            ).fit(data)
-        elif method == "continuous_mlp_gaussian":
-            data = self._normalize_fit_input(data)
-            return learning.ContinuousMLPLearner(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            ).fit(data)
-        else:
-            raise NotImplementedError(method)
+    def _default_kind_for(self, node: str) -> str:
+        info = self.nodes[node]
+        t = info.get("type", "gaussian")
+        if t == "discrete":
+            return "mle"
+        # continuous
+        return "linear_gaussian"
 
-    def materialize(self, method: str, lp: LearnParams, **kw) -> LearnParams:
-        from vbn import learning
-
-        if method == "discrete_mlp":
-            return learning.DiscreteMLPLearner(
-                self.meta, device=self.device, dtype=self.dtype
-            ).materialize_tables(lp)
-        elif method == "continuous_mlp_gaussian":
-            pivot = kw.get("pivot", None)
-            data = kw.get("data", None)
-            norm_pivot = (
-                None
-                if pivot is None
-                else {
-                    k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
-                    for k, v in pivot.items()
-                }
+    def _node_specs(self) -> List[NodeSpec]:
+        specs: List[NodeSpec] = []
+        for n in self.topo_order:
+            info = self.nodes[n]
+            kind = self._learner_map.get(n, self._default_kind_for(n))
+            if kind not in CPD_REGISTRY:
+                raise ValueError(f"Node '{n}': unknown learner kind '{kind}'.")
+            y_shape = int(
+                info.get("card")
+                if info.get("type") == "discrete"
+                else info.get("dim", 1)
             )
-            norm_data = None if data is None else self._normalize_fit_input(data)
-            return learning.continuous_mlp.materialize_lg_from_cont_mlp(
-                lp, pivot=norm_pivot, data=norm_data
-            )
-        else:
-            raise NotImplementedError(method)
+            specs.append(NodeSpec(n, kind=kind, y_shape=y_shape))
+        return specs
 
-    def setup_inference(self, method: str, **kw):
-        from vbn import inference
+    def _ensure_trainer(self):
+        if self._trainer is not None:
+            return
+        specs = self._node_specs()
+        self._trainer = VBNParallelTrainer(self, specs, device=self.device)
 
-        if method == "discrete_exact":
-            return inference.DiscreteExactVEInference(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            )
-        elif method == "continuous_gaussian":
-            return inference.ContinuousLGInference(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            )
-        elif method == "discrete_approx":
-            return inference.DiscreteApproxInference(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            )
-        elif method == "continuous_approx":
-            return inference.ContinuousApproxInference(
-                self.meta, device=self.device, dtype=self.dtype, **kw
-            )
-        else:
-            raise NotImplementedError(method)
-
-    @torch.no_grad()
-    def _safe_ridge_solve(
+    # ─────────────────────────────────────────────────────────────────────────
+    # LEARNING — now *integrates* parallel init + (optional) minibatch training
+    # ─────────────────────────────────────────────────────────────────────────
+    def fit(
         self,
-        XTX: torch.Tensor,
-        XTy: torch.Tensor,
-        ridge_start: float = 1e-6,
-        max_ridge: float = 1e6,
-        tries: int = 8,
-    ):
-        """Solve (XTX + λI) β = XTy robustly; escalate λ if needed; fallback to lstsq/pinv."""
-        # Clean bad values
-        XTX = torch.nan_to_num(XTX, nan=0.0, posinf=0.0, neginf=0.0)
-        XTy = torch.nan_to_num(XTy, nan=0.0, posinf=0.0, neginf=0.0)
+        data: Dict[str, torch.Tensor],
+        steps: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+        clip_grad: Optional[float] = None,
+        shuffle: Optional[bool] = None,
+    ) -> None:
+        """
+        Learn all CPDs in parallel. Behavior:
+          • Builds CPDs from nodes if missing (auto mapping).
+          • Offline init on full data (always).
+          • Then *optionally* runs joint minibatch optimization:
+                - If `steps` is provided, use that.
+                - Else, if any node uses 'gp_svgp' or 'kde', default to steps_svgp_kde.
+                - Else, default to steps_others (0 by default for back-compat).
+        """
+        # If the user manually set *all* CPDs, keep them; else build trainer CPDs.
+        self._ensure_trainer()
 
-        D = XTX.shape[0]
-        if D == 0:
-            # degenerate: no params; return empty
-            return torch.empty((0, 1), device=XTX.device, dtype=XTX.dtype), ridge_start
+        # Good defaults
+        batch_size = batch_size or self._dl_defaults["batch_size"]
+        lr = lr if lr is not None else self._dl_defaults["lr"]
+        clip_grad = (
+            clip_grad if clip_grad is not None else self._dl_defaults["clip_grad"]
+        )
+        shuffle = shuffle if shuffle is not None else self._dl_defaults["shuffle"]
 
-        identity = torch.eye(D, device=XTX.device, dtype=XTX.dtype)
-        lam = float(ridge_start)
+        # Decide a default `steps` if not explicitly given
+        if steps is None:
+            kinds = {spec.kind for spec in self._trainer.cpds.values()}
+            # `kinds` is actually modules; grab their class-bound “kind” by re-deriving from specs:
+            kinds = {s.kind for s in self._node_specs()}
+            if any(k in {"gp_svgp", "kde"} for k in kinds):
+                steps = int(self._dl_defaults["steps_svgp_kde"])
+            else:
+                steps = int(self._dl_defaults["steps_others"])
 
-        for _ in range(tries):
-            A = XTX + lam * identity
-            try:
-                beta = torch.linalg.solve(A, XTy)
-                return beta, lam
-            except torch._C._LinAlgError:
-                lam = min(max(lam * 10.0, 1e-12), max_ridge)
+        # 1) Always offline initialize from the full batch
+        self._trainer.fit(data)
 
-        # Fallbacks
-        A = XTX + lam * identity
-        try:
-            beta = torch.linalg.lstsq(A, XTy).solution
-        except Exception:
-            beta = torch.linalg.pinv(A) @ XTy
-        return beta, lam
+        # 2) Optional joint minibatch optimization
+        if steps and steps > 0:
+            loader = DictDataLoader(data, batch_size=batch_size, shuffle=shuffle)
+            self._trainer.train_minibatch(
+                loader, steps=steps, lr=lr, clip_grad=clip_grad
+            )
 
-    @staticmethod
-    def infer(
-        inference_obj,
-        lp: LearnParams,
-        evidence: Dict[str, torch.Tensor],
-        query: List[str],
+    def partial_fit(self, data: Dict[str, torch.Tensor]) -> None:
+        """Streaming update (EMA/count updates, or small ELBO/NLL steps depending on CPD)."""
+        self._ensure_trainer()
+        self._trainer.partial_fit(data)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SAMPLING / INFERENCE (unchanged)
+    # ─────────────────────────────────────────────────────────────────────────
+    def sample(
+        self,
+        n_samples: int = 1024,
         do: Optional[Dict[str, torch.Tensor]] = None,
-        return_samples: bool = False,
+        method: str = "ancestral",
         **kw,
     ):
-        return inference_obj.posterior(lp, evidence, query, do, return_samples, **kw)
+        from .sampling import sample as _sample
 
-    @staticmethod
-    def save_params(lp: LearnParams, path: str) -> None:
-        from .io import save_learnparams
-
-        save_learnparams(path, lp)
-
-    def load_params(
-        self, path: str, map_location: Optional[torch.device] = None
-    ) -> LearnParams:
-        from .io import load_learnparams
-
-        lp = load_learnparams(path, map_location=map_location or self.device)
-        return lp
-
-    # ---- 1) canonical ingest -> tensordict ---------------------------------
-    def _to_tensordict(
-        self, data: TDLike, device: Optional[torch.device] = None
-    ) -> TensorDict:
-        if isinstance(data, TensorDict):
-            td = data
-        elif isinstance(data, pd.DataFrame):
-            # only take columns that belong to the BN; preserve topo order
-            cols = [k for k in self.variables if k in data.columns]
-            if not cols:
-                raise ValueError("DataFrame has no columns matching BN variables.")
-            mapping = {k: torch.as_tensor(data[k].values) for k in cols}
-            td = TensorDict(mapping, batch_size=[len(data)])
-        elif isinstance(data, dict):
-            mapping = {}
-            n = None
-            for k in self.variables:
-                if k not in data:
-                    continue
-                t = torch.as_tensor(data[k])
-                n = t.shape[0] if n is None else n
-                assert t.shape[0] == n, f"Batch mismatch for key {k}"
-                mapping[k] = t
-            if not mapping:
-                raise ValueError("No valid keys found to build a TensorDict.")
-            td = TensorDict(mapping, batch_size=[n])
-        else:
-            raise TypeError(
-                "Unsupported data type; use TensorDict, dict, or DataFrame."
-            )
-
-        dev = device or self.device
-        out = {}
-        for k, t in td.items():
-            if self.types.get(k, "discrete") == "discrete":
-                out[k] = t.to(dev).long()
-            else:
-                out[k] = t.to(dev).float()
-        return TensorDict(out, batch_size=[next(iter(out.values())).shape[0]])
-
-    # ---- 2) extend the in-memory dataset -----------------------------------
-
-    # --- NEW: tiny helper to build strides given parent cards ---
-    def _make_strides(self, cards: List[int], device, dtype=torch.long) -> torch.Tensor:
-        if not cards:
-            return torch.empty(0, device=device, dtype=dtype)
-        s = [1] * len(cards)
-        # row-major: stride[j] = product_{k>j} cards[k]
-        for i in range(len(cards) - 2, -1, -1):
-            s[i] = s[i + 1] * cards[i + 1]
-        return torch.tensor(s, device=device, dtype=dtype)
-
-    @torch.no_grad()
-    def add_data(
-        self,
-        new_data: TDLike,
-        validate: bool = True,
-        update_params: bool = False,
-        return_lp: bool = False,  # <-- NEW
-        **partial_fit_kwargs,
-    ):
-        """
-        Append rows to the model's dataset.
-        If update_params=True, also perform an incremental parameter update.
-        If return_lp=True, return a LearnParams snapshot reflecting all data seen so far.
-        """
-        td_new = self._to_tensordict(new_data, device=self.device)
-        if validate:
-            self._validate_batch(td_new)
-
-        # ensure buffers exist before optional online update
-        self._ensure_incremental_buffers()
-
-        if not hasattr(self, "data") or self.data is None:
-            self.data = td_new.clone()
-        else:
-            self.data = TensorDict.cat([self.data, td_new], dim=0)
-
-        if update_params:
-            self.partial_fit(td_new, **partial_fit_kwargs)
-
-        if return_lp:
-            # Make sure probs and LG params are materialized
-            self._finalize_incremental_updates()
-            return self._to_learnparams()  # <-- NEW
-        # default: keep old behavior (no return)
-
-    # --- NEW: convert the current incremental buffers into a LearnParams ---
-    @torch.no_grad()
-    def _to_learnparams(self) -> LearnParams:
-        # Discrete tables
-        disc_tables: Optional[Dict[str, DiscreteCPDTable]] = {}
-        for node, ntype in self.types.items():
-            if ntype != "discrete":
-                continue
-            if not hasattr(self, "tabular_probs") or node not in self.tabular_probs:
-                continue
-            probs = self.tabular_probs[node]
-            pars = self.parents.get(node, [])
-            child_card = int(self.cards[node]) if self.cards else int(probs.shape[-1])
-            if probs.ndim == 1:
-                probs = probs.view(1, -1)  # [1, C] for parentless nodes
-
-            parent_cards = [int(self.cards[p]) for p in pars] if self.cards else []
-            strides = self._make_strides(parent_cards, device=self.device)
-
-            disc_tables[node] = DiscreteCPDTable(
-                probs=probs.to(device=self.device, dtype=self.dtype),
-                parent_names=pars,
-                parent_cards=parent_cards,
-                child_card=child_card,
-                strides=strides,
-            )
-        if not disc_tables:
-            disc_tables = None
-
-        # Linear-Gaussian block (continuous subgraph only)
-        cont_order = [n for n in self.variables if self.types.get(n) == "continuous"]
-        if cont_order and hasattr(self, "lin_weights"):
-            name2idx = {n: i for i, n in enumerate(cont_order)}
-            nc = len(cont_order)
-            W = torch.zeros((nc, nc), device=self.device, dtype=self.dtype)
-            b = torch.zeros((nc,), device=self.device, dtype=self.dtype)
-            sigma2 = torch.full((nc,), 1e-9, device=self.device, dtype=self.dtype)
-            for i, child in enumerate(cont_order):
-                beta = self.lin_weights.get(child, None)
-                if beta is None:
-                    continue
-                # beta = [bias, coeff(parent_0), coeff(parent_1), ...]
-                b[i] = beta[0].to(self.device, self.dtype)
-                # Only continuous parents go into LG W
-                cont_pars = [
-                    p
-                    for p in self.parents.get(child, [])
-                    if self.types.get(p) == "continuous"
-                ]
-                for j, p in enumerate(cont_pars):
-                    pi = name2idx[p]
-                    W[i, pi] = beta[1 + j].to(self.device, self.dtype)
-                if hasattr(self, "lin_noise_var") and child in self.lin_noise_var:
-                    sigma2[i] = torch.as_tensor(
-                        self.lin_noise_var[child], device=self.device, dtype=self.dtype
-                    )
-            lg = LGParams(order=cont_order, name2idx=name2idx, W=W, b=b, sigma2=sigma2)
-        else:
-            lg = None
-
-        # Build the LearnParams (neural CPDs, if any, remain as-is in memory—none are created here)
-        lp = LearnParams(
-            meta=self.meta,
-            discrete_tables=disc_tables,
-            discrete_mlps=None,
-            lg=lg,
-            cont_mlps=None,
-            cont_mlp_meta=None,
+        return _sample(
+            self, n=n_samples, do=do, method=method, device=self.device, **kw
         )
-        return lp
 
-    def _validate_batch(self, td: TensorDict):
-        for var in self.variables:
-            if var not in td:
-                continue
-            if self.types.get(var, "discrete") == "discrete":
-                if td[var].dtype.is_floating_point:
-                    raise ValueError(
-                        f"{var}: expected integer tensor for discrete var."
-                    )
-                if self.cards and var in self.cards:
-                    vmax = int(td[var].max().item())
-                    assert (
-                        vmax < self.cards[var]
-                    ), f"{var}: value {vmax} ≥ card {self.cards[var]}"
-            else:
-                if not td[var].dtype.is_floating_point:
-                    raise ValueError(
-                        f"{var}: expected float tensor for continuous var."
-                    )
-
-    # ---- 3) incremental parameter update ("partial_fit") --------------------
-    def partial_fit(
+    def sample_conditional(
         self,
-        td_new: Optional[TensorDict] = None,
-        epochs: int = 1,
-        batch_size: int = 8192,
-        lr: Optional[float] = None,
+        evidence: Dict[str, torch.Tensor],
+        n_samples: int = 1024,
+        do: Optional[Dict[str, torch.Tensor]] = None,
+        **kw,
     ):
-        self._ensure_incremental_buffers()
-        td_iter = self._batch_iterator(
-            self.data if td_new is None else td_new, batch_size
+        from .sampling import sample_conditional as _samplec
+
+        return _samplec(
+            self, evidence=evidence, n=n_samples, do=do, device=self.device, **kw
         )
-        for _ in range(epochs):
-            for td_b in td_iter:
-                self._update_discrete_sufficient_stats(td_b)
-                self._update_continuous_sufficient_stats(td_b, lr=lr)
-        self._finalize_incremental_updates()
 
-    # ---- 4) helpers for incremental updates --------------------------------
-    @torch.no_grad()
-    def _update_discrete_sufficient_stats(self, td_b: TensorDict):
-        for node, ntype in self.types.items():
-            if ntype != "discrete" or node not in td_b:
-                continue
-            pars = self.parents.get(node, [])
-            if any(p not in td_b for p in pars):
-                continue
-            y = td_b[node].view(-1).long()
-            if pars:
-                parent_cards = [self.cards[p] for p in pars]
-                parent_vals = [td_b[p].view(-1).long() for p in pars]
-                parent_idx = self._ravel_multi_index(parent_vals, parent_cards)
-                counts = self.tabular_counts[node]
-                Pcfg, card_y = counts.shape
-                idx = parent_idx * card_y + y
-                flat = torch.bincount(idx, minlength=Pcfg * card_y).view(Pcfg, card_y)
-                self.tabular_counts[node] = counts + flat
-            else:
-                card_y = self.cards[node]
-                flat = torch.bincount(y, minlength=card_y).to(
-                    self.tabular_counts[node].dtype
-                )
-                self.tabular_counts[node] = self.tabular_counts[node] + flat
-
-    @torch.no_grad()
-    def _update_continuous_sufficient_stats(
-        self, td_b: TensorDict, lr: Optional[float]
+    def posterior(
+        self,
+        query,
+        evidence=None,
+        do=None,
+        n_samples: int = 4096,
+        method: str | None = None,
+        **kwargs,
     ):
-        for node, ntype in self.types.items():
-            if ntype != "continuous" or node not in td_b:
-                continue
-            pars = self.parents.get(node, [])
-            if any(p not in td_b for p in pars):
-                continue
-            y = td_b[node].float().view(-1, 1)
-            X = (
-                torch.cat(
-                    [torch.ones_like(y)] + [td_b[p].float().view(-1, 1) for p in pars],
-                    dim=1,
-                )
-                if pars
-                else torch.ones_like(y)
-            )
-            self.XTX[node] += X.T @ X
-            self.XTy[node] += X.T @ y
-            self.yy[node] += (y.T @ y).squeeze()
-            self.N[node] += X.shape[0]
+        if method is not None and (
+            self._inference_obj is None or method != self.inference_method
+        ):
+            self.set_inference(method, **kwargs)
+        elif self._inference_obj is None:
+            self.set_inference("lw", **kwargs)
 
-    @torch.no_grad()
-    def _finalize_incremental_updates(self, ridge: float = 1e-6):
-        # -------- Discrete (unchanged) --------
-        for node, ntype in self.types.items():
-            if ntype == "discrete":
-                C = self.tabular_counts[node]
-                if C.ndim == 1:
-                    Z = C.sum().clamp_min(1.0)
-                    self.tabular_probs[node] = C / Z
-                else:
-                    Z = C.sum(dim=1, keepdim=True).clamp_min(1.0)
-                    self.tabular_probs[node] = C / Z
-
-        # -------- Continuous (robust solve) --------
-        for node, ntype in self.types.items():
-            if ntype != "continuous":
-                continue
-
-            XTX = self.XTX[node]
-            XTy = self.XTy[node]
-            N = int(self.N[node])  # total rows seen
-            if N <= 0:
-                # no data yet: zero weights, small noise
-                D = XTX.shape[0]
-                self.lin_weights[node] = torch.zeros(
-                    D, device=self.device, dtype=self.dtype
-                )
-                self.lin_noise_var[node] = 1e-6
-                continue
-
-            # Solve (XTX + λI) β = XTy robustly
-            beta, used_ridge = self._safe_ridge_solve(XTX, XTy, ridge_start=ridge)
-
-            # Store β
-            self.lin_weights[node] = beta.squeeze(1)
-
-            # noise variance: σ^2 = (yy - 2βᵀXTy + βᵀXTXβ) / max(N - dof, 1)
-            yy = float(self.yy[node])
-            bTXTy = float((beta.T @ XTy).item())
-            bTXTXb = float((beta.T @ XTX @ beta).item())
-            dof = max(XTX.shape[0], 1)  # parameters count
-            denom = max(N - dof, 1)  # avoid zero/neg
-            s2 = (yy - 2.0 * bTXTy + bTXTXb) / denom
-            if not (s2 > 0 and torch.isfinite(torch.tensor(s2))):
-                s2 = 1e-6
-            self.lin_noise_var[node] = float(s2)
-
-    # ---- 5) utilities -------------------------------------------------------
-    @staticmethod
-    def _ravel_multi_index(vals_list, dims):
-        """
-        Convert list of integer tensors [v0, v1, ...] with 0<=vk<dims[k]
-        into a single flat index tensor, row-major.
-        """
-        idx = vals_list[0]
-        for v, d in zip(vals_list[1:], dims[1:]):
-            idx = idx * d + v
-        return idx
-
-    def _batch_iterator(self, td: TensorDict, batch_size: int):
-        N = td.batch_size[0]
-        for i in range(0, N, batch_size):
-            j = min(i + batch_size, N)
-            yield td[i:j]
-
-    def _ensure_incremental_buffers(self):
-        # discrete
-        if not hasattr(self, "tabular_counts"):
-            self.tabular_counts = {}
-        if not hasattr(self, "tabular_probs"):
-            self.tabular_probs = {}
-        # continuous (linear-Gaussian)
-        if not hasattr(self, "XTX"):
-            self.XTX, self.XTy, self.yy, self.N = {}, {}, {}, {}
-        if not hasattr(self, "lin_weights"):
-            self.lin_weights, self.lin_noise_var = {}, {}
-        # allocate per node if missing
-        for node, ntype in self.types.items():
-            if ntype == "discrete":
-                pars = self.parents.get(node, [])
-                if self.cards is None or node not in self.cards:
-                    continue  # can’t size counts without card
-                child_card = self.cards[node]
-                if pars and self.cards:
-                    pcfg = 1
-                    for p in pars:
-                        pcfg *= self.cards[p]
-                    shape = (pcfg, child_card)
-                else:
-                    shape = (child_card,)
-                if node not in self.tabular_counts:
-                    self.tabular_counts[node] = torch.zeros(
-                        *shape, device=self.device, dtype=torch.float64
-                    )
-            else:
-                pars = self.parents.get(node, [])
-                D = 1 + len(pars)  # affine
-                if node not in self.XTX:
-                    self.XTX[node] = torch.zeros(
-                        (D, D), device=self.device, dtype=self.dtype
-                    )
-                    self.XTy[node] = torch.zeros(
-                        (D, 1), device=self.device, dtype=self.dtype
-                    )
-                    self.yy[node] = torch.tensor(
-                        0.0, device=self.device, dtype=self.dtype
-                    )
-                    self.N[node] = 0
+        backend = self._inference_obj
+        call_kw = dict(bn=self, query=query, evidence=evidence, do=do)
+        if "n_samples" in backend.posterior.__code__.co_varnames:
+            call_kw["n_samples"] = n_samples
+        for k, v in kwargs.items():
+            if k not in ("device",):
+                call_kw[k] = v
+        return backend.posterior(**call_kw)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Merge helper: combine multiple LearnParams into one
-# ─────────────────────────────────────────────────────────────────────────────
-def merge_learnparams(*lps: LearnParams) -> LearnParams:
-    assert len(lps) >= 1, "Provide at least one LearnParams"
-    meta = lps[0].meta
-    out = LearnParams(
-        meta=meta,
-        discrete_tables={},
-        discrete_mlps={},
-        lg=None,
-        cont_mlps={},
-        cont_mlp_meta={},
+def build_cpd(
+    name: str, kind: str, parents: Dict[str, int], y_shape: int, **kw
+) -> BaseCPD:
+    cls = CPD_REGISTRY[kind]
+    return cls(
+        name=name,
+        parents=parents,
+        **(
+            {"card_y": y_shape}
+            if kind == "mle"
+            else {
+                (
+                    "out_dim" if kind in ("linear_gaussian", "gp_svgp") else "y_dim"
+                ): y_shape
+            }
+        ),
+        **kw,
     )
-    for lp in lps:
-        assert lp.meta.order == meta.order, "All LearnParams must share the same BN"
-        if lp.discrete_tables:
-            out.discrete_tables.update(lp.discrete_tables)
-        if lp.discrete_mlps:
-            out.discrete_mlps.update(lp.discrete_mlps)
-        if lp.cont_mlps:
-            out.cont_mlps.update(lp.cont_mlps)
-        if lp.cont_mlp_meta:
-            out.cont_mlp_meta.update(lp.cont_mlp_meta)
-        if lp.lg is not None:
-            out.lg = lp.lg  # last-wins if multiple
-    # Normalize empties to None
-    if not out.discrete_tables:
-        out.discrete_tables = None
-    if not out.discrete_mlps:
-        out.discrete_mlps = None
-    if not out.cont_mlps:
-        out.cont_mlps = None
-    if not out.cont_mlp_meta:
-        out.cont_mlp_meta = None
-    return out
+
+
+@dataclass
+class NodeSpec:
+    name: str
+    kind: str  # one of CPD_REGISTRY keys
+    y_shape: int  # card for discrete / dimension for continuous
+
+
+class VBNParallelTrainer(nn.Module):
+    def __init__(
+        self,
+        vbn,
+        node_specs: List[NodeSpec],
+        device: Optional[str | torch.device] = None,
+    ):
+        super().__init__()
+        self.vbn = vbn
+        self.device = torch.device(device or vbn.device)
+        self.cpds = nn.ModuleDict()
+        # build CPDs per node
+        for spec in node_specs:
+            par_names = vbn.parents.get(spec.name, [])
+            par_dims: Dict[str, int] = {}
+            for p in par_names:
+                pinfo = vbn.nodes[p]
+                if pinfo.get("type", "gaussian") == "discrete":
+                    par_dims[p] = int(pinfo.get("card", 1))
+                else:
+                    par_dims[p] = int(pinfo.get("dim", 1))
+            cpd = CPD_REGISTRY[spec.kind](
+                name=spec.name,
+                parents=par_dims,
+                card_y=spec.y_shape if spec.kind == "mle" else None,
+                out_dim=(
+                    spec.y_shape
+                    if spec.kind in ("linear_gaussian", "gp_svgp")
+                    else None
+                ),
+                y_dim=spec.y_shape if spec.kind == "kde" else None,
+                device=self.device,
+            )
+            self.cpds[spec.name] = cpd
+            self.vbn.set_cpd(spec.name, cpd)
+        self.to(self.device)
+
+    def _split_parents(self, batch: Dict[str, Tensor], node: str) -> Dict[str, Tensor]:
+        par = {}
+        for p in self.vbn.parents.get(node, []):
+            par[p] = batch[p]
+        return par
+
+    def nll(self, batch: Dict[str, Tensor]) -> Tensor:
+        losses = []
+        for node, cpd in self.cpds.items():
+            par = self._split_parents(batch, node)
+            y = batch[node]
+            losses.append(-cpd.log_prob(y, par).mean())
+        return torch.stack(losses).sum()
+
+    @torch.no_grad()
+    def fit(self, data: Dict[str, Tensor]) -> None:
+        # initialize each CPD from full batch
+        for node, cpd in self.cpds.items():
+            par = self._split_parents(data, node)
+            cpd.fit(par, data[node])
+
+    @torch.no_grad()
+    def partial_fit(self, data: Dict[str, Tensor]) -> None:
+        for node, cpd in self.cpds.items():
+            par = self._split_parents(data, node)
+            cpd.update(par, data[node])
+
+    def train_minibatch(
+        self, iterator, steps: int = 1000, lr: float = 1e-3, clip_grad: float = 1.0
+    ) -> None:
+        self.train()
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
+        it = iter(iterator)
+        for _ in range(steps):
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            # ensure device
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            opt.zero_grad(set_to_none=True)
+            loss = self.nll(batch)
+            loss.backward()
+            if clip_grad:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), clip_grad)
+            opt.step()
+
+
+class DictDataLoader:
+    def __init__(
+        self, data: Dict[str, Tensor], batch_size: int = 1024, shuffle: bool = True
+    ):
+        N = next(iter(data.values())).shape[0]
+        self.data = data
+        self.N = N
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        idx = torch.randperm(self.N) if self.shuffle else torch.arange(self.N)
+        for s in range(0, self.N, self.batch_size):
+            sel = idx[s : s + self.batch_size]
+            yield {k: v[sel] for k, v in self.data.items()}

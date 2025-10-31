@@ -1,25 +1,28 @@
-from abc import ABC
-from typing import Dict, List, Optional
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, Sequence
 
 import torch
 
+Tensor = torch.Tensor
 
-class BaseInference(ABC):
-    def __init__(self, meta, device=None, dtype=torch.float32):
-        self.meta = meta
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-        self.dtype = dtype
 
-    @torch.no_grad()
+class InferenceBackend(ABC):
+    """Minimal sampling-based backend interface.
+    Supports evidence and interventions via node clamping/override during sampling.
+    """
+
+    def __init__(self, device: str | torch.device = "cpu", **kwargs):
+        self.device = torch.device(device)
+
+    @abstractmethod
     def posterior(
         self,
-        lp,
-        evidence: Dict[str, torch.Tensor],
-        query: List[str],
-        do: Optional[Dict[str, torch.Tensor]] = None,
-        return_samples: bool = False,
-        **kwargs,
-    ):
+        bn,
+        query: Sequence[str],
+        evidence: Optional[Dict[str, Tensor]] = None,
+        do: Optional[Dict[str, Tensor]] = None,
+        **kw,
+    ) -> Dict[str, Tensor]:
         raise NotImplementedError
