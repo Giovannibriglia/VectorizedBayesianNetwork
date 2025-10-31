@@ -271,16 +271,26 @@ class SVGPRegCPD(BaseCPD):
 
     @torch.no_grad()
     def update(
-        self, parents: Dict[str, Tensor], y: Tensor, alpha: float = 5e-3
+        self, parents: Dict[str, Tensor], y: Tensor, alpha: float = 5e-3, steps: int = 3
     ) -> None:
-        # small online step on ELBO
+        """Small online ELBO step(s) to assimilate a new batch."""
         self.train()
-        opt = torch.optim.Adam(self.parameters(), lr=alpha)
-        for _ in range(3):
-            opt.zero_grad(set_to_none=True)
-            loss = self.elbo(y, parents)
-            loss.backward()
-            opt.step()
+        # keep a tiny optimizer around across updates to avoid re-init each call (optional)
+        if not hasattr(self, "_upd_opt"):
+            self._upd_opt = torch.optim.Adam(self.parameters(), lr=alpha)
+        opt = self._upd_opt
+        # even if caller disabled grads, re-enable here
+
+        with torch.enable_grad():
+            for _ in range(int(steps)):
+                opt.zero_grad(set_to_none=True)
+                loss = self.elbo(y, parents)  # must track params
+                if not loss.requires_grad:
+                    raise RuntimeError(
+                        "SVGP.update(): ELBO has no grad; check for outer no_grad/inference_mode."
+                    )
+                loss.backward()
+                opt.step()
 
     @torch.no_grad()
     def sample(self, parents: Dict[str, Tensor], n_samples: int) -> Tensor:

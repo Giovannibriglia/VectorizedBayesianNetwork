@@ -81,13 +81,18 @@ class LinearGaussianCPD(BaseCPD):
 
     @torch.no_grad()
     def update(
-        self, parents: Dict[str, Tensor], y: Tensor, alpha: float = 0.05
+        self, parents: Dict[str, Tensor], y: Tensor, lr: float = 1e-2, steps: int = 1
     ) -> None:
+        """Small ELBO/NLL step(s) to assimilate a new batch."""
         self.train()
-        opt = torch.optim.SGD(self.parameters(), lr=alpha)
-        opt.zero_grad(set_to_none=True)
-        (-self.log_prob(y, parents).mean()).backward()
-        opt.step()
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
+
+        with torch.enable_grad():
+            for _ in range(int(steps)):
+                opt.zero_grad(set_to_none=True)
+                loss = -self.log_prob(y, parents).mean()
+                loss.backward()
+                opt.step()
 
     @torch.no_grad()
     def sample(self, parents: Dict[str, Tensor], n_samples: int) -> Tensor:

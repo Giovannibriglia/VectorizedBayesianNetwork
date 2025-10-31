@@ -101,8 +101,8 @@ class VBNParallelTrainer(nn.Module):
         for n, cpd in self.cpds.items():
             cpd.fit(self._parents(data, n), data[n])
 
-    @torch.no_grad()
     def partial_fit(self, data: Dict[str, Tensor]) -> None:
+        # Updates may require autograd (LG, SVGP). No no_grad here.
         for n, cpd in self.cpds.items():
             cpd.update(self._parents(data, n), data[n])
 
