@@ -1,115 +1,131 @@
-# examples/03_save_load_and_plot.py
 from __future__ import annotations
 
-from pathlib import Path
-
-import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
-import pandas as pd
 import torch
 
-from vbn.core import CausalBayesNet, LearnParams
+from vbn import VBN
+from vbn.io import load_state, save_state
 
-# ---------------- BN & data ----------------
-G = nx.DiGraph([("X", "Y"), ("Z", "Y"), ("Y", "A")])
-types = {"X": "discrete", "Z": "discrete", "Y": "discrete", "A": "continuous"}
-cards = {"X": 3, "Z": 2, "Y": 4}
-bn = CausalBayesNet(G, types, cards)
+# 1) Define a tiny BN: A -> X -> R with A -> R
+#    A: discrete {0,1}; X,R: Gaussian (dim=1)
+nodes = {
+    "A": {"type": "discrete", "card": 2},
+    "X": {"type": "gaussian", "dim": 1},
+    "R": {"type": "gaussian", "dim": 1},
+}
+parents = {
+    "A": [],
+    "X": ["A"],
+    "R": ["A", "X"],
+}
 
-N = 5000
-rng = np.random.default_rng(7)
-X = torch.tensor(rng.integers(0, 3, size=N))
-Z = torch.tensor(rng.integers(0, 2, size=N))
-Y = (X + 2 * Z + torch.tensor(rng.integers(0, 2, size=N))) % 4
-A = 1.0 * Y.float() + torch.randn(N) * 0.5
-df = pd.DataFrame({"X": X.numpy(), "Z": Z.numpy(), "Y": Y.numpy(), "A": A.numpy()})
+# 2) Generate synthetic training data
+#    A ~ Bernoulli(0.4)
+#    X = 2*A + ε,  ε ~ N(0, 0.25)
+#    R = -1 + 0.5*X + 1.0*A + η,  η ~ N(0, 0.3)
+N = 20_000
+rng = np.random.default_rng(0)
+A_np = rng.binomial(1, 0.4, size=(N, 1)).astype(np.int64)
+eps = rng.normal(0.0, 0.5, size=(N, 1))
+X_np = 2.0 * A_np + eps
+eta = rng.normal(0.0, 0.5477, size=(N, 1))  # std≈sqrt(0.3)
+R_np = -1.0 + 0.5 * X_np + 1.0 * A_np + eta
 
-# Fit both discrete+continuous
-lp_disc = bn.fit("discrete_mle", df)
-lp_lg = bn.fit("continuous_gaussian", df)
+data = {
+    "A": torch.from_numpy(A_np),
+    "X": torch.from_numpy(X_np).float(),
+    "R": torch.from_numpy(R_np).float(),
+}
 
-# Merge (optional): last-wins if overlapping families (here there is no conflict)
-from vbn.core import merge_learnparams
-
-lp_full = merge_learnparams(lp_disc, lp_lg)
-
-# -------------- SAVE ----------------
-out_dir = Path("artifacts")
-out_dir.mkdir(parents=True, exist_ok=True)
-bin_path = out_dir / "bn_learnparams.td"  # your .io uses torch.save under the hood
-bn.save_params(lp_full, str(bin_path))
-print(f"[saved] {bin_path}")
-
-# -------------- LOAD ----------------
-lp_loaded: LearnParams = bn.load_params(str(bin_path))
-print(
-    "[loaded] families:",
-    "tables" if lp_loaded.discrete_tables else "-",
-    "lg" if lp_loaded.lg else "-",
+# 3) Build & train a VBN
+bn = VBN(
+    nodes=nodes,
+    parents=parents,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    inference_method="lw",  # likelihood weighting
+    seed=123,
 )
+# map learners explicitly to be restorable later
+bn.set_learners(
+    {
+        "A": "mle",  # categorical MLE
+        "X": "linear_gaussian",  # linear-Gaussian regressor
+        "R": "linear_gaussian",  # linear-Gaussian regressor
+    }
+)
+bn.fit(data)  # default steps=0 for linear/mle, which is fine here
 
-
-# -------------- Plot from loaded ----------------
-def plot_discrete_table(table, title):
-    probs = table.probs.detach().cpu().float().numpy()
-    plt.figure()
-    if probs.ndim == 1:
-        plt.bar(range(len(probs)), probs)
-        plt.xlabel("child value")
-        plt.ylabel("prob")
+# 4) Do a reference posterior query before saving (e.g., E[R | do(A=1)])
+with torch.no_grad():
+    post_pre = bn.posterior(
+        query="R",
+        do={"A": torch.tensor([1], device=bn.device)},
+        n_samples=8192,
+        method="lw",
+    )
+    # The API may return a dict or tensor depending on your backend;
+    # we handle two common cases:
+    if isinstance(post_pre, dict) and "samples" in post_pre:
+        r_samples_pre = post_pre["samples"].float().view(-1)
+    elif torch.is_tensor(post_pre):
+        r_samples_pre = post_pre.float().view(-1)
     else:
-        Pcfg, C = probs.shape
-        xs = np.arange(C)
-        width = 0.8 / Pcfg
-        for i in range(Pcfg):
-            plt.bar(xs + i * width, probs[i], width=width, label=f"pcfg={i}")
-        plt.xlabel("child value")
-        plt.ylabel("prob")
-        plt.legend()
-    plt.title(title)
-    plt.tight_layout()
+        # fall back to sampling from the BN under do()
+        r_samples_pre = (
+            bn.sample(n_samples=8192, do={"A": torch.tensor([1], device=bn.device)})[
+                "R"
+            ]
+            .float()
+            .view(-1)
+        )
 
+    mu_pre = r_samples_pre.mean().item()
+    std_pre = r_samples_pre.std(unbiased=False).item()
+print(f"[pre-save] E[R|do(A=1)] ≈ {mu_pre:.4f} ± {std_pre:.4f}")
 
-def quick_plot_lg_mean(bn: CausalBayesNet, node: str, df: pd.DataFrame):
-    """Plots observed y vs LG mean using bn.lin_weights; device-safe."""
-    # Ensure we have some online weights; touch incremental updater once
-    if not (hasattr(bn, "lin_weights") and node in getattr(bn, "lin_weights", {})):
-        bn.add_data(df.iloc[:1024], update_params=True)
+# 5) Save to disk
+ckpt_path = "trained_vbn.pt"
+save_state(bn, ckpt_path)
 
-    beta = bn.lin_weights.get(node, None)
-    if beta is None:
-        print(f"No online lin_weights for {node}.")
-        return
+# 6) Rebuild a fresh BN skeleton (no training), then load the state
+bn2 = VBN(
+    nodes=nodes,
+    parents=parents,
+    device=bn.device,
+    inference_method=None,  # will be restored
+    seed=123,
+)
+# You can set a dummy learner map; load_state will overwrite with the saved one.
+bn2.set_learners({"A": "mle", "X": "linear_gaussian", "R": "linear_gaussian"})
+# Materialize trainer/CPDs before injecting state
+bn2._ensure_trainer()
+load_state(bn2, ckpt_path)
 
-    pars = bn.parents[node]
-    # Build X on CPU then move to beta.device
-    if pars:
-        Xp = [torch.as_tensor(df[p].values, dtype=beta.dtype).view(-1, 1) for p in pars]
-        X = torch.cat([torch.ones((len(df), 1), dtype=beta.dtype), *Xp], dim=1)
+# 7) Re-run the same posterior on the reloaded BN
+with torch.no_grad():
+    post_post = bn2.posterior(
+        query="R",
+        do={"A": torch.tensor([1], device=bn2.device)},
+        n_samples=8192,
+        method=bn2.inference_method or "lw",
+    )
+    if isinstance(post_post, dict) and "samples" in post_post:
+        r_samples_post = post_post["samples"].float().view(-1)
+    elif torch.is_tensor(post_post):
+        r_samples_post = post_post.float().view(-1)
     else:
-        X = torch.ones((len(df), 1), dtype=beta.dtype)
+        r_samples_post = (
+            bn2.sample(n_samples=8192, do={"A": torch.tensor([1], device=bn2.device)})[
+                "R"
+            ]
+            .float()
+            .view(-1)
+        )
 
-    X = X.to(beta.device)
-    yhat = (X @ beta).detach().cpu().numpy()
+    mu_post = r_samples_post.mean().item()
+    std_post = r_samples_post.std(unbiased=False).item()
+print(f"[post-load] E[R|do(A=1)] ≈ {mu_post:.4f} ± {std_post:.4f}")
 
-    y = torch.as_tensor(df[node].values, dtype=torch.float32).numpy()
-
-    plt.figure()
-    plt.scatter(range(len(yhat)), y[: len(yhat)], s=6, alpha=0.4, label="observed")
-    plt.plot(yhat, lw=2, label="LG mean")
-    plt.title(f"{node}: observed vs. LG mean (from loaded params)")
-    plt.xlabel("sample index")
-    plt.ylabel(node)
-    plt.legend()
-    plt.tight_layout()
-
-
-# Discrete plot (Y|X,Z)
-if lp_loaded.discrete_tables and "Y" in lp_loaded.discrete_tables:
-    plot_discrete_table(lp_loaded.discrete_tables["Y"], "P(Y|X,Z) – loaded")
-
-# Continuous plot (A | Y)
-quick_plot_lg_mean(bn, "A", df.iloc[:1200])
-
-plt.show()
+# 8) Quick sanity check (should be very close)
+abs_diff = abs(mu_pre - mu_post)
+print(f"Δ mean ≈ {abs_diff:.6f} (should be ~0)")
