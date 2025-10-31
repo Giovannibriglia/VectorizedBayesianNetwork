@@ -81,6 +81,10 @@ class MLECategoricalCPD(BaseCPD):
         probs = (self.counts / self.counts.sum(-1, keepdim=True)).clamp_min(1e-8)
         self.logits.copy_(probs.log())
 
+        with torch.no_grad():
+            # probs: tensor with shape [Π cards(parents), K] or canonical shaped
+            self.register_buffer("table", probs.float().clamp_min(1e-12))
+
     @torch.no_grad()
     def update(self, parents: Dict[str, Tensor], y: Tensor, alpha: float = 0.1) -> None:
         y = y.view(-1).clamp_(min=0, max=self.card_y - 1)

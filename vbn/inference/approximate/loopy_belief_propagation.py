@@ -3,8 +3,47 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 from vbn.inference.base import InferenceBackend
+
+
+def _cpd_table_from_logprob(bn, X, device):
+    """Return probs table with canonical shape [card[p1], ..., card[p_m], card[X]]
+    by querying cpd.log_prob over all parent assignments and all y∈{0..K-1}."""
+    parents = bn.parents.get(X, [])
+    K = int(bn.nodes[X]["card"])
+    if not parents:
+        # just P(X)
+        cpd = bn.cpd[X]
+        lps = []
+        for k in range(K):
+            yk = torch.tensor([k], device=device).view(1, 1).long()
+            lp = cpd.log_prob(yk, {})  # (1,)
+            lps.append(lp)
+        lps = torch.stack(lps, dim=0).view(1, K)  # [1,K]
+        probs = F.softmax(lps, dim=-1).squeeze(0)  # [K]
+        return probs  # shape [K]
+
+    # parent cards and grids
+    cards = [bn.nodes[p]["card"] for p in parents]
+    grids = [torch.arange(c, device=device, dtype=torch.long) for c in cards]
+    mesh = torch.cartesian_prod(*grids)  # [M, len(parents)]
+    M = mesh.shape[0]
+
+    # evaluate log_prob for all classes
+    cpd = bn.cpd[X]
+    lps = []
+    for k in range(K):
+        yk = torch.full((M, 1), k, device=device, dtype=torch.long)
+        pars = {p: mesh[:, i].view(M, 1) for i, p in enumerate(parents)}
+        lp = cpd.log_prob(yk, pars).view(M, 1)  # [M,1]
+        lps.append(lp)
+    lps = torch.cat(lps, dim=1)  # [M, K]
+    probs = F.softmax(lps, dim=1)  # normalize over classes
+
+    # reshape to [card[p1],...,card[p_m], K]
+    return probs.view(*cards, K)
 
 
 class LoopyBP(InferenceBackend):
@@ -19,18 +58,16 @@ class LoopyBP(InferenceBackend):
         self.damping = damping
 
     def _build_factors(self, bn, evidence, do):
-        # cards once here
         cards = {
             n: bn.nodes[n]["card"]
-            for n, spec in bn.nodes.items()
-            if spec["type"] == "discrete"
+            for n, s in bn.nodes.items()
+            if s["type"] == "discrete"
         }
         factors = []
         for X in bn.topo_order:
             if bn.nodes[X]["type"] != "discrete":
                 continue
 
-            # handle do(X=·) as a delta (log 1 at the clamped index, -inf elsewhere)
             if X in do:
                 K = cards[X]
                 logt = torch.full((K,), -1e9, device=self.device)
@@ -39,16 +76,21 @@ class LoopyBP(InferenceBackend):
                 continue
 
             parents = bn.parents.get(X, [])
-            # --- CANONICAL RESHAPE ---
-            # CPD table may be stored as [prod(parent_cards), K]; view it as
-            # [card[p1], ..., card[p_m], card[X]] so evidence slicing works.
-            raw = bn.cpd[X].table.to(self.device).clamp_min(1e-12)
-            shape = [cards[p] for p in parents] + [cards[X]]
-            logt = torch.log(raw.view(*shape))  # <-- key fix
+            # get (probability) table
+            if hasattr(bn.cpd[X], "table"):
+                raw = bn.cpd[X].table.to(self.device).clamp_min(1e-12)
+                shape = [cards[p] for p in parents] + [cards[X]]
+                tab = raw.view(*shape)
+            else:
+                tab = _cpd_table_from_logprob(
+                    bn, X, self.device
+                )  # [cards(parents)..., K]
+
+            logt = torch.log(tab.clamp_min(1e-12))
             scope = tuple(parents + [X])
 
-            # apply evidence by slicing (reduce scope on matched vars)
-            for v, val in evidence.items():
+            # slice by evidence
+            for v, val in (evidence or {}).items():
                 if v in scope:
                     axis = scope.index(v)
                     idx = int(val.view(-1)[0].item())
