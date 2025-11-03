@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict, List
 
 import torch
 from torch import nn
@@ -8,36 +8,45 @@ from torch import nn
 Tensor = torch.Tensor
 
 
-class BaseCPD(nn.Module):
-    """Torch CPD base: log_prob(), sample(), fit(), update()."""
-
+class BaseCPDModule(nn.Module):
     def __init__(
-        self, name: str, parents: Dict[str, int], device: str | torch.device = "cpu"
+        self,
+        node_name: str,
+        parents: List[str],
+        node_config: Dict[str, Any],
+        parent_configs: Dict[str, Any],
+        device: torch.device,
     ):
         super().__init__()
-        self.name = name
-        self.parents = parents  # parent -> feature dim (or 1 for discrete codes)
-        self.device = torch.device(device)
-        self.to(self.device)
+        self.node_name = node_name
+        self.parents = parents
+        self.node_config = node_config
+        self.parent_configs = (
+            parent_configs  # Store it if derived classes need it later
+        )
+        self.device = device
+        self.to(device)
 
-    def forward(self, parents: Dict[str, Tensor]):
-        raise NotImplementedError
+    def forward(
+        self, parent_data: Dict[str, torch.Tensor], target_data: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Computes the Negative Log-Likelihood (NLL) for the target node given its parents' data.
+        This is the LOSS function for training.
+        Returns: A Tensor representing the per-sample average NLL (loss).
+        """
+        raise NotImplementedError(
+            "Subclasses must implement the forward pass for loss computation."
+        )
 
-    def log_prob(self, y: Tensor, parents: Dict[str, Tensor]) -> Tensor:
-        raise NotImplementedError
-
-    @torch.no_grad()
-    def sample(self, parents: Dict[str, Tensor], n_samples: int) -> Tensor:
-        raise NotImplementedError
-
-    @torch.no_grad()
-    def fit(self, parents: Dict[str, Tensor], y: Tensor) -> None:
-        pass
-
-    @torch.no_grad()
-    def update(self, parents: Dict[str, Tensor], y: Tensor, alpha: float = 1.0) -> None:
-        self.fit(parents, y)
-
-    def training_loss(self, y: Tensor, parents: Dict[str, Tensor]) -> Tensor:
-        # default: NLL
-        return -self.log_prob(y, parents).mean()
+    def log_prob(
+        self, parent_data: Dict[str, torch.Tensor], target_data: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Computes the per-sample log-likelihood P(X_i | Pa(X_i)).
+        This is the standardized output for INFERENCE.
+        Returns: A Tensor of shape (Batch_size) containing log-probabilities.
+        """
+        raise NotImplementedError(
+            "Subclasses must implement the log_prob method for inference."
+        )

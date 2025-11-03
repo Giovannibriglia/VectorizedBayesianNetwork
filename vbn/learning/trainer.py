@@ -1,148 +1,102 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, Type
 
 import torch
 from torch import nn
 
-from . import CPD_REGISTRY
+from .base import BaseCPDModule
 
 Tensor = torch.Tensor
 
 
-@dataclass
-class NodeSpec:
-    name: str
-    kind: str  # one of CPD_REGISTRY keys
-    y_shape: int  # card for discrete / dim for continuous
-
-
-class VBNParallelTrainer(nn.Module):
+class BNModule(nn.Module):
+    # ... (Keep the definition as provided in the previous response) ...
     def __init__(
         self,
-        vbn,
-        node_specs: List[NodeSpec],
-        device: Optional[str | torch.device] = None,
+        dag,
+        node_configs: Dict[str, Any],
+        cpd_mapping: Dict[str, Type[BaseCPDModule]],
+        device: torch.device,
     ):
         super().__init__()
-        self.vbn = vbn
-        self.device = torch.device(device or vbn.device)
-        self.cpds = nn.ModuleDict()
+        self.dag = dag
+        self.node_configs = node_configs
+        self.cpd_modules = nn.ModuleDict()
 
-        for spec in node_specs:
-            kind = spec.kind
+        # Initialize a CPD module for every node in the DAG
+        for node in dag.nodes():
+            parents = list(
+                dag.predecessors(node)
+            )  # Get the parents of the current node
+            node_type = node_configs[node].get("type")
 
-            # Build both views of parents once
-            par_dims: Dict[str, int] = {}
-            par_cards: Dict[str, int] = {}
-            for p in vbn.parents.get(spec.name, []):
-                pinfo = vbn.nodes[p]
-                if pinfo.get("type") == "discrete":
-                    par_dims[p] = 1
-                    par_cards[p] = int(pinfo["card"])
-                else:
-                    par_dims[p] = int(pinfo.get("dim", 1))
-                    # no entry in par_cards for continuous parents
-
-            # Instantiate exactly once, with the right kwargs/parents
-            if kind == "mle":
-                # guard: all parents must be discrete
-                for p in vbn.parents.get(spec.name, []):
-                    if vbn.nodes[p].get("type") != "discrete":
-                        raise ValueError(
-                            f"MLECategoricalCPD('{spec.name}') requires all parents discrete; "
-                            f"got continuous parent '{p}'. Discretize it (e.g., X→X_disc)."
-                        )
-                cpd = CPD_REGISTRY[kind](
-                    name=spec.name,
-                    parents=par_cards,  # cardinalities
-                    card_y=spec.y_shape,  # number of categories for Y
-                    device=self.device,
+            if node_type not in cpd_mapping:
+                raise ValueError(
+                    f"No CPD module mapping found for node type: {node_type} of node {node}"
                 )
 
-            elif kind in {"linear_gaussian", "gp_svgp"}:
-                cpd = CPD_REGISTRY[kind](
-                    name=spec.name,
-                    parents=par_dims,  # feature dims (discrete coded as 1)
-                    out_dim=spec.y_shape,  # output dim
-                    device=self.device,
-                )
+            cpd_class = cpd_mapping[node_type]
 
-            elif kind == "kde":
-                cpd = CPD_REGISTRY[kind](
-                    name=spec.name,
-                    parents=par_dims,  # feature dims
-                    y_dim=spec.y_shape,  # output dim
-                    device=self.device,
-                )
+            # --- START FIX: Prepare Parent Configurations ---
 
-            else:
-                raise ValueError(f"Unknown CPD kind: {kind}")
+            # Create a dictionary containing the configurations (type, card/dim)
+            # for all parent nodes.
+            parent_configs = {parent: node_configs[parent] for parent in parents}
 
-            self.cpds[spec.name] = cpd
-            self.vbn.set_cpd(spec.name, cpd)
+            # --- END FIX ---
 
-        self.to(self.device)
+            # Instantiate the specific CPD module, passing the parent_configs
+            self.cpd_modules[node] = cpd_class(
+                node_name=node,
+                parents=parents,
+                node_config=node_configs[node],
+                parent_configs=parent_configs,  # Required for calculating input_dim
+                device=device,
+            )
 
-    def _parents(self, batch: Dict[str, Tensor], node: str) -> Dict[str, Tensor]:
-        return {p: batch[p] for p in self.vbn.parents.get(node, [])}
+    def forward(self, data: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Computes the total Negative Log-Likelihood (NLL) for the entire network.
+        This is the loss function for fitting.
 
-    def nll(self, batch: Dict[str, Tensor]) -> Tensor:
-        losses = []
-        for n, cpd in self.cpds.items():
-            y = batch[n]
-            parents = self._parents(batch, n)
-            if hasattr(cpd, "training_loss"):
-                loss = cpd.training_loss(y, parents)
-            elif hasattr(cpd, "log_prob"):
-                loss = (-cpd.log_prob(y, parents)).mean()
-            else:
-                raise AttributeError(
-                    f"CPD '{n}' has neither training_loss nor log_prob."
-                )
-            losses.append(loss)
-        return torch.stack(losses).sum()
+        Args:
+            data: A dict of node_name -> Tensor (batch of data for each node).
 
-    @torch.no_grad()
-    def fit(self, data: Dict[str, Tensor]) -> None:
-        for n, cpd in self.cpds.items():
-            cpd.fit(self._parents(data, n), data[n])
+        Returns:
+            A Tensor representing the total average NLL (loss).
+        """
 
-    def partial_fit(self, data: Dict[str, Tensor]) -> None:
-        # Updates may require autograd (LG, SVGP). No no_grad here.
-        for n, cpd in self.cpds.items():
-            cpd.update(self._parents(data, n), data[n])
+        if not self.cpd_modules:
+            return torch.tensor(0.0, device=data[list(data.keys())[0]].device)
 
-    def train_minibatch(
-        self, iterator, steps: int = 1000, lr: float = 1e-3, clip_grad: float = 1.0
-    ) -> None:
-        self.train()
-        opt = torch.optim.Adam(self.parameters(), lr=lr)
-        it = iter(iterator)
-        for _ in range(steps):
-            try:
-                batch = next(it)
-            except StopIteration:
-                break
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            opt.zero_grad(set_to_none=True)
-            loss = self.nll(batch)
-            loss.backward()
-            if clip_grad:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), clip_grad)
-            opt.step()
+        # 1. ⚙️ Determine the correct device for the loss tensor
+        # Get the first registered parameter from the first CPD module
+        try:
+            first_module = next(iter(self.cpd_modules.values()))
+            module_device = next(first_module.parameters()).device
+        except StopIteration:
+            # Fallback if a CPD module has no parameters (unlikely in this context)
+            module_device = data[list(data.keys())[0]].device
 
+        # Initialize the total NLL on the determined device
+        total_nll = torch.tensor(0.0, device=module_device)
 
-class DictDataLoader:
-    def __init__(
-        self, data: Dict[str, Tensor], batch_size: int = 2048, shuffle: bool = True
-    ):
-        N = next(iter(data.values())).shape[0]
-        self.data, self.N, self.batch_size, self.shuffle = data, N, batch_size, shuffle
+        # 2. 🚀 Compute and aggregate NLL from all CPDs in parallel
+        # This loop iterates over all nodes and their CPDs. Since each CPD
+        # is independent, PyTorch computes them in parallel.
+        for node in self.dag.nodes():
+            cpd_module = self.cpd_modules[node]
 
-    def __iter__(self):
-        idx = torch.randperm(self.N) if self.shuffle else torch.arange(self.N)
-        for s in range(0, self.N, self.batch_size):
-            sel = idx[s : s + self.batch_size]
-            yield {k: v[sel] for k, v in self.data.items()}
+            # Prepare parent data for the CPD module
+            parent_data = {parent: data[parent] for parent in cpd_module.parents}
+
+            # Compute the loss (NLL) for the current node's CPD
+            # The CPD forward pass must return a NLL tensor (per-sample loss)
+            node_nll = cpd_module(parent_data=parent_data, target_data=data[node])
+
+            # Aggregate the loss: The BN's loss is the sum of the average NLLs
+            # We use .mean() to average across the batch size (B) for stable training.
+            total_nll += node_nll.mean()
+
+        return total_nll

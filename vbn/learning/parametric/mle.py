@@ -1,114 +1,144 @@
-from __future__ import annotations
+from typing import Any, Dict, List
 
-from typing import Dict, List
-
+import numpy as np
 import torch
-from torch import nn
-from torch.nn import functional as F
 
-from ..base import BaseCPD, Tensor
+from vbn.learning import BaseCPDModule
 
 
-class MLECategoricalCPD(BaseCPD):
-    """Discrete parents (as integer codes) → Categorical child."""
+class ExactCategoricalCPD(BaseCPDModule):
+    """
+    Computes the exact Maximum Likelihood Estimate (MLE) for a Categorical CPD
+    using frequency counting (non-differentiable).
+    This method should be called *outside* the PyTorch optimization loop (fit).
+    """
 
     def __init__(
         self,
-        name: str,
-        parents: Dict[str, int],
-        card_y: int,
-        device: str | torch.device = "cpu",
+        node_name: str,
+        parents: List[str],
+        node_config: Dict[str, Any],
+        parent_configs: Dict[str, Any],
+        device: torch.device,
     ):
-        super().__init__(name, parents, device)
-        self.parent_cards: List[int] = [int(c) for c in parents.values()]
-        self.card_y = int(card_y)
-        size = 1
-        for c in self.parent_cards:
-            size *= c
-        self.logits = nn.Parameter(
-            torch.zeros(max(size, 1), self.card_y, device=self.device)
+        super().__init__(node_name, parents, node_config, parent_configs, device)
+
+        self.cardinality = self.node_config.get("card", 2)
+        self.parent_cardinalities = {}
+
+        # --- THE FIX: Register as persistent buffers ---
+        self.register_buffer("_log_cpd_table", None)
+        self.register_buffer("count_table", None)
+        # ---------------------------------------------
+
+    def fit_exact(
+        self, data: Dict[str, torch.Tensor], parent_configs: Dict[str, Any]
+    ) -> None:
+        """
+        Calculates the CPD table using frequency counting.
+        """
+
+        # 1. Gather parent cardinalities
+        for parent in self.parents:
+            self.parent_cardinalities[parent] = parent_configs[parent].get("card")
+
+        # Convert data to numpy/CPU for efficient counting
+        target_np = data[self.node_name].cpu().numpy().squeeze()
+        parent_data_np = {p: data[p].cpu().numpy().squeeze() for p in self.parents}
+
+        # 2. Determine the shape of the CPD table
+        # Shape: (Card_Parent1, Card_Parent2, ..., Card_Target)
+        table_shape = tuple(self.parent_cardinalities.values()) + (self.cardinality,)
+
+        # 3. Initialize count table and apply Laplace smoothing (add 1)
+        count_table = np.ones(table_shape, dtype=float)  # Laplace smoothing
+
+        # 4. Perform Frequency Counting
+
+        # Convert all discrete data to flat array of tuples/rows (N_samples, N_parents+1)
+        # columns = self.parents + [self.node_name]
+        data_combined = np.stack(
+            [parent_data_np[p] for p in self.parents] + [target_np], axis=1
         )
-        self.register_buffer("counts", torch.ones_like(self.logits))
 
-    def _flat_index(self, parents: Dict[str, Tensor]) -> Tensor:
-        if not self.parent_cards:
-            N = next(iter(parents.values())).shape[0] if parents else 1
-            return torch.zeros(N, dtype=torch.long, device=self.device)
-        keys = list(self.parents.keys())
-        first = parents[keys[0]].to(self.device).long().view(-1)  # (N,)
-        idx = first
-        for k, card in zip(keys[1:], self.parent_cards[1:]):
-            pk = parents[k].to(self.device).long().view(-1)  # (N,)
-            idx = idx * card + pk
-        return idx.view(-1)  # ensure 1-D
+        # Simple iterative counting (can be optimized with np.bincount or pd.groupby)
+        for row in data_combined:
+            # Create a tuple index (parent1_value, parent2_value, ..., target_value)
+            idx = tuple(row.astype(int))
+            count_table[idx] += 1
 
-    def forward(self, parents: Dict[str, Tensor]) -> Tensor:
-        return self.logits[self._flat_index(parents)]
+        # 5. Compute Probabilities (MLE)
 
-    def log_prob(self, y: Tensor, parents: Dict[str, Tensor]) -> Tensor:
-        y = y.view(-1)
-        logits = self.forward(parents)
-        # If root (no parents), forward() returns shape (1, K).
-        # Expand to match the target batch size.
+        # Sum counts over the last dimension (the target node) to get marginal parent counts
+        # This represents the denominator in the MLE formula: Count(Pa=pa)
+        parent_marginal_counts = count_table.sum(axis=-1, keepdims=True)
 
-        if not self.parent_cards and logits.shape[0] == 1:
-            logits = logits.expand(y.shape[0], -1)
+        # Divide to get conditional probabilities: P(Target | Parents)
+        cpd_table = count_table / parent_marginal_counts
 
-        return -F.cross_entropy(logits, y.long().to(self.device), reduction="none")
+        # 6. Store the results as log probabilities on the PyTorch device
+        self._log_cpd_table = torch.tensor(np.log(cpd_table), dtype=torch.float32).to(
+            self.device
+        )
 
-    @torch.no_grad()
-    def fit(self, parents: Dict[str, Tensor], y: Tensor) -> None:
-        y = y.view(-1)
-        # safety: clamp target labels to [0, K-1]
-        y = y.clamp_(min=0, max=self.card_y - 1)
-        if not self.parent_cards:
-            counts = (
-                F.one_hot(y.long(), num_classes=self.card_y)
-                .float()
-                .sum(0, keepdim=True)
-                .to(self.device)
+    def forward(
+        self, parent_data: Dict[str, torch.Tensor], target_data: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Computes the NLL using the pre-calculated, fixed CPD table.
+        """
+        if self._log_cpd_table is None:
+            raise RuntimeError(
+                "CPD table must be calculated via fit_exact() before calling forward."
             )
+
+        # 1. Prepare parent indices
+        # We need the parent data to look up the correct slice of the CPD table.
+
+        # Stack parent data (B x N_parents)
+        parent_values = [parent_data[p].long().squeeze(-1) for p in self.parents]
+
+        if not parent_values:
+            # Unconditioned case: P(X) - index the last dimension (Target)
+            log_probs_slice = self._log_cpd_table
         else:
-            idx = self._flat_index(parents)
-            # safety: ensure parent codes are within declared cardinalities
-            K = self.logits.shape[0]
-            idx = idx.clamp_(min=0, max=K - 1)
-            counts = torch.zeros(K, self.card_y, device=self.device)
-            counts.index_add_(
-                0, idx, F.one_hot(y.long(), num_classes=self.card_y).float()
-            )
-        self.counts.copy_(counts + 1.0)
-        probs = (self.counts / self.counts.sum(-1, keepdim=True)).clamp_min(1e-8)
-        self.logits.copy_(probs.log())
+            # Conditional case: Use parent values to index the table dimensions
+            # indices_tuple = (B, B, ...) where B is the batch index. This is complex indexing.
 
-        with torch.no_grad():
-            # probs: tensor with shape [Π cards(parents), K] or canonical shaped
-            self.register_buffer("table", probs.float().clamp_min(1e-12))
+            # Simple approach: Reshape target to match log_probs_slice and use torch.gather
+            # The indices for the look-up are the combined indices of the parents.
 
-    @torch.no_grad()
-    def update(self, parents: Dict[str, Tensor], y: Tensor, alpha: float = 0.1) -> None:
-        y = y.view(-1).clamp_(min=0, max=self.card_y - 1)
-        if not self.parent_cards:
-            idx = torch.zeros_like(y, device=self.device)
-        else:
-            idx = self._flat_index(parents)
-            idx = idx.clamp_(min=0, max=self.logits.shape[0] - 1)
-        K = self.logits.shape[0]
-        fresh = torch.zeros(K, self.card_y, device=self.device)
-        fresh.index_add_(0, idx, F.one_hot(y.long(), num_classes=self.card_y).float())
-        fresh += 1.0
-        self.counts.mul_(1 - alpha).add_(alpha * fresh)
-        probs = (self.counts / self.counts.sum(-1, keepdim=True)).clamp_min(1e-8)
-        self.logits.copy_(probs.log())
+            # Use torch.index_select on the flattened parent states for simplified lookup
 
-    @torch.no_grad()
-    def sample(self, parents: Dict[str, Tensor], n_samples: int) -> Tensor:
-        logits = self.forward(parents)
-        if not self.parent_cards and logits.shape[0] == 1:
-            # If you can infer an intended batch size N here, expand:
-            # logits = logits.expand(N, -1)
-            pass
-        probs = logits.softmax(-1)
-        cat = torch.distributions.Categorical(probs=probs)
-        draws = cat.sample((n_samples,)).transpose(0, 1)
-        return draws.unsqueeze(-1).float()
+            # --- Robust Indexing using Parent States ---
+            # 1. Compute the linear index (state) for each parent configuration in the batch.
+            multipliers = []
+            cumulative_multiplier = 1
+            for parent in reversed(self.parents):
+                multipliers.insert(0, cumulative_multiplier)
+                cumulative_multiplier *= self.parent_cardinalities[parent]
+
+            linear_parent_index = torch.zeros_like(parent_values[0])
+            for idx, p_val in enumerate(parent_values):
+                linear_parent_index += p_val * multipliers[idx]
+
+            # 2. Flatten the CPD table to (N_Parent_States, Card_Target)
+            flat_log_cpd = self._log_cpd_table.view(-1, self.cardinality)
+
+            # 3. Look up the log probabilities for each sample's parent state
+            log_probs_slice = flat_log_cpd.index_select(
+                0, linear_parent_index
+            )  # Shape: (B, Card_Target)
+
+        # 2. Final NLL computation (Loss)
+
+        # target_data must be indices (B, 1 or B)
+        target_indices = target_data.long().squeeze(-1)
+
+        # Use torch.gather to select the log-probability P(X=x | Pa=pa) for the observed sample
+        # gather needs indices of shape (B, 1) to match log_probs_slice shape (B, C)
+        log_prob = log_probs_slice.gather(1, target_indices.unsqueeze(-1)).squeeze(-1)
+
+        # NLL is -log(P)
+        nll = -log_prob
+        return nll
