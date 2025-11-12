@@ -114,3 +114,93 @@ vbn/
 @article{
 }
 ```
+
+
+# Unified Class Hierarchy & Compatibility Map
+
+```
+                    ┌────────────────────────────────────────────────────────┐
+                    │                CAPABILITY CONTRACT                    │
+                    │  Capabilities{ has_sample, has_log_prob,              │
+                    │                 is_reparameterized, supports_do }     │
+                    └────────────────────────────────────────────────────────┘
+                                       ▲
+                                       │ (queried by samplers & inferencers)
+                                       │
+┌──────────────────────────┐           │           ┌──────────────────────────┐
+│        LEARNING          │           │           │         SAMPLING         │
+│  (models + trainers)     │           │           │   (per graph/topology)   │
+├──────────────────────────┤           │           ├──────────────────────────┤
+│ BaseConditionalModel     │───────────┼──────────▶│ BaseSampler              │
+│  ├─ ParametricCPD        │ has_log_prob✓  sample✓│  ├─ ParametricSampler    │
+│  │   (Categorical, Gauss)│ is_reparam✗            │  │  (ancestral, IS, LW, │
+│  │                        │                       │  │   MCMC; log_prob✓)    │
+│  ├─ DifferentiableCPD    │ has_log_prob✓  sample✓ │  ├─ DifferentiableSampler│
+│  │   (Flows, MoG, NDE)   │ is_reparam✓            │  │  (reparam; VI-ready)  │
+│  │                        │                       │  └─ ImplicitSampler      │
+│  └─ ImplicitGenerator    │ has_log_prob✗  sample✓ │     (generator only;     │
+│      (Sim/GAN/Diffusion) │ is_reparam✗            │      ABC/ratio-only)     │
+├──────────────────────────┤           │           └──────────────────────────-┘
+│ Trainers                 │           │                     │
+│  ├─ MLE / MAP / EM       │           │                     ▼ samples (+weights?)
+│  ├─ Bayesian (θ posterior)│          │        ┌──────────────────────────────┐
+│  ├─ Variational (ELBO/VI)│           │        │            INFERENCE         │
+│  └─ ABC / Ratio (LF)     │           │        │ (select by graph size & caps)│
+└──────────────────────────┘           │        ├──────────────────────────────┤
+                                       │        │ ExactFactorInference (VE/JT) │
+                                       │  needs │  needs: has_log_prob✓        │
+                                       │ logpdf │  out: exact marginals        │
+                                       │        ├──────────────────────────────┤
+                                       │        │ LoopyBeliefPropagation       │
+                                       │        │  needs: has_log_prob✓        │
+                                       │        │  out: approx marginals       │
+                                       │        ├──────────────────────────────┤
+                                       │        │ MonteCarloInference          │
+                                       │        │  needs: sample✓ (+log_prob✓) │
+                                       │        │  out: samples + weights      │
+                                       │        ├──────────────────────────────┤
+                                       │        │ VariationalInference (ELBO)  │
+                                       │        │  needs: has_log_prob✓ &      │
+                                       │        │         is_reparameterized✓  │
+                                       │        │  out: qφ + amortized samples │
+                                       │        ├──────────────────────────────┤
+                                       │        │ LikelihoodFreeInference (ABC)│
+                                       │        │  needs: sample✓ (no log_prob)│
+                                       │        │  out: empirical posteriors   │
+                                       │        ├──────────────────────────────┤
+                                       │        │ SMC / Particle Filtering     │
+                                       │        │  needs: sample✓ (+log_prob✓) │
+                                       │        │  out: sequential posteriors  │
+                                       │        └──────────────────────────────┘
+```
+
+## Compatibility Table (✓ works • ~ partial • ✗ no)
+
+| Inference \ Learning         |      ParametricCPD      | DifferentiableCPD |        ImplicitGenerator       |
+| ---------------------------- | :---------------------: | :---------------: | :----------------------------: |
+| ExactFactor (VE/JT)          |            ✓            |         ✓         |                ✗               |
+| Loopy BP                     |            ✓            |         ✓         |                ✗               |
+| Monte Carlo (IS/LW/MH/Gibbs) |            ✓            |         ✓         | ~ *(no pdf → rejection/ratio)* |
+| Variational (ELBO)           | ~ *(if differentiable)* |    **✓ ideal**    |                ✗               |
+| Likelihood-Free (ABC/ratio)  |      ~ *(unneeded)*     |   ~ *(unneeded)*  |              **✓**             |
+| SMC / Particle Filter        |            ✓            |         ✓         |          ~ *(ABC‑SMC)*         |
+
+## Routing Heuristics (factory)
+
+* If `has_log_prob` and low treewidth → **ExactFactor**.
+* Else if `has_log_prob` and `is_reparameterized` → **Variational**.
+* Else if `has_sample` and `has_log_prob` → **MonteCarlo**.
+* Else if `has_sample` only → **Likelihood‑Free**.
+* Temporal graphs → prefer **SMC** when available.
+
+## Minimal Implementations
+
+* **Models**: `ParametricCPD`, `DifferentiableCPD`, `ImplicitGenerator` (all subclass `BaseConditionalModel`).
+* **Samplers**: `ParametricSampler`, `DifferentiableSampler`, `ImplicitSampler` (all subclass `BaseSampler`).
+* **Inference**: `ExactFactorInference`, `MonteCarloInference`, `VariationalInference`, `LikelihoodFreeInference` (+ optional `SMCInference`).
+
+## Notes
+
+* Do‑operator: samplers and inferencers must support **edge‑cut + node‑override** (`D=d`).
+* Evidence: implement **masking + weight accumulation** (log‑space) where relevant.
+* GPU: prioritize **DifferentiableCPD + VI**, and **vectorized Monte Carlo**.

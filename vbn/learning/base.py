@@ -1,52 +1,76 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, Protocol
 
 import torch
-from torch import nn
-
-Tensor = torch.Tensor
+import torch.nn as nn
 
 
-class BaseCPDModule(nn.Module):
-    def __init__(
-        self,
-        node_name: str,
-        parents: List[str],
-        node_config: Dict[str, Any],
-        parent_configs: Dict[str, Any],
-        device: torch.device,
-    ):
+@dataclass(frozen=True)
+class Capabilities:
+    has_sample: bool = True
+    has_log_prob: bool = True
+    is_reparameterized: bool = False
+    supports_conditioning: bool = True
+    supports_do: bool = True
+
+
+class BaseNodeCPD(Protocol):
+    name: str
+    capabilities: Capabilities
+
+    def fit(self, X: torch.Tensor, y: torch.Tensor) -> None:
+        pass
+
+    def update(self, X: torch.Tensor, y: torch.Tensor) -> None:
+        pass
+
+    def log_prob(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        pass
+
+    @torch.no_grad()
+    def sample(self, X: torch.Tensor, n: int = 1) -> torch.Tensor:
+        pass
+
+
+class ParametricCPD(nn.Module):
+    def __init__(self, name: str, cfg: Dict[str, Any]):
         super().__init__()
-        self.node_name = node_name
-        self.parents = parents
-        self.node_config = node_config
-        self.parent_configs = (
-            parent_configs  # Store it if derived classes need it later
-        )
-        self.device = device
-        self.to(device)
-
-    def forward(
-        self, parent_data: Dict[str, torch.Tensor], target_data: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Computes the Negative Log-Likelihood (NLL) for the target node given its parents' data.
-        This is the LOSS function for training.
-        Returns: A Tensor representing the per-sample average NLL (loss).
-        """
-        raise NotImplementedError(
-            "Subclasses must implement the forward pass for loss computation."
+        self.name = name
+        self.cfg = cfg
+        self.capabilities = Capabilities(
+            has_sample=True,
+            has_log_prob=True,
+            is_reparameterized=False,
+            supports_conditioning=True,
+            supports_do=True,
         )
 
-    def log_prob(
-        self, parent_data: Dict[str, torch.Tensor], target_data: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Computes the per-sample log-likelihood P(X_i | Pa(X_i)).
-        This is the standardized output for INFERENCE.
-        Returns: A Tensor of shape (Batch_size) containing log-probabilities.
-        """
-        raise NotImplementedError(
-            "Subclasses must implement the log_prob method for inference."
+
+class DifferentiableCPD(nn.Module):
+    def __init__(self, name: str, cfg: Dict[str, Any]):
+        super().__init__()
+        self.name = name
+        self.cfg = cfg
+        self.capabilities = Capabilities(
+            has_sample=True,
+            has_log_prob=True,
+            is_reparameterized=True,
+            supports_conditioning=True,
+            supports_do=True,
+        )
+
+
+class ImplicitGenerator(nn.Module):
+    def __init__(self, name: str, cfg: Dict[str, Any]):
+        super().__init__()
+        self.name = name
+        self.cfg = cfg
+        self.capabilities = Capabilities(
+            has_sample=True,
+            has_log_prob=False,
+            is_reparameterized=True,
+            supports_conditioning=True,
+            supports_do=True,
         )

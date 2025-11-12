@@ -1,494 +1,242 @@
 from __future__ import annotations
 
 import random
-from typing import Dict, Optional, Tuple, Union
+
+from typing import Any, Callable, Dict, List, Optional
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
 
-from .inference import INFERENCE_BACKENDS
-from .learning import LEARNING_METHODS
-from .learning.trainer import BNModule
-from .sampling import SAMPLING_METHODS
+from vbn.inference import INFERENCE_METHODS
+from vbn.learning import LEARNING_METHODS
+from vbn.learning.base import BaseNodeCPD
+
+
+def _parents_map_from_dag(dag: nx.DiGraph) -> Dict[str, List[str]]:
+    return {n: list(dag.predecessors(n)) for n in dag.nodes()}
 
 
 class VBN:
-    """
-    nodes: Dict[name, {"type": "discrete"|"gaussian", "card"|"dim": int}]
-    parents: Dict[name, List[parent_name]]
-    cpd: Dict[name, CPD]
-    """
-
-    def __init__(
-        self,
-        dag: nx.DiGraph,
-        device=None,
-        seed: int | None = None,
-    ):
-
+    def __init__(self, dag: nx.DiGraph, device=None, seed: Optional[int] = None):
         self.device = (
             torch.device(device)
             if device
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.dag = dag
-
         if seed is not None:
-            self.seed = seed
             self.set_seed(seed)
+        else:
+            self.seed = None
 
-        self._trainer: BNModule | None = None
+        self._parents = _parents_map_from_dag(self.dag)
+        self._nodes: Dict[str, BaseNodeCPD] = {}
 
-        self._learning_methods = {}
-        self._node_configs = None
-        self._optimizer = None
+        self._learning_factory: Optional[Callable[[str, int, int], BaseNodeCPD]] = None
+        self._learning_kwargs: Dict[str, Any] = {}
 
-        self._sampling_method = None
-        self._sampling_obj = None
+        self._inference_factory = None
+        self._inference_kwargs: Dict[str, Any] = {}
+        self._inference = None
 
-        self._inference_method = None
-        self._inference_obj = None
-
-    def set_seed(self, seed):
+    def set_seed(self, seed: int):
         self.seed = seed
-        torch.manual_seed(self.seed)
+        torch.manual_seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed(self.seed)
-        np.random.seed(self.seed)
-        random.seed(self.seed)
+            torch.cuda.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
-    def set_learning_method(self, methods: Dict, **kwargs):
-        """
-        Defines the configuration (type, cardinality/dimension) for each node
-        and initializes the main BNModule for parallel computation.
-
-        Args:
-            methods: Dict[node_name, {"type": "discrete"|"gaussian", "card"|"dim": int, ...}]
-        """
-        required_keys = ["type"]
-        node_configs = {}
-
-        for node in self.dag.nodes():
-            if node not in methods:
+    def set_learning_method(self, method, **kwargs):
+        if isinstance(method, str):
+            key = method.lower().strip()
+            if key not in LEARNING_METHODS:
                 raise ValueError(
-                    f"Node *{node}* has no learning method/configuration defined."
+                    f"Unknown learning method '{method}'. "
+                    f"Available: {list(LEARNING_METHODS.keys())}"
                 )
-
-            config = methods[node]
-
-            # 1. Validate required keys
-            for key in required_keys:
-                if key not in config:
-                    raise ValueError(
-                        f"Node *{node}* configuration must include '{key}'."
-                    )
-
-            # 2. Validate type-specific keys (e.g., 'card' for discrete)
-            node_type = config["type"].lower()
-            if node_type == "discrete" and "card" not in config:
-                raise ValueError(
-                    f"Discrete node *{node}* requires 'card' (cardinality) in its configuration."
-                )
-            if node_type == "gaussian" and "dim" not in config:
-                # Although unconditioned Gaussian usually has dim=1, it's good practice
-                config["dim"] = config.get("dim", 1)
-
-            node_configs[node] = config
-
-        self._learning_methods = methods
-        self._node_configs = node_configs
-
-        # 3. Initialize the BNModule using the gathered configurations
-        print("✅ All node configurations validated. Initializing BNModule...")
-        try:
-            self._trainer = BNModule(
-                dag=self.dag,
-                node_configs=self._node_configs,
-                cpd_mapping=LEARNING_METHODS,
-                device=self.device,
-            )
-            print("✨ BNModule created successfully. Ready for parallel training.")
-        except Exception as e:
-            print(f"❌ Error initializing BNModule: {e}")
-            self._trainer = None
-            raise
-
-    def set_sampling_method(self, method: str, **kwargs):
-        cls = SAMPLING_METHODS.get(method)
-        if cls is None:
-            raise ValueError(f"Unknown inference method: {method}")
-
-        self._sampling_method = method
-        self._sampling_obj = cls(device=self.device, **kwargs)
-
-    def set_inference(self, method: str, **kwargs):
-        cls = INFERENCE_BACKENDS.get(method)
-        if cls is None:
-            raise ValueError(f"Unknown inference method: {method}")
-
-        self._inference_method = method
-        self._inference_obj = cls(device=self.device, **kwargs)
-
-    def _run_nondiff_fitting(self, data: Dict[str, torch.Tensor]) -> None:
-        """
-        Internal helper to run non-differentiable fitting (Exact MLE and KDE).
-        This must be called BEFORE the gradient descent loop.
-        """
-        if self._trainer is None:
-            raise RuntimeError(
-                "BNModule not initialized. Call VBN.set_learning_method() first."
-            )
-
-        tensor_data = {
-            k: v.to(self.device).unsqueeze(-1) if v.ndim == 1 else v.to(self.device)
-            for k, v in data.items()
-        }
-
-        print("\n--- Auto-running Non-Differentiable CPD Fitting (Exact/KDE) ---")
-
-        for node in self.dag.nodes():
-            cpd_module = self._trainer.cpd_modules[node]
-
-            # Check if the module has a non-differentiable fitting method
-            if hasattr(cpd_module, "fit_exact"):
-                print(f"-> Running Exact MLE for node: {node}")
-                cpd_module.fit_exact(tensor_data, self._node_configs)
-
-            elif hasattr(cpd_module, "fit_kde"):
-                print(f"-> Storing data for KDE node: {node}")
-                cpd_module.fit_kde(tensor_data)
+            self._learning_factory = LEARNING_METHODS[key]
+        elif callable(method):
+            self._learning_factory = method
+        else:
+            raise TypeError("method must be a string or a callable factory")
+        self._learning_kwargs = kwargs
 
     def _prepare_data(
         self, data: Dict[str, torch.Tensor] | pd.DataFrame
     ) -> Dict[str, torch.Tensor]:
-        """
-        Converts input data (DataFrame or dict of Tensors) into a standardized
-        dictionary of Tensors, ensuring correct device placement and shape (N x 1).
-
-        Args:
-            data: The input training data.
-
-        Returns:
-            A dict of node_name -> torch.Tensor on the correct device.
-        """
-
         if isinstance(data, pd.DataFrame):
-            # 1. Handle Pandas DataFrame: Convert each column to a Tensor
-            tensor_data = {}
-            for col in data.columns:
-                # Convert Series to Tensor
-                tensor = torch.tensor(data[col].values, dtype=torch.float32)
-
-                # Ensure shape is at least 2D (N x 1)
-                if tensor.ndim == 1:
-                    tensor = tensor.unsqueeze(-1)
-
-                tensor_data[col] = tensor.to(self.device)
-
+            tensor_data = {
+                c: torch.tensor(
+                    data[c].values, dtype=torch.float32, device=self.device
+                ).unsqueeze(-1)
+                for c in data.columns
+            }
         elif isinstance(data, dict):
-            # 2. Handle Dictionary of Tensors: Ensure correct device and shape
             tensor_data = {}
             for k, v in data.items():
-                tensor = v.to(self.device).float()
-
-                # Ensure shape is at least 2D (N x 1)
-                if tensor.ndim == 1:
-                    tensor = tensor.unsqueeze(-1)
-
-                tensor_data[k] = tensor
-
+                t = v.to(self.device).float()
+                if t.ndim == 1:
+                    t = t.unsqueeze(-1)
+                tensor_data[k] = t
         else:
-            raise TypeError(
-                "Input data must be a pandas DataFrame or a dictionary of torch.Tensors."
-            )
+            raise TypeError("data must be a pandas DataFrame or dict[str, Tensor]")
 
-        # Final check: Ensure all nodes in the DAG have corresponding data
-        missing_nodes = [node for node in self.dag.nodes() if node not in tensor_data]
-        if missing_nodes:
-            raise ValueError(
-                f"Missing data for required nodes in the DAG: {missing_nodes}"
-            )
-
+        missing = [n for n in self.dag.nodes() if n not in tensor_data]
+        if missing:
+            raise ValueError(f"Missing data for DAG nodes: {missing}")
         return tensor_data
 
-    def fit(
-        self,
-        data: Dict[str, torch.Tensor] | pd.DataFrame,
-        epochs: int = 100,
-        **kwargs,
-    ) -> None:
-        """
-        Unified method for training the Bayesian Network.
-        Automatically handles non-differentiable CPDs before starting gradient descent.
-        """
-        if self._trainer is None:
-            raise RuntimeError("BNModule not initialized.")
+    def _concat_parents(
+        self, tensor_data: Dict[str, torch.Tensor], node: str
+    ) -> torch.Tensor:
+        ps = self._parents[node]
+        if len(ps) == 0:
+            return torch.empty((tensor_data[node].shape[0], 0), device=self.device)
+        xs = [tensor_data[p].squeeze(-1) for p in ps]  # each [N]
+        return torch.stack(xs, dim=-1)  # [N, |Pa|]
 
-        # 1. Prepare Data and check for non-differentiable requirements
+    # ---------- SEQUENTIAL FIT ----------
+    def fit(self, data: Dict[str, torch.Tensor] | pd.DataFrame, **kwargs) -> None:
+        if self._learning_factory is None:
+            raise RuntimeError("Call set_learning_method(...) before fit().")
+
         tensor_data = self._prepare_data(data)
+        topo = list(
+            nx.topological_sort(self.dag)
+        )  # not strictly necessary for these CPDs
 
-        # 2. ⚡️ THE FIX: Run non-differentiable fitting ONCE ⚡️
-        self._run_nondiff_fitting(tensor_data)
-        # Now D_exact and E_kde are ready for the forward pass.
-
-        # 3. Setup Optimizer for gradient-based nodes
-        # Only train parameters that require gradients (GaussianCPD, CategoricalCPD, GPSVGPCPD)
-        trainable_params = [p for p in self._trainer.parameters() if p.requires_grad]
-        kwargs_optimizer = kwargs.get("optimizer", {})
-        optimizer = torch.optim.Adam(trainable_params, **kwargs_optimizer)
-        self._optimizer = optimizer
-
-        # 4. Start Gradient Descent Loop
-        pbar = tqdm(range(epochs), desc="Training Differentiable estimators...")
-        for _ in pbar:
-            optimizer.zero_grad()
-
-            # BNModule forward pass runs parallel computation
-            loss = self._trainer(data=tensor_data)
-
-            # Backpropagation only affects gradient-based CPDs
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix({"loss": loss.item()})
-
-    def update(self, data: Dict[str, torch.Tensor] | pd.DataFrame, **kwargs) -> None:
-        """
-        Updates the CPD parameters with a new batch of data (online learning).
-        """
-        if self._trainer is None:
-            raise RuntimeError("BNModule not initialized.")
-        if not hasattr(self, "_optimizer"):
-            # This handles cases where update() is called before fit()
-            raise RuntimeError(
-                "Optimizer not initialized. Call VBN.fit() first or initialize _optimizer."
+        self._nodes = {}
+        for n in topo:
+            X = self._concat_parents(tensor_data, n)
+            y = tensor_data[n]
+            in_dim = X.shape[1]
+            out_dim = y.shape[1]
+            head = self._learning_factory(
+                name=n, in_dim=in_dim, out_dim=out_dim, **self._learning_kwargs
             )
+            head = head.to(self.device)
+            head.fit(X, y)
+            self._nodes[n] = head
 
+    # ---------- SEQUENTIAL UPDATE ----------
+    def update(self, data: Dict[str, torch.Tensor] | pd.DataFrame, **kwargs) -> None:
+        if not self._nodes:
+            raise RuntimeError("Call fit(...) before update(...).")
         tensor_data = self._prepare_data(data)
+        for n, head in self._nodes.items():
+            X = self._concat_parents(tensor_data, n)
+            y = tensor_data[n]
+            head.update(X, y)
 
-        # 1. Update non-differentiable CPDs
-        self._run_nondiff_update(tensor_data)
+    def set_inference_method(self, method, **kwargs):
+        if isinstance(method, str):
+            key = method.lower().strip()
+            if key not in INFERENCE_METHODS:
+                raise ValueError(
+                    f"Unknown inference method '{method}'. Available: {list(INFERENCE_METHODS.keys())}"
+                )
+            self._inference_factory = INFERENCE_METHODS[key]
+        elif callable(method):
+            self._inference_factory = method
+        else:
+            raise TypeError("method must be a string or a callable factory")
+        self._inference_kwargs = kwargs  # defaults (e.g., num_samples)
+        self._inferencer = self._inference_factory(
+            dag=self.dag,
+            parents=self._parents,
+            nodes=self._nodes,
+            device=self.device,
+        )
 
-        # 2. Perform one step of gradient descent for differentiable CPDs
-        # --- FIX 2: Use the stored optimizer ---
-        self._optimizer.zero_grad()
-        loss = self._trainer(data=tensor_data)
-        loss.backward()
-        self._optimizer.step()
-        # --------------------------------------
-
-        # print(f"VBN Update completed. Batch Loss: {loss.item():.4f}")
-
-    def _run_nondiff_update(self, data: Dict[str, torch.Tensor]) -> None:
-        for node in self.dag.nodes():
-            cpd_module = self._trainer.cpd_modules[node]
-
-            # Only run update on modules that implement the .update() method (i.e., Exact and KDE)
-            if hasattr(cpd_module, "update"):
-                parents = list(self.dag.predecessors(node))
-
-                # Create a data dict containing only the required tensors
-                node_data = {p: data[p] for p in parents}
-                node_data[node] = data[node]
-
-                # Pass node_data and all node configurations (as some CPDs need parent configs)
-                cpd_module.update(data=node_data, node_configs=self._node_configs)
-
-    def get_log_prob(
+    def infer_posterior(
         self,
-        target_node: str,
+        query: str,
         evidence: Optional[Dict[str, torch.Tensor]] = None,
         do: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
-        """
-        Computes the Log Probability P(Target | Evidence, do(Intervention)).
-
-        This method currently only returns the CPD for the target node,
-        assuming the provided evidence/do-interventions cover all parents.
-        For full inference (marginalization over unobserved parents),
-        a separate engine is required.
-
-        Args:
-            target_node: The name of the node (X) for which to compute P(X | Pa_X).
-            evidence: A dictionary of observed node states {node_name: tensor_data}.
-                      Only needs to contain states for the PARENTS of the target_node.
-            do: A dictionary of intervened node states {node_name: tensor_data}.
-                             Treats intervened nodes as fixed parent values for any of their children.
-
-        Returns:
-            A tuple: (log_prob_tensor, parent_data_dict)
-            log_prob_tensor: Log probability (Log-Prob or Log-NLL) of the target node,
-                             conditioned on its parents (or do-interventions on parents).
-            parent_data_dict: The final dictionary of parent states used for conditioning.
-        """
-        if self._trainer is None:
-            raise RuntimeError(
-                "BNModule not initialized. Run set_learning_method() first."
-            )
-
-        if target_node not in self._trainer.cpd_modules:
-            raise ValueError(f"Target node '{target_node}' not found in BNModule.")
-
-        cpd_module = self._trainer.cpd_modules[target_node]
-
-        if cpd_module is None:
-            raise ValueError(f"Target node '{target_node}' not found in BNModule.")
-
-        # 1. Identify required parent nodes
-        required_parents = list(self.dag.predecessors(target_node))
-
-        # 2. Compile parent conditioning data, prioritizing 'do' over 'evidence'
-        parent_data = {}
-
-        # Check if we have the target data itself (for log_prob)
-        target_data = None
-        if evidence and target_node in evidence:
-            target_data = self._standardize_tensor(evidence[target_node])
-
-        for parent in required_parents:
-            # Check for do-intervention first (stronger manipulation of the graph)
-            if do and parent in do:
-                # Intervention: Parent value is fixed by the 'do' operation
-                parent_data[parent] = self._standardize_tensor(do[parent])
-
-            # Check for observed evidence second
-            elif evidence and parent in evidence:
-                # Observation: Parent value is fixed by evidence
-                parent_data[parent] = self._standardize_tensor(evidence[parent])
-
-            else:
-                # If the parent is not observed or intervened upon, we cannot
-                # compute the conditional probability P(Target | Pa) fully.
-                # In a full inference engine, this would trigger marginalization.
-                raise ValueError(
-                    f"Parent node '{parent}' of '{target_node}' is neither observed nor intervened upon. "
-                    "Provide evidence/do for all parents to compute the CPD."
-                )
-
-        # 3. Compute Log Probability using the CPD module
-        if target_data is not None:
-            # Compute the specific log probability P(Target=t | Pa=pa)
-            log_prob_tensor = cpd_module.log_prob(
-                parent_data=parent_data, target_data=target_data
-            )
-
-        else:
-            # Requesting the CPD itself (the full distribution)
-            # Since log_prob requires target_data, we may need a separate cpd_dist() method
-            # or rely on the module's forward method if it returns the full distribution.
-
-            # For simplicity and robust integration with existing methods:
-            raise NotImplementedError(
-                "To get the full CPD, you need a specific 'cpd_dist' method in the CPD module. "
-                "For now, only computing log_prob for observed target is supported. "
-                "Please provide target_node's value in the 'evidence' dict."
-            )
-
-        return log_prob_tensor, parent_data
-
-    # Assume self._standardize_tensor is a helper in VBN for device/dtype alignment.
-    def _standardize_tensor(
-        self, data: Union[torch.Tensor, pd.DataFrame]
-    ) -> torch.Tensor:
-        # Basic helper to convert input data to a standardized tensor format
-        if isinstance(data, pd.DataFrame):
-            data = torch.tensor(data.values, dtype=torch.float32)
-        elif not isinstance(data, torch.Tensor):
-            data = torch.tensor(data, dtype=torch.float32)
-
-        return data.to(self.device).view(-1, 1)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # SAMPLING / INFERENCE (unchanged)
-    # ─────────────────────────────────────────────────────────────────────────
-    def sample(
-        self,
-        n_samples: int = 1024,
-        do: Optional[Dict[str, torch.Tensor]] = None,
-        method: str = "ancestral",
-        **kw,
-    ):
-        from .sampling import sample as _sample
-
-        return _sample(
-            self, n=n_samples, do=do, method=method, device=self.device, **kw
-        )
-
-    def sample_conditional(
-        self,
-        evidence: Dict[str, torch.Tensor],
-        n_samples: int = 1024,
-        do: Optional[Dict[str, torch.Tensor]] = None,
-        **kw,
-    ):
-        from .sampling import sample_conditional as _samplec
-
-        # NOTE: pass n=..., not n_samples=...
-        return _samplec(
-            self, evidence=evidence, n=n_samples, do=do, device=self.device, **kw
-        )
-
-    def _is_linear_gaussian_node(self, n: str) -> bool:
-        cpd = self.cpd.get(n)
-        # Robust check: either class name or required attributes
-        return (
-            cpd is not None
-            and hasattr(cpd, "W")
-            and hasattr(cpd, "b")
-            and hasattr(cpd, "sigma2")
-        )
-
-    def _vars_kind(self, vars_set):
-        kinds = []
-        for v in vars_set:
-            s = self.nodes.get(v, {})
-            t = s.get("type")
-            if t == "discrete":
-                kinds.append("discrete")
-            elif t == "gaussian" and s.get("dim", 1) == 1:
-                kinds.append("gaussian_scalar")
-            else:
-                kinds.append("other")
-        return set(kinds)
-
-    def posterior(
-        self,
-        query,
-        evidence=None,
-        do=None,
-        n_samples: int = 4096,
-        method: str | None = None,
         **kwargs,
     ):
-        involved = set(query) | set(evidence or {}) | set(do or {})
+        if self._inference_factory is None:
+            raise RuntimeError(
+                "Call set_inference_method(...) before infer_posterior()."
+            )
+        call_kwargs = {**getattr(self, "_inference_kwargs", {}), **kwargs}
+        return self._inferencer.infer_posterior(
+            query, evidence=evidence, do=do, **call_kwargs
+        )
 
-        if method is None:
-            kinds = self._vars_kind(involved)
+    @torch.no_grad()
+    def counterfactual(
+        self,
+        query: str,
+        evidence: Optional[Dict[str, torch.Tensor]] = None,
+        do: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        base_infer: str = "montecarlo.lw",
+        num_samples: int = 2048,
+        **infer_kwargs,
+    ):
+        """
+        Abduction–Action–Prediction counterfactual:
+          1) Abduction: sample a posterior world consistent with evidence
+          2) Action: set do(·) interventions (override mechanisms/values)
+          3) Prediction: simulate forward to get query under the counterfactual action
 
-            if kinds <= {"discrete"}:
-                method = "ve"
-            elif kinds <= {"gaussian_scalar"}:
-                # NEW: only use GaussianExact if EVERY involved continuous node
-                # that could appear in the Gaussian solve is truly linear-Gaussian.
-                all_lg = all(
-                    (self.nodes.get(v, {}).get("type") != "gaussian")
-                    or self._is_linear_gaussian_node(v)
-                    for v in involved
-                )
-                method = "gaussian" if all_lg else (self.inference_method or "lw")
-            else:
-                method = self.inference_method or "lw"
+        Returns:
+          pdf:     {"weights": [B, N]}
+          samples: {query:    [B, N]}
+        """
+        device = self.device
+        ev = {k: v.to(device) for k, v in (evidence or {}).items()}
+        do_ = {k: v.to(device) for k, v in (do or {}).items()}
+        B = max([v.shape[0] for v in list(ev.values()) + list(do_.values())] + [1])
 
-        if self._inference_obj is None or method != self.inference_method:
-            self.set_inference(method, **kwargs)
+        # 1) Abduction: posterior samples of all nodes given E (using chosen inferencer)
+        self.set_inference_method(base_infer, num_samples=num_samples, **infer_kwargs)
+        # sample each non-evidence node once to get a consistent ancestral sample set
+        posterior_samples: Dict[str, torch.Tensor] = {}
+        for n in self.dag.nodes():
+            if n in ev:
+                posterior_samples[n] = ev[n].expand(B, num_samples)  # [B,N]
+                continue
+            pdf_n, s_n = self._inferencer.infer_posterior(
+                n, evidence=ev, do=None, num_samples=num_samples
+            )
+            posterior_samples[n] = s_n[n]  # [B,N]
 
-        backend = self._inference_obj
-        call_kw = dict(bn=self, query=query, evidence=evidence, do=do)
-        if "n_samples" in backend.posterior.__code__.co_varnames:
-            call_kw["n_samples"] = n_samples
-        for k, v in kwargs.items():
-            if k not in ("device",):
-                call_kw[k] = v
-        return backend.posterior(**call_kw)
+        # 2) Action: override do-nodes with fixed values across N
+        for n, v in do_.items():
+            posterior_samples[n] = v.expand(B, 1).repeat(1, num_samples)  # [B,N]
+
+        # 3) Prediction: forward-sample query with mechanisms under 'do'
+        #    Use CPDs but with parents taken from posterior_samples (abduced noises/parents).
+        #    If query is intervened, just return its clamped value.
+        if query in do_:
+            q = do_[query].expand(B, 1).repeat(1, num_samples)
+            pdf = {"weights": torch.ones(B, num_samples, device=device) / num_samples}
+            return pdf, {query: q}
+
+        # Otherwise sample using CPD of 'query' with parent assignments from posterior_samples
+        ps = list(self.dag.predecessors(query))
+        if len(ps) == 0:
+            X = torch.zeros(B * num_samples, 0, device=device)
+        else:
+            X_b_n_p = torch.stack(
+                [posterior_samples[p] for p in ps], dim=-1
+            )  # [B,N,|Pa|]
+            X = X_b_n_p.reshape(B * num_samples, -1).float()
+
+        if hasattr(self._nodes[query], "sample"):
+            y = (
+                self._nodes[query].sample(X, n=1).squeeze(0).view(B, num_samples)
+            )  # [B,N]
+        else:
+            # fallback: argmax from log_prob grid (rare)
+            raise RuntimeError(
+                f"Node '{query}' lacks sample(); cannot predict counterfactual."
+            )
+
+        pdf = {"weights": torch.ones(B, num_samples, device=device) / num_samples}
+        return pdf, {query: y}
