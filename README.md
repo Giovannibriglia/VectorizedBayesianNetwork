@@ -2,7 +2,10 @@
 
 [![Tests](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml/badge.svg)](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/Giovannibriglia/VectorizedBayesianNetwork/main)](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen.svg)](https://pre-commit.com/)
 [![License](https://img.shields.io/github/license/Giovannibriglia/VectorizedBayesianNetwork)](LICENSE)
 
 Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian Network library built for **batched learning, inference, and sampling**. The goal is a research-grade, extensible framework that stays differentiable end-to-end and scales to modern estimators.
