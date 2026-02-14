@@ -1,0 +1,5 @@
+name: node_wise
+default_cpd: softmax_nn
+epochs: 200
+lr: 1e-3
+batch_size: 128
