@@ -51,6 +51,8 @@ class MDNCPD(BaseCPD):
             input_dim=input_dim, output_dim=output_dim, device=device, seed=seed
         )
         self.n_components = int(n_components)
+        self.hidden_dims = tuple(int(h) for h in hidden_dims)
+        self.activation = str(activation)
         self.min_scale = float(min_scale)
         if self.input_dim == 0:
             self._logits = nn.Parameter(
@@ -65,10 +67,18 @@ class MDNCPD(BaseCPD):
             self.net = None
         else:
             out_dim = self.n_components * (2 * self.output_dim) + self.n_components
-            self.net = _build_mlp(self.input_dim, hidden_dims, out_dim, activation).to(
-                self.device
-            )
+            self.net = _build_mlp(
+                self.input_dim, self.hidden_dims, out_dim, self.activation
+            ).to(self.device)
         self._optimizer: Optional[torch.optim.Optimizer] = None
+
+    def get_init_kwargs(self) -> dict:
+        return {
+            "n_components": self.n_components,
+            "hidden_dims": self.hidden_dims,
+            "activation": self.activation,
+            "min_scale": self.min_scale,
+        }
 
     def _params(
         self, parents: Optional[torch.Tensor]

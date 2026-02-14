@@ -59,6 +59,18 @@ class BaseCPD(nn.Module):
     ) -> None:
         raise NotImplementedError("Incremental update not implemented for this CPD.")
 
+    def get_init_kwargs(self) -> Dict[str, object]:
+        """Return CPD-specific init kwargs needed for reconstruction."""
+        return {}
+
+    def get_extra_state(self) -> Optional[Dict[str, object]]:
+        """Return extra state not captured by state_dict()."""
+        return None
+
+    def set_extra_state(self, state: Optional[Dict[str, object]]) -> None:
+        """Restore extra state captured by get_extra_state()."""
+        return None
+
 
 class BaseLearning(Protocol):
     def fit(

@@ -39,6 +39,27 @@ class KDECPD(BaseCPD):
         self._parents: Optional[torch.Tensor] = None
         self._targets: Optional[torch.Tensor] = None
 
+    def get_init_kwargs(self) -> dict:
+        return {
+            "bandwidth": self.bandwidth,
+            "parent_bandwidth": self.parent_bandwidth,
+            "max_points": self.max_points,
+            "min_scale": self.min_scale,
+        }
+
+    def get_extra_state(self) -> Optional[dict]:
+        return {"parents": self._parents, "targets": self._targets}
+
+    def set_extra_state(self, state: Optional[dict]) -> None:
+        if not state:
+            self._parents = None
+            self._targets = None
+            return
+        parents = state.get("parents")
+        targets = state.get("targets")
+        self._parents = parents.to(self.device) if parents is not None else None
+        self._targets = targets.to(self.device) if targets is not None else None
+
     def _check_fitted(self) -> None:
         if self._targets is None:
             raise RuntimeError("KDECPD is not fitted yet.")

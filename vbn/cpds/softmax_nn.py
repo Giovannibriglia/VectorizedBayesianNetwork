@@ -49,6 +49,8 @@ class SoftmaxNNCPD(BaseCPD):
         super().__init__(
             input_dim=input_dim, output_dim=output_dim, device=device, seed=seed
         )
+        self.hidden_dims = tuple(int(h) for h in hidden_dims)
+        self.activation = str(activation)
         self.min_scale = float(min_scale)
         if self.input_dim == 0:
             self._loc = nn.Parameter(torch.zeros(self.output_dim, device=self.device))
@@ -58,9 +60,16 @@ class SoftmaxNNCPD(BaseCPD):
             self.net = None
         else:
             self.net = _build_mlp(
-                self.input_dim, hidden_dims, self.output_dim * 2, activation
+                self.input_dim, self.hidden_dims, self.output_dim * 2, self.activation
             ).to(self.device)
         self._optimizer: Optional[torch.optim.Optimizer] = None
+
+    def get_init_kwargs(self) -> dict:
+        return {
+            "hidden_dims": self.hidden_dims,
+            "activation": self.activation,
+            "min_scale": self.min_scale,
+        }
 
     def _params(
         self, parents: Optional[torch.Tensor]

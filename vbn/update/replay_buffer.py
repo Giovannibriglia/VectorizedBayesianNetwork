@@ -98,3 +98,10 @@ class ReplayBufferUpdate(BaseUpdatePolicy):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+    def get_state(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+        return {"buffer": self._buffer}
+
+    def set_state(self, state: Dict[str, Tuple[torch.Tensor, torch.Tensor]]) -> None:
+        buffer = state.get("buffer", {})
+        self._buffer = buffer
