@@ -13,6 +13,7 @@ import torch
 import yaml
 
 from vbn.core.base import Query
+from vbn.core.cpd_handle import CPDHandle
 from vbn.core.dags import StaticDAG
 from vbn.core.registry import (
     CPD_REGISTRY,
@@ -323,13 +324,17 @@ class VBN:
                 "Call set_inference_method(...) before infer_posterior()."
             )
         q = self._normalize_query(query)
-        return self._inference.infer_posterior(self, q, **kwargs)
+        pdf, samples = self._inference.infer_posterior(self, q, **kwargs)
+        return pdf.detach(), samples.detach()
 
     def sample(self, query: Dict | Query, n_samples: int = 200, **kwargs):
         if self._sampling is None:
             raise RuntimeError("Call set_sampling_method(...) before sample().")
         q = self._normalize_query(query)
-        return self._sampling.sample(self, q, n_samples=n_samples, **kwargs)
+        samples = self._sampling.sample(self, q, n_samples=n_samples, **kwargs)
+        if isinstance(samples, dict):
+            return {k: v.detach() for k, v in samples.items()}
+        return samples.detach()
 
     def _normalize_query(self, query: Dict | Query) -> Query:
         if isinstance(query, Query):
@@ -361,6 +366,10 @@ class VBN:
             for k, (p, x) in self._update_policy._buffer.items():
                 new_buffer[k] = (p.to(self.device), x.to(self.device))
             self._update_policy._buffer = new_buffer
+
+    # ----------------- CPD access -----------------
+    def cpd(self, node: str) -> CPDHandle:
+        return CPDHandle(self, node)
 
     # ----------------- persistence -----------------
     def save(

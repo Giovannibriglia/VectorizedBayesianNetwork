@@ -1,7 +1,7 @@
 # VectorizedBayesianNetwork (VBN)
 
 [![Tests](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml/badge.svg)](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml)
-[![Coverage](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork/branch/main/graph/badge.svg)](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork)
+[![Coverage](https://img.shields.io/codecov/c/github/Giovannibriglia/VectorizedBayesianNetwork/main)](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/Giovannibriglia/VectorizedBayesianNetwork)](LICENSE)
 

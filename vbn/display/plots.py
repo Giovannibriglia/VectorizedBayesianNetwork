@@ -40,7 +40,7 @@ def _finalize_figure(fig, save_path: Optional[str], show: bool) -> None:
         directory = os.path.dirname(save_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        fig.savefig(save_path, bbox_inches="tight", dpi=150)
+        fig.savefig(save_path, bbox_inches="tight", dpi=1000)
     if show:
         plt.show()
     plt.close(fig)

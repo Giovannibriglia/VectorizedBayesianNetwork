@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from vbn.core.cpd_handle import CPDHandle
 from vbn.core.utils import ensure_2d, ensure_tensor
 from vbn.display.plots import _finalize_figure, _import_plt, _to_numpy
 
@@ -15,18 +16,23 @@ def _format_parent_row(row: np.ndarray) -> str:
 
 
 def plot_cpd_fit(
-    vbn,
-    node: str,
+    vbn_or_handle,
+    node: Optional[str] = None,
     *,
     parents_grid: Optional[torch.Tensor] = None,
     n_samples: int = 512,
     save_path: Optional[str] = None,
     show: bool = False,
 ) -> None:
-    if node not in vbn.nodes:
-        raise ValueError(f"Unknown node '{node}'.")
+    if isinstance(vbn_or_handle, CPDHandle):
+        handle = vbn_or_handle
+        node = handle.node
+    else:
+        if node is None:
+            raise ValueError("node must be provided when passing a VBN instance.")
+        handle = vbn_or_handle.cpd(node)
 
-    cpd = vbn.nodes[node]
+    cpd = handle.cpd
     if parents_grid is not None and cpd.input_dim == 0:
         raise ValueError("parents_grid provided for node with no parents")
 
@@ -35,10 +41,10 @@ def plot_cpd_fit(
             parents_tensor = None
             labels = ["unconditional"]
         else:
-            parents_tensor = torch.zeros(1, cpd.input_dim, device=vbn.device)
+            parents_tensor = torch.zeros(1, cpd.input_dim, device=cpd.device)
             labels = ["parents=0"]
     else:
-        parents_tensor = ensure_2d(ensure_tensor(parents_grid, device=vbn.device))
+        parents_tensor = ensure_2d(ensure_tensor(parents_grid, device=cpd.device))
         if parents_tensor.shape[-1] != cpd.input_dim:
             raise ValueError(
                 f"parents_grid last dim {parents_tensor.shape[-1]} does not match input_dim {cpd.input_dim}"
@@ -48,7 +54,7 @@ def plot_cpd_fit(
         ]
 
     with torch.no_grad():
-        samples = cpd.sample(parents_tensor, int(n_samples))
+        samples = handle.sample(parents_tensor, int(n_samples))
     if samples.dim() == 2:
         samples = samples.unsqueeze(0)
     samples_np = _to_numpy(samples)
