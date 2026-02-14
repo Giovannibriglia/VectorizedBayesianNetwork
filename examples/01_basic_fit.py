@@ -1,19 +1,24 @@
+import os
+
 import networkx as nx
 import pandas as pd
 import torch
 from vbn import VBN
+from vbn.display import plot_cpd_fit
 
 
-def make_df(n=200):
-    x0 = torch.randn(n)
-    x1 = torch.randn(n)
-    x2 = 0.5 * x0 - 0.2 * x1 + 0.1 * torch.randn(n)
+def make_df(n=200, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    x0 = torch.randn(n, generator=gen)
+    x1 = torch.randn(n, generator=gen)
+    x2 = 0.5 * x0 - 0.2 * x1 + 0.1 * torch.randn(n, generator=gen)
     return pd.DataFrame(
         {"feature_0": x0.numpy(), "feature_1": x1.numpy(), "feature_2": x2.numpy()}
     )
 
 
 def main():
+    os.makedirs("examples/out", exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
@@ -28,7 +33,16 @@ def main():
         },
     )
     vbn.fit(df)
-    print("Fit complete. Nodes:", list(vbn.nodes.keys()))
+
+    parents_grid = torch.tensor([[0.0, 0.0], [1.0, -1.0]])
+    plot_cpd_fit(
+        vbn,
+        "feature_2",
+        parents_grid=parents_grid,
+        n_samples=512,
+        save_path="examples/out/cpd_feature_2.png",
+    )
+    print("Fit complete. CPD plot saved to examples/out/cpd_feature_2.png")
 
 
 if __name__ == "__main__":

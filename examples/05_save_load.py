@@ -4,7 +4,7 @@ import networkx as nx
 import pandas as pd
 import torch
 from vbn import VBN
-from vbn.display import plot_sampling_outcome
+from vbn.display import plot_inference_posterior, plot_sampling_outcome
 
 
 def make_df(n=200, seed=0):
@@ -34,20 +34,39 @@ def main():
     )
     vbn.fit(df)
 
+    vbn.set_inference_method(
+        vbn.config.inference.monte_carlo_marginalization, n_samples=50
+    )
     vbn.set_sampling_method(vbn.config.sampling.gibbs, n_samples=50)
+
+    model_path = "examples/out/model.pt"
+    vbn.save(model_path)
+    print(f"Saved model to {model_path}")
+
+    loaded = VBN.load(model_path, map_location="cpu")
     query = {
         "target": "feature_2",
         "evidence": {
-            "feature_0": torch.tensor([[0.4]]),
-            "feature_1": torch.tensor([[0.1]]),
+            "feature_0": torch.tensor([[0.2]]),
+            "feature_1": torch.tensor([[-0.1]]),
         },
     }
-    samples = vbn.sample(query, n_samples=50)
-    plot_sampling_outcome(
+    pdf, samples = loaded.infer_posterior(query)
+    print("loaded pdf shape:", pdf.shape)
+    print("loaded samples shape:", samples.shape)
+    plot_inference_posterior(
+        pdf,
         samples,
-        save_path="examples/out/sampling_outcome.png",
+        save_path="examples/out/loaded_inference_posterior.png",
     )
-    print("Sampling plot saved to examples/out/sampling_outcome.png")
+
+    samp = loaded.sample(query, n_samples=50)
+    print("loaded sampling shape:", samp.shape)
+    plot_sampling_outcome(
+        samp,
+        save_path="examples/out/loaded_sampling_outcome.png",
+    )
+    print("Loaded model plots saved under examples/out/")
 
 
 if __name__ == "__main__":
