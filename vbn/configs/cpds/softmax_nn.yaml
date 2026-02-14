@@ -1,0 +1,4 @@
+name: softmax_nn
+hidden_dims: [32, 32]
+activation: relu
+min_scale: 1e-3
