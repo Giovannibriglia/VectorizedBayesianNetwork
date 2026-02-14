@@ -3,5 +3,5 @@
 build
 dist
 vbn.egg-info
-examples/out/*
-/benchmarking/
+examples/out
+benchmarking/*
