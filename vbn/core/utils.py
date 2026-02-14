@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -54,3 +55,20 @@ def unflatten_samples(x: torch.Tensor, b: int, s: int) -> torch.Tensor:
     if x.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got shape {tuple(x.shape)}")
     return x.reshape(b, s, x.shape[-1])
+
+
+def to_plain_dict(conf) -> dict:
+    if isinstance(conf, dict):
+        return dict(conf)
+    if hasattr(conf, "to_dict") and callable(conf.to_dict):
+        return dict(conf.to_dict())
+    if hasattr(conf, "as_dict") and callable(conf.as_dict):
+        return dict(conf.as_dict())
+    if is_dataclass(conf):
+        return asdict(conf)
+    if hasattr(conf, "model_dump") and callable(conf.model_dump):
+        return conf.model_dump()
+    raise TypeError(
+        f"Unsupported config type '{type(conf).__name__}'. "
+        "Expected dict, ConfigItem, dataclass, or pydantic model."
+    )

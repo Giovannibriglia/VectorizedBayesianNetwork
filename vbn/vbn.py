@@ -22,7 +22,14 @@ from vbn.core.registry import (
     SAMPLING_REGISTRY,
     UPDATE_REGISTRY,
 )
-from vbn.core.utils import ensure_2d, ensure_tensor, resolve_device, set_seed
+from vbn.core.utils import (
+    ensure_2d,
+    ensure_tensor,
+    resolve_device,
+    set_seed,
+    to_plain_dict,
+)
+from vbn.defaults import defaults
 from vbn.utils import df_to_tensor_dict, dict_to_device
 
 
@@ -30,6 +37,17 @@ from vbn.utils import df_to_tensor_dict, dict_to_device
 class ConfigItem:
     name: str
     params: Dict
+    kind: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        if self.kind == "cpd":
+            return {"cpd": self.name, **self.params}
+        if self.kind in {"learning", "inference", "sampling", "update"}:
+            return {"name": self.name, **self.params}
+        return dict(self.params)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return self.to_dict()
 
 
 class ConfigNamespace(SimpleNamespace):
@@ -43,12 +61,13 @@ def _load_configs() -> ConfigNamespace:
     for category in ["cpds", "learning", "inference", "sampling", "update"]:
         cat_dir = base / category
         items = {}
+        kind = "cpd" if category == "cpds" else category
         if cat_dir.is_dir():
             for path in sorted(cat_dir.iterdir(), key=lambda p: p.name):
                 if path.name.endswith(".yaml"):
                     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
                     name = data.pop("name", path.stem)
-                    items[path.stem] = ConfigItem(name=name, params=data)
+                    items[path.stem] = ConfigItem(name=name, params=data, kind=kind)
         categories[category] = ConfigNamespace(**items)
     return ConfigNamespace(**categories)
 
@@ -101,7 +120,7 @@ def _cpd_key_from_class(cpd_cls) -> Optional[str]:
     return None
 
 
-def _serialize_nodes_cpds(nodes_cpds: Optional[Dict[str, Dict]]) -> Optional[Dict]:
+def _serialize_nodes_cpds(nodes_cpds: Optional[Dict[str, Any]]) -> Optional[Dict]:
     if nodes_cpds is None:
         return None
     serialized: Dict[str, Dict] = {}
@@ -109,7 +128,14 @@ def _serialize_nodes_cpds(nodes_cpds: Optional[Dict[str, Dict]]) -> Optional[Dic
         if conf is None:
             serialized[node] = {}
             continue
-        conf_copy = dict(conf)
+        if isinstance(conf, str):
+            conf_copy = defaults.cpd(conf)
+        else:
+            conf_copy = to_plain_dict(conf)
+            cpd_value = conf_copy.get("cpd")
+            if isinstance(cpd_value, str):
+                base = defaults.cpd(cpd_value)
+                conf_copy = {**base, **conf_copy}
         cpd_value = conf_copy.get("cpd")
         if cpd_value is None or isinstance(cpd_value, str):
             serialized[node] = conf_copy
@@ -169,7 +195,23 @@ class VBN:
     def set_learning_method(
         self, method, nodes_cpds: Optional[Dict[str, Dict]] = None, **kwargs
     ):
-        if isinstance(method, ConfigItem):
+        if isinstance(method, dict):
+            method_conf = to_plain_dict(method)
+            name = method_conf.get("name") or method_conf.get("method")
+            if name is None:
+                raise TypeError("method dict must include a 'name' field")
+            if not isinstance(name, str):
+                raise TypeError("method name must be a string")
+            key = name.lower().strip()
+            if key not in LEARNING_REGISTRY:
+                raise ValueError(
+                    f"Unknown learning method '{name}'. Available: {list(LEARNING_REGISTRY.keys())}"
+                )
+            base_params = {
+                k: v for k, v in method_conf.items() if k not in {"name", "method"}
+            }
+            name = key
+        elif isinstance(method, ConfigItem):
             name, base_params = method.name, method.params
         elif isinstance(method, str):
             key = method.lower().strip()
@@ -198,7 +240,23 @@ class VBN:
         }
 
     def set_inference_method(self, method, **kwargs):
-        if isinstance(method, ConfigItem):
+        if isinstance(method, dict):
+            method_conf = to_plain_dict(method)
+            name = method_conf.get("name") or method_conf.get("method")
+            if name is None:
+                raise TypeError("method dict must include a 'name' field")
+            if not isinstance(name, str):
+                raise TypeError("method name must be a string")
+            key = name.lower().strip()
+            if key not in INFERENCE_REGISTRY:
+                raise ValueError(
+                    f"Unknown inference method '{name}'. Available: {list(INFERENCE_REGISTRY.keys())}"
+                )
+            base_params = {
+                k: v for k, v in method_conf.items() if k not in {"name", "method"}
+            }
+            name = key
+        elif isinstance(method, ConfigItem):
             name, base_params = method.name, method.params
         elif isinstance(method, str):
             key = method.lower().strip()
@@ -222,7 +280,23 @@ class VBN:
         self._inference_config = {"name": name, "params": params}
 
     def set_sampling_method(self, method, **kwargs):
-        if isinstance(method, ConfigItem):
+        if isinstance(method, dict):
+            method_conf = to_plain_dict(method)
+            name = method_conf.get("name") or method_conf.get("method")
+            if name is None:
+                raise TypeError("method dict must include a 'name' field")
+            if not isinstance(name, str):
+                raise TypeError("method name must be a string")
+            key = name.lower().strip()
+            if key not in SAMPLING_REGISTRY:
+                raise ValueError(
+                    f"Unknown sampling method '{name}'. Available: {list(SAMPLING_REGISTRY.keys())}"
+                )
+            base_params = {
+                k: v for k, v in method_conf.items() if k not in {"name", "method"}
+            }
+            name = key
+        elif isinstance(method, ConfigItem):
             name, base_params = method.name, method.params
         elif isinstance(method, str):
             key = method.lower().strip()
@@ -278,7 +352,24 @@ class VBN:
             raise RuntimeError("Call fit(...) before update(...).")
         tensor_data = self._prepare_data(data)
         if update_method is not None:
-            if isinstance(update_method, ConfigItem):
+            if isinstance(update_method, dict):
+                method_conf = to_plain_dict(update_method)
+                name = method_conf.get("name") or method_conf.get("method")
+                if name is None:
+                    raise TypeError("update_method dict must include a 'name' field")
+                if not isinstance(name, str):
+                    raise TypeError("update_method name must be a string")
+                key = name.lower().strip()
+                if key not in UPDATE_REGISTRY:
+                    raise ValueError(
+                        f"Unknown update method '{name}'. Available: {list(UPDATE_REGISTRY.keys())}"
+                    )
+                base_params = {
+                    k: v for k, v in method_conf.items() if k not in {"name", "method"}
+                }
+                params = {**base_params, **kwargs}
+                name = key
+            elif isinstance(update_method, ConfigItem):
                 name, base_params = update_method.name, update_method.params
                 params = {**base_params, **kwargs}
             else:

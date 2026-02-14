@@ -13,6 +13,7 @@ from vbn.core.registry import (
     SAMPLING_REGISTRY,
     UPDATE_REGISTRY,
 )
+from vbn.defaults import defaults
 from vbn.vbn import VBN
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "INFERENCE_REGISTRY",
     "SAMPLING_REGISTRY",
     "UPDATE_REGISTRY",
+    "defaults",
 ]
