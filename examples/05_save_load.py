@@ -18,7 +18,7 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs("examples/out", exist_ok=True)
+    os.makedirs("out", exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
@@ -39,7 +39,7 @@ def main():
     )
     vbn.set_sampling_method(vbn.config.sampling.gibbs, n_samples=50)
 
-    model_path = "examples/out/model.pt"
+    model_path = "out/model.pt"
     vbn.save(model_path)
     print(f"Saved model to {model_path}")
 
@@ -57,14 +57,14 @@ def main():
     plot_inference_posterior(
         pdf,
         samples,
-        save_path="examples/out/loaded_inference_posterior.png",
+        save_path="out/loaded_inference_posterior.png",
     )
 
     samp = loaded.sample(query, n_samples=50)
     print("loaded sampling shape:", samp.shape)
     plot_sampling_outcome(
         samp,
-        save_path="examples/out/loaded_sampling_outcome.png",
+        save_path="out/loaded_sampling_outcome.png",
     )
     print("Loaded model plots saved under examples/out/")
 
