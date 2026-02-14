@@ -35,14 +35,14 @@ def main():
     vbn.fit(df)
 
     parents_grid = torch.tensor([[0.0, 0.0], [1.0, -1.0]])
+    handle = vbn.cpd("feature_2")
     plot_cpd_fit(
-        vbn,
-        "feature_2",
+        handle,
         parents_grid=parents_grid,
         n_samples=512,
         save_path="out/cpd_feature_2.png",
     )
-    print("Fit complete. CPD plot saved to examples/out/cpd_feature_2.png")
+    print("Fit complete. CPD plot saved to out/cpd_feature_2.png")
 
 
 if __name__ == "__main__":

@@ -45,12 +45,13 @@ def main():
         },
     }
     pdf, samples = vbn.infer_posterior(query)
+    assert not pdf.requires_grad and not samples.requires_grad
     plot_inference_posterior(
         pdf,
         samples,
         save_path="out/inference_posterior.png",
     )
-    print("Posterior plot saved to examples/out/inference_posterior.png")
+    print("Posterior plot saved to out/inference_posterior.png")
 
 
 if __name__ == "__main__":

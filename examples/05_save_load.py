@@ -52,6 +52,7 @@ def main():
         },
     }
     pdf, samples = loaded.infer_posterior(query)
+    assert not pdf.requires_grad and not samples.requires_grad
     print("loaded pdf shape:", pdf.shape)
     print("loaded samples shape:", samples.shape)
     plot_inference_posterior(
@@ -61,12 +62,13 @@ def main():
     )
 
     samp = loaded.sample(query, n_samples=50)
+    assert not samp.requires_grad
     print("loaded sampling shape:", samp.shape)
     plot_sampling_outcome(
         samp,
         save_path="out/loaded_sampling_outcome.png",
     )
-    print("Loaded model plots saved under examples/out/")
+    print("Loaded model plots saved under out/")
 
 
 if __name__ == "__main__":

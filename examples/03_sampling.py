@@ -43,11 +43,12 @@ def main():
         },
     }
     samples = vbn.sample(query, n_samples=50)
+    assert not samples.requires_grad
     plot_sampling_outcome(
         samples,
         save_path="out/sampling_outcome.png",
     )
-    print("Sampling plot saved to examples/out/sampling_outcome.png")
+    print("Sampling plot saved to out/sampling_outcome.png")
 
 
 if __name__ == "__main__":
