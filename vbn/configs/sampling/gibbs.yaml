@@ -1,0 +1,4 @@
+name: gibbs
+n_samples: 200
+burn_in: 10
+n_steps: 1
