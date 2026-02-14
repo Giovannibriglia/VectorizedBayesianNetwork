@@ -38,14 +38,15 @@ def main():
     query = {
         "target": "feature_2",
         "evidence": {
-            "feature_0": torch.tensor([[0.4]]),
-            "feature_1": torch.tensor([[0.1]]),
+            "feature_0": torch.tensor([[0.4], [0.8]]),
+            "feature_1": torch.tensor([[0.1], [0.2]]),
         },
     }
     samples = vbn.sample(query, n_samples=50)
     assert not samples.requires_grad
     plot_sampling_outcome(
         samples,
+        batch_index=0,
         save_path="out/03_sampling_outcome.png",
     )
     print("Sampling plot saved to out/sampling_outcome.png")

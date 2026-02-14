@@ -34,13 +34,13 @@ def main():
     )
     vbn.fit(df)
 
-    parents_grid = torch.tensor([[0.0, 0.0], [1.0, -1.0]])
+    parents_grid = torch.tensor([[0.0, 0.0], [0.5, -0.5], [1.0, -1.0]])
     handle = vbn.cpd("feature_2")
     plot_cpd_fit(
         handle,
         parents_grid=parents_grid,
         n_samples=512,
-        save_path="out/cpd_feature_2.png",
+        save_path="out/01_basic_fit_cpd_features2.png",
     )
     print("Fit complete. CPD plot saved to out/cpd_feature_2.png")
 

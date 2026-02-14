@@ -49,7 +49,7 @@ def main():
     plot_inference_posterior(
         pdf,
         samples,
-        save_path="out/inference_posterior.png",
+        save_path="out/02_inference_posterior.png",
     )
     print("Posterior plot saved to out/inference_posterior.png")
 

@@ -39,7 +39,7 @@ def main():
     )
     vbn.set_sampling_method(defaults.sampling("gibbs"), n_samples=50)
 
-    model_path = "out/model.pt"
+    model_path = "out/saved_model.pt"
     vbn.save(model_path)
     print(f"Saved model to {model_path}")
 
@@ -58,7 +58,7 @@ def main():
     plot_inference_posterior(
         pdf,
         samples,
-        save_path="out/loaded_inference_posterior.png",
+        save_path="out/05_loaded_inference_posterior.png",
     )
 
     samp = loaded.sample(query, n_samples=50)
@@ -66,7 +66,7 @@ def main():
     print("loaded sampling shape:", samp.shape)
     plot_sampling_outcome(
         samp,
-        save_path="out/loaded_sampling_outcome.png",
+        save_path="out/05_loaded_sampling_outcome.png",
     )
     print("Loaded model plots saved under out/")
 

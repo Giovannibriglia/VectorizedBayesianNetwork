@@ -15,7 +15,7 @@ def make_df(n=200):
 
 
 def main():
-    df = make_df()
+    df = make_df(n=2000)
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
@@ -47,8 +47,8 @@ def main():
         save_path="out/04_inference_posterior.png",
     )
 
-    new_df = make_df(200)
-    vbn.update(new_df, update_method="online_sgd", lr=1e-3, n_steps=2)
+    new_df = make_df(500)
+    vbn.update(new_df, update_method="ema", lr=1e-3, n_steps=2)
     print("Update complete")
 
     pdf, samples = vbn.infer_posterior(query)
