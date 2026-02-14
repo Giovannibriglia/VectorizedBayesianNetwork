@@ -119,11 +119,6 @@ tests/
 pytest -q
 ```
 
-## Roadmap
-- Amortized learning
-- Temporal/Dynamic DAGs
-- Additional CPDs and inference/sampling backends
-
 ## Contribution Guidelines
 - Keep all core computations torch-only.
 - Respect the global device invariant.
