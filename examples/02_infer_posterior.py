@@ -18,7 +18,7 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs("examples/out", exist_ok=True)
+    os.makedirs("out", exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
@@ -48,7 +48,7 @@ def main():
     plot_inference_posterior(
         pdf,
         samples,
-        save_path="examples/out/inference_posterior.png",
+        save_path="out/inference_posterior.png",
     )
     print("Posterior plot saved to examples/out/inference_posterior.png")
 

@@ -18,7 +18,7 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs("examples/out", exist_ok=True)
+    os.makedirs("out", exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
@@ -40,7 +40,7 @@ def main():
         "feature_2",
         parents_grid=parents_grid,
         n_samples=512,
-        save_path="examples/out/cpd_feature_2.png",
+        save_path="out/cpd_feature_2.png",
     )
     print("Fit complete. CPD plot saved to examples/out/cpd_feature_2.png")
 

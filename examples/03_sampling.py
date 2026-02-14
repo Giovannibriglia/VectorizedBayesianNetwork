@@ -18,7 +18,7 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs("examples/out", exist_ok=True)
+    os.makedirs("out", exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
@@ -45,7 +45,7 @@ def main():
     samples = vbn.sample(query, n_samples=50)
     plot_sampling_outcome(
         samples,
-        save_path="examples/out/sampling_outcome.png",
+        save_path="out/sampling_outcome.png",
     )
     print("Sampling plot saved to examples/out/sampling_outcome.png")
 
