@@ -1,5 +1,10 @@
 # VectorizedBayesianNetwork (VBN)
 
+[![Tests](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml/badge.svg)](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml)
+[![Coverage](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork/branch/main/graph/badge.svg)](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/github/license/Giovannibriglia/VectorizedBayesianNetwork)](LICENSE)
+
 Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian Network library built for **batched learning, inference, and sampling**. The goal is a research-grade, extensible framework that stays differentiable end-to-end and scales to modern estimators.
 
 ## Philosophy

@@ -14,12 +14,16 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install coverage
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install coverage[toml]
+          python -m pip install -e ".[test]"
+      - name: Smoke import
+        run: python -c "import torch, pandas; import vbn; print('deps ok')"
       - name: Run coverage
         run: |
           coverage run -m pytest -q
           coverage xml
+          coverage report -m
       - name: Upload
         uses: codecov/codecov-action@v4
         with:

@@ -15,12 +15,13 @@ dependencies = [
     "pandas>=1.5",
     "networkx>=3.0",
     "pyyaml>=6.0",
+    "numpy>=1.23",
     "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.5", "black>=24.0", "mypy>=1.8"]
-test = ["pytest>=7.0", "pytest-cov"]
+test = ["pytest>=7.0", "pytest-cov", "coverage[toml]"]
 torch = ["torch>=2.0"]
 
 [tool.setuptools]
