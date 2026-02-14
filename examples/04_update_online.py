@@ -48,7 +48,9 @@ def main():
     )
 
     new_df = make_df(500)
-    vbn.update(new_df, update_method="ema", lr=1e-3, n_steps=2)
+    vbn.update(
+        new_df, defaults.update("ema")
+    )  # vbn.update(new_df, update_method="ema", lr=1e-3, n_steps=2)
     print("Update complete")
 
     pdf, samples = vbn.infer_posterior(query)
