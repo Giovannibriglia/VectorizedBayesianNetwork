@@ -1,0 +1,5 @@
+name: ema
+lr: 1e-3
+n_steps: 1
+batch_size: 128
+alpha: 0.1
