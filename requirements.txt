@@ -3,3 +3,4 @@ pandas>=1.5
 pyyaml>=6.0
 tqdm>=4.66
 pytest>=7.0
+matplotlib>=3.7
