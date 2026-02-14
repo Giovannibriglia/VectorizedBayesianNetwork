@@ -1,0 +1,5 @@
+name: mdn
+n_components: 5
+hidden_dims: [32, 32]
+activation: relu
+min_scale: 1e-3
