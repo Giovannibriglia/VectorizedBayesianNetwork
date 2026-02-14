@@ -3,7 +3,5 @@
 build
 dist
 vbn.egg-info
-benchmarking
-benchmarking/results
-/benchmarking/bnrepo/bif/
-examples/out
+examples/out/*
+/benchmarking/
