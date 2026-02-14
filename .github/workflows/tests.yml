@@ -16,5 +16,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[test]"
+      - name: Smoke import
+        run: python -c "import torch, pandas, networkx; import vbn; print('deps ok')"
       - name: Run tests
         run: pytest -q
