@@ -3,7 +3,7 @@ import os
 import networkx as nx
 import pandas as pd
 import torch
-from vbn import VBN
+from vbn import defaults, VBN
 from vbn.display import plot_sampling_outcome
 
 
@@ -25,16 +25,16 @@ def main():
 
     vbn = VBN(g, seed=0, device="cpu")
     vbn.set_learning_method(
-        method=vbn.config.learning.node_wise,
+        method=defaults.learning("node_wise"),
         nodes_cpds={
-            "feature_0": {"cpd": "softmax_nn"},
-            "feature_1": {"cpd": "softmax_nn"},
-            "feature_2": {"cpd": "mdn", "n_components": 3},
+            "feature_0": defaults.cpd("softmax_nn"),
+            "feature_1": defaults.cpd("softmax_nn"),
+            "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
         },
     )
     vbn.fit(df)
 
-    vbn.set_sampling_method(vbn.config.sampling.gibbs, n_samples=50)
+    vbn.set_sampling_method(defaults.sampling("gibbs"), n_samples=50)
     query = {
         "target": "feature_2",
         "evidence": {
@@ -46,7 +46,7 @@ def main():
     assert not samples.requires_grad
     plot_sampling_outcome(
         samples,
-        save_path="out/sampling_outcome.png",
+        save_path="out/03_sampling_outcome.png",
     )
     print("Sampling plot saved to out/sampling_outcome.png")
 

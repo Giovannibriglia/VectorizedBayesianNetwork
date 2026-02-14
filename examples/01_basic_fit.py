@@ -3,7 +3,7 @@ import os
 import networkx as nx
 import pandas as pd
 import torch
-from vbn import VBN
+from vbn import defaults, VBN
 from vbn.display import plot_cpd_fit
 
 
@@ -25,11 +25,11 @@ def main():
 
     vbn = VBN(g, seed=0, device="cpu")
     vbn.set_learning_method(
-        method=vbn.config.learning.node_wise,
+        method=defaults.learning("node_wise"),
         nodes_cpds={
-            "feature_0": {"cpd": "softmax_nn"},
-            "feature_1": {"cpd": "softmax_nn"},
-            "feature_2": {"cpd": "mdn", "n_components": 3},
+            "feature_0": defaults.cpd("softmax_nn"),
+            "feature_1": defaults.cpd("softmax_nn"),
+            "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
         },
     )
     vbn.fit(df)

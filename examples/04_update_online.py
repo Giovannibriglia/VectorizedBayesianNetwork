@@ -1,7 +1,8 @@
 import networkx as nx
 import pandas as pd
 import torch
-from vbn import VBN
+from vbn import defaults, VBN
+from vbn.display import plot_inference_posterior
 
 
 def make_df(n=200):
@@ -20,17 +21,17 @@ def main():
 
     vbn = VBN(g, seed=0, device="cpu")
     vbn.set_learning_method(
-        method=vbn.config.learning.node_wise,
+        method=defaults.learning("node_wise"),
         nodes_cpds={
-            "feature_0": {"cpd": "softmax_nn"},
-            "feature_1": {"cpd": "softmax_nn"},
-            "feature_2": {"cpd": "mdn", "n_components": 3},
+            "feature_0": defaults.cpd("softmax_nn"),
+            "feature_1": defaults.cpd("softmax_nn"),
+            "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
         },
     )
     vbn.fit(df)
 
     vbn.set_inference_method(
-        vbn.config.inference.monte_carlo_marginalization, n_samples=16
+        defaults.inference("monte_carlo_marginalization"), n_samples=16
     )
     query = {
         "target": "feature_2",
@@ -40,16 +41,22 @@ def main():
         },
     }
     pdf, samples = vbn.infer_posterior(query)
-    print("pdf:", pdf)
-    print("samples:", samples)
+    plot_inference_posterior(
+        pdf,
+        samples,
+        save_path="out/04_inference_posterior.png",
+    )
 
     new_df = make_df(200)
     vbn.update(new_df, update_method="online_sgd", lr=1e-3, n_steps=2)
     print("Update complete")
 
     pdf, samples = vbn.infer_posterior(query)
-    print("pdf:", pdf)
-    print("samples:", samples)
+    plot_inference_posterior(
+        pdf,
+        samples,
+        save_path="out/04_inference_posterior_after_refit.png",
+    )
 
 
 if __name__ == "__main__":
