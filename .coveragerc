@@ -1,0 +1,16 @@
+[run]
+source = vbn
+branch = True
+omit =
+    */site-packages/*
+    */dist-packages/*
+    */.venv/*
+    */venv/*
+    */tests/*
+    */_remote_module_non_scriptable*
+    */_remote_module_*
+    */__torch__/*
+
+[report]
+exclude_also =
+    pragma: no cover

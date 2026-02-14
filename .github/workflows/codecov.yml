@@ -21,8 +21,8 @@ jobs:
         run: python -c "import torch, pandas; import vbn; print('deps ok')"
       - name: Run coverage
         run: |
-          coverage run -m pytest -q
-          coverage xml
+          coverage run --rcfile=.coveragerc --source=vbn -m pytest -q
+          coverage xml -o coverage.xml
           coverage report -m
       - name: Upload
         uses: codecov/codecov-action@v4
