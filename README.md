@@ -1,206 +1,122 @@
-# TODO
-- temporal bn
-- dynamic bn
-
-
 # VectorizedBayesianNetwork (VBN)
 
-Fast, modular Bayesian Networks for **discrete** and **continuous** data — with **vectorized** exact & approximate inference, **neural CPDs**, `do(·)` interventions, plotting, and lightweight save/load.
+Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian Network library built for **batched learning, inference, and sampling**. The goal is a research-grade, extensible framework that stays differentiable end-to-end and scales to modern estimators.
 
-* **Learners**
+## Philosophy
+- Continuous variables only (no discrete special casing in core).
+- Batched operations everywhere.
+- PyTorch-first: all core math in torch.
+- Global device invariant: `VBN(device=...)` is the single source of truth for device placement.
+- Modular and registry-driven: CPDs, learning, inference, sampling, and update policies are pluggable.
 
-  * Discrete: **MLE (tabular)**, **Categorical MLP**
-  * Continuous: **Linear-Gaussian (ridge)**, **Gaussian MLP** (mean/logvar)
-* **Inference**
+## Implemented Methods
+**CPDs**
+- `softmax_nn`: neural Gaussian CPD
+- `kde`: (conditional) Gaussian KDE CPD
+- `mdn`: mixture density network CPD
 
-  * Discrete: **Exact** (variable elimination), **Approximate** (likelihood weighting)
-  * Continuous: **Exact Gaussian** (canonical form), **Approximate** (vectorized sampling + LW)
-* **Extras**
+**Learning**
+- `node_wise`
 
-  * `do(...)` **interventions** in *all* inference backends
-  * **Batched evidence** (vectorized over data points)
-  * **TensorDict-compatible** save/load (`torch.save` / `torch.load` fallback)
-  * **Plotting**: DAG, CPDs, marginals, Gaussian posteriors, LG params, sample diagnostics
+**Inference**
+- Monte Carlo marginalization
+- Importance sampling
+- SVGP (placeholder, MC fallback)
 
----
+**Sampling**
+- Ancestral sampling
+- Gibbs sampling (simple conditional sampling)
+- HMC (placeholder, ancestral fallback)
 
-## Table of Contents
+**Update policies**
+- `streaming_stats`
+- `online_sgd`
+- `ema`
+- `replay_buffer`
 
-* [Install](#install)
-* [Why VBN?](#why-vbn)
-* [Quickstart](#quickstart)
-* [Repo Layout](#repo-layout)
-* [Troubleshooting](#troubleshooting)
-* [Citation](#citation)
+## Planned Methods
+- Amortized learning
+- Temporal/Dynamic DAGs
+- Additional CPD families and inference backends
 
----
-
-## Install
-
+## Installation
 ```bash
-  pip install -r requirements.txt
-  python setup.py install
+pip install -e .
 ```
 
-> GPU is auto-detected by PyTorch; all heavy ops are vectorized and GPU-friendly.
+## Minimal Usage
+```python
+import networkx as nx
+import torch
+from vbn import VBN
 
----
+G = nx.DiGraph()
+G.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
+vbn = VBN(G, seed=0, device="cpu")
 
-## Quickstart
+vbn.set_learning_method(
+    method=vbn.config.learning.node_wise,
+    nodes_cpds={
+        "feature_0": {"cpd": "softmax_nn"},
+        "feature_1": {"cpd": "softmax_nn"},
+        "feature_2": {"cpd": "mdn", "n_components": 3},
+    },
+)
 
-We provide three example scripts in `examples/`:
+vbn.fit(df)
 
-1. **01\_fit\_and\_infer.py** – learn discrete and continuous CPDs (MLE, MLP, linear-Gaussian) on synthetic data and run exact/approximate inference.
-2. **02\_add\_data\_and\_refit.py** – update a fitted model with new data (DataFrame, dict, or TensorDict) and incrementally refit parameters.
-3. **03\_save\_and\_load.py** – save learned parameters to disk, reload them, and plot CPDs from the saved model.
-
-Run any example with:
-
-```bash
-python examples/01_fit_and_infer.py
-```
-
----
-
-## Repo Layout
-
-```
-examples/
-  01_fit_and_infer.py
-  02_add_data_and_refit.py
-  03_save_and_load.py
-vbn/
-  core.py           # BNMeta, LearnParams, CausalBayesNet facade, merge_learnparams(...)
-  utils.py          # vectorized helpers (factor ops, pivots, pdfs)
-  io.py             # save/load LearnParams (TensorDict-friendly)
-  plotting.py           # DAG, CPDs, posteriors, LG params, diagnostics
-
-  learning/
-    discrete_mle.py       # Maximum-likelihood tabular CPDs (Laplace smoothing)
-    discrete_mlp.py       # Categorical MLP CPDs (+ materialize to tables)
-    gaussian_linear.py    # Linear-Gaussian (ridge) per-node regression
-    continuous_mlp.py     # Gaussian MLP CPDs + linearization → LG
-
-  inference/
-    discrete_exact.py     # Variable elimination (batched evidence, supports do)
-    discrete_approx.py    # Likelihood weighting (tables or discrete MLPs, supports do)
-    continuous_gaussian.py# Canonical-form exact inference (supports do)
-    continuous_approx.py  # Vectorized ancestral sampling + LW (supports do)
-```
-
----
-
-## Troubleshooting
-
-* **PyTorch `.to(...)` TypeError**
-  Always pass **named** args when moving tensors:
-  `x = x.to(device=self.device, dtype=self.dtype)`
-
-* **Broadcast / shape errors during exact inference**
-  We align and insert singleton axes internally. If you still see errors, check that **cards** match your data ranges and that evidence values are within `0..card-1`.
-
-* **Continuous approximate needs discrete CPDs**
-  `infer_continuous_approx` must sample/weight discrete parents.
-  Either `merge_learnparams(lp_disc, lp_cmlp)` or ensure `lp.discrete_mlps` is present (we fall back to MLPs if tables are missing).
-
-* **Empty continuous query**
-  Asking Gaussian inference for variables that aren’t continuous in your model returns empty results. Query only the continuous nodes present in `LGParams.order`.
-
----
-
-## Citation
-```
-@article{
+vbn.set_inference_method(vbn.config.inference.monte_carlo_marginalization, n_samples=200)
+query = {
+    "target": "feature_2",
+    "evidence": {
+        "feature_0": torch.tensor([[0.3]]),
+        "feature_1": torch.tensor([[-0.2]]),
+    },
 }
+pdf, samples = vbn.infer_posterior(query)
+
+vbn.set_sampling_method(vbn.config.sampling.gibbs)
+samples = vbn.sample(query, n_samples=200)
+
+new_df = df.sample(64)
+vbn.update(new_df, update_method="online_sgd", lr=1e-4, n_steps=5)
 ```
 
+## Config Loading
+Config YAMLs are packaged under `vbn/configs/**` and loaded via `importlib.resources` from the installed package.
 
-# Unified Class Hierarchy & Compatibility Map
-
+## Repository Layout
 ```
-                    ┌────────────────────────────────────────────────────────┐
-                    │                CAPABILITY CONTRACT                    │
-                    │  Capabilities{ has_sample, has_log_prob,              │
-                    │                 is_reparameterized, supports_do }     │
-                    └────────────────────────────────────────────────────────┘
-                                       ▲
-                                       │ (queried by samplers & inferencers)
-                                       │
-┌──────────────────────────┐           │           ┌──────────────────────────┐
-│        LEARNING          │           │           │         SAMPLING         │
-│  (models + trainers)     │           │           │   (per graph/topology)   │
-├──────────────────────────┤           │           ├──────────────────────────┤
-│ BaseConditionalModel     │───────────┼──────────▶│ BaseSampler              │
-│  ├─ ParametricCPD        │ has_log_prob✓  sample✓│  ├─ ParametricSampler    │
-│  │   (Categorical, Gauss)│ is_reparam✗            │  │  (ancestral, IS, LW, │
-│  │                        │                       │  │   MCMC; log_prob✓)    │
-│  ├─ DifferentiableCPD    │ has_log_prob✓  sample✓ │  ├─ DifferentiableSampler│
-│  │   (Flows, MoG, NDE)   │ is_reparam✓            │  │  (reparam; VI-ready)  │
-│  │                        │                       │  └─ ImplicitSampler      │
-│  └─ ImplicitGenerator    │ has_log_prob✗  sample✓ │     (generator only;     │
-│      (Sim/GAN/Diffusion) │ is_reparam✗            │      ABC/ratio-only)     │
-├──────────────────────────┤           │           └──────────────────────────-┘
-│ Trainers                 │           │                     │
-│  ├─ MLE / MAP / EM       │           │                     ▼ samples (+weights?)
-│  ├─ Bayesian (θ posterior)│          │        ┌──────────────────────────────┐
-│  ├─ Variational (ELBO/VI)│           │        │            INFERENCE         │
-│  └─ ABC / Ratio (LF)     │           │        │ (select by graph size & caps)│
-└──────────────────────────┘           │        ├──────────────────────────────┤
-                                       │        │ ExactFactorInference (VE/JT) │
-                                       │  needs │  needs: has_log_prob✓        │
-                                       │ logpdf │  out: exact marginals        │
-                                       │        ├──────────────────────────────┤
-                                       │        │ LoopyBeliefPropagation       │
-                                       │        │  needs: has_log_prob✓        │
-                                       │        │  out: approx marginals       │
-                                       │        ├──────────────────────────────┤
-                                       │        │ MonteCarloInference          │
-                                       │        │  needs: sample✓ (+log_prob✓) │
-                                       │        │  out: samples + weights      │
-                                       │        ├──────────────────────────────┤
-                                       │        │ VariationalInference (ELBO)  │
-                                       │        │  needs: has_log_prob✓ &      │
-                                       │        │         is_reparameterized✓  │
-                                       │        │  out: qφ + amortized samples │
-                                       │        ├──────────────────────────────┤
-                                       │        │ LikelihoodFreeInference (ABC)│
-                                       │        │  needs: sample✓ (no log_prob)│
-                                       │        │  out: empirical posteriors   │
-                                       │        ├──────────────────────────────┤
-                                       │        │ SMC / Particle Filtering     │
-                                       │        │  needs: sample✓ (+log_prob✓) │
-                                       │        │  out: sequential posteriors  │
-                                       │        └──────────────────────────────┘
+vbn/
+  vbn.py
+  utils.py
+  core/
+  cpds/
+  learning/
+  inference/
+  sampling/
+  update/
+  configs/
+examples/
+  01_basic_fit.py
+  02_infer_posterior.py
+  03_sampling.py
+  04_update_online.py
+tests/
 ```
 
-## Compatibility Table (✓ works • ~ partial • ✗ no)
+## Testing
+```bash
+pytest -q
+```
 
-| Inference \ Learning         |      ParametricCPD      | DifferentiableCPD |        ImplicitGenerator       |
-| ---------------------------- | :---------------------: | :---------------: | :----------------------------: |
-| ExactFactor (VE/JT)          |            ✓            |         ✓         |                ✗               |
-| Loopy BP                     |            ✓            |         ✓         |                ✗               |
-| Monte Carlo (IS/LW/MH/Gibbs) |            ✓            |         ✓         | ~ *(no pdf → rejection/ratio)* |
-| Variational (ELBO)           | ~ *(if differentiable)* |    **✓ ideal**    |                ✗               |
-| Likelihood-Free (ABC/ratio)  |      ~ *(unneeded)*     |   ~ *(unneeded)*  |              **✓**             |
-| SMC / Particle Filter        |            ✓            |         ✓         |          ~ *(ABC‑SMC)*         |
+## Roadmap
+- Amortized learning
+- Temporal/Dynamic DAGs
+- Additional CPDs and inference/sampling backends
 
-## Routing Heuristics (factory)
-
-* If `has_log_prob` and low treewidth → **ExactFactor**.
-* Else if `has_log_prob` and `is_reparameterized` → **Variational**.
-* Else if `has_sample` and `has_log_prob` → **MonteCarlo**.
-* Else if `has_sample` only → **Likelihood‑Free**.
-* Temporal graphs → prefer **SMC** when available.
-
-## Minimal Implementations
-
-* **Models**: `ParametricCPD`, `DifferentiableCPD`, `ImplicitGenerator` (all subclass `BaseConditionalModel`).
-* **Samplers**: `ParametricSampler`, `DifferentiableSampler`, `ImplicitSampler` (all subclass `BaseSampler`).
-* **Inference**: `ExactFactorInference`, `MonteCarloInference`, `VariationalInference`, `LikelihoodFreeInference` (+ optional `SMCInference`).
-
-## Notes
-
-* Do‑operator: samplers and inferencers must support **edge‑cut + node‑override** (`D=d`).
-* Evidence: implement **masking + weight accumulation** (log‑space) where relevant.
-* GPU: prioritize **DifferentiableCPD + VI**, and **vectorized Monte Carlo**.
+## Contribution Guidelines
+- Keep all core computations torch-only.
+- Respect the global device invariant.
+- Register new components in the registries.

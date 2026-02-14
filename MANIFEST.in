@@ -1,0 +1,1 @@
+recursive-include vbn/configs *.yaml
