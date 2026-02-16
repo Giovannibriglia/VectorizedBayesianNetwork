@@ -1,0 +1,3 @@
+bnlearn
+pandas
+numpy
