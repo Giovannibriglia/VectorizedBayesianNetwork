@@ -4,6 +4,5 @@ build
 dist
 vbn.egg-info
 examples/out
-benchmarking/bnrepo/bif
-benchmarking/results
-benchmarking/.cache
+benchmarking/bnlearn_data/*
+!benchmarking/bnlearn_data/metadata.json
