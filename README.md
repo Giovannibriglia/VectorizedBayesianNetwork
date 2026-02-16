@@ -43,9 +43,11 @@ Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian
 - `replay_buffer`
 
 ## Planned Methods
-- Amortized learning
+- Causal inference: instrumental variables, counterfactuals, soft- and back-door adjustments
+- Amortized learning and inference
 - Temporal/Dynamic DAGs
 - Additional CPD families and inference backends
+- Saving to .onnx
 
 ## Installation
 ```bash
@@ -56,10 +58,22 @@ pip install -e .
 ```python
 import networkx as nx
 import torch
+import pandas as pd
 from vbn import VBN
+
+def make_df(n, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    x0 = torch.randn(n, generator=gen)
+    x1 = torch.randn(n, generator=gen)
+    x2 = 0.5 * x0 - 0.2 * x1 + 0.1 * torch.randn(n, generator=gen)
+    return pd.DataFrame(
+        {"feature_0": x0.numpy(), "feature_1": x1.numpy(), "feature_2": x2.numpy()}
+    )
 
 G = nx.DiGraph()
 G.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
+
+df = make_df(1000)
 
 vbn = VBN(G, seed=0, device="cpu")
 
