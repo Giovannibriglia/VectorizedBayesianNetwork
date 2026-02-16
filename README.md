@@ -134,6 +134,19 @@ pytest -q
 ```
 
 ## Contribution Guidelines
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pre-commit install
+```
+
+Run formatting checks:
+
+```bash
+pre-commit run --all-files
+```
+
 - Keep all core computations torch-only.
 - Respect the global device invariant.
 - Register new components in the registries.
