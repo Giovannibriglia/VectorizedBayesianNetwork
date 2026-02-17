@@ -52,6 +52,7 @@ Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian
 ## Installation
 ```bash
 pip install -e .
+python setup.py install
 ```
 
 ## Minimal Usage
@@ -121,6 +122,7 @@ vbn/
   update/
   configs/
 examples/
+  __init__.py
   01_basic_fit.py
   02_infer_posterior.py
   03_sampling.py
@@ -129,9 +131,39 @@ tests/
 ```
 
 ## Testing
+
+Install the project in editable mode (ensures tests use local sources):
+
+```bash
+pip uninstall -y vbn
+pip install -e ".[test]"
+```
+
+Run the full test suite:
+
 ```bash
 pytest -q
 ```
+
+Benchmarking-only tests:
+
+```bash
+pytest benchmarking/ -q
+```
+
+## Running Examples (Module Execution)
+Run examples from the repo root using `python -m`:
+
+```bash
+python -m examples.03_sampling
+```
+
+## Benchmarking
+
+See `benchmarking/README.md` for the full benchmarking workflow.
+
+## Why We Use `python -m`
+Module execution avoids `PYTHONPATH`/`sys.path` hacks, ensures consistent imports from the repo root, and works cleanly with editable installs and CI. Registries remain in place to keep the system extensible without modifying core scripts.
 
 ## Contribution Guidelines
 ```bash
@@ -141,7 +173,7 @@ pip install -r requirements.txt
 pre-commit install
 ```
 
-Run formatting checks:
+Run formatting checks *before* pushing:
 
 ```bash
 pre-commit run --all-files
