@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-for path in [str(ROOT)]:
-    if path not in sys.path:
-        sys.path.insert(0, path)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
