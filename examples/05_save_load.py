@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import networkx as nx
 import pandas as pd
@@ -7,8 +8,6 @@ from vbn import defaults, VBN
 from vbn.display import plot_inference_posterior, plot_sampling_outcome
 
 os.environ.setdefault("MPLBACKEND", "Agg")
-OUT_DIR = os.getenv("VBN_OUT_DIR", "out")
-SKIP_PLOTS = os.getenv("VBN_SKIP_PLOTS", "0") == "1"
 
 
 def make_df(n=200, seed=0):
@@ -22,7 +21,13 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # Directory of the current script
+    SCRIPT_DIR = Path(__file__).resolve().parent
+
+    # Create "out" inside the script directory
+    OUT_DIR = SCRIPT_DIR / "out"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
@@ -60,21 +65,19 @@ def main():
     assert not pdf.requires_grad and not samples.requires_grad
     print("loaded pdf shape:", pdf.shape)
     print("loaded samples shape:", samples.shape)
-    if not SKIP_PLOTS:
-        plot_inference_posterior(
-            pdf,
-            samples,
-            save_path=os.path.join(OUT_DIR, "05_loaded_inference_posterior.png"),
-        )
+    plot_inference_posterior(
+        pdf,
+        samples,
+        save_path=os.path.join(OUT_DIR, "05_loaded_inference_posterior.png"),
+    )
 
     samp = loaded.sample(query, n_samples=50)
     assert not samp.requires_grad
     print("loaded sampling shape:", samp.shape)
-    if not SKIP_PLOTS:
-        plot_sampling_outcome(
-            samp,
-            save_path=os.path.join(OUT_DIR, "05_loaded_sampling_outcome.png"),
-        )
+    plot_sampling_outcome(
+        samp,
+        save_path=os.path.join(OUT_DIR, "05_loaded_sampling_outcome.png"),
+    )
     print("Loaded model run complete.")
 
 

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import networkx as nx
 import pandas as pd
@@ -7,8 +8,6 @@ from vbn import defaults, VBN
 from vbn.display import plot_sampling_outcome
 
 os.environ.setdefault("MPLBACKEND", "Agg")
-OUT_DIR = os.getenv("VBN_OUT_DIR", "out")
-SKIP_PLOTS = os.getenv("VBN_SKIP_PLOTS", "0") == "1"
 
 
 def make_df(n=200, seed=0):
@@ -22,6 +21,13 @@ def make_df(n=200, seed=0):
 
 
 def main():
+    # Directory of the current script
+    SCRIPT_DIR = Path(__file__).resolve().parent
+
+    # Create "out" inside the script directory
+    OUT_DIR = SCRIPT_DIR / "out"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     os.makedirs(OUT_DIR, exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
@@ -49,12 +55,11 @@ def main():
     }
     samples = vbn.sample(query, n_samples=50)
     assert not samples.requires_grad
-    if not SKIP_PLOTS:
-        plot_sampling_outcome(
-            samples,
-            batch_index=0,
-            save_path=os.path.join(OUT_DIR, "03_sampling_outcome.png"),
-        )
+    plot_sampling_outcome(
+        samples,
+        batch_index=0,
+        save_path=os.path.join(OUT_DIR, "03_sampling_outcome.png"),
+    )
     print("Sampling complete.")
 
 
