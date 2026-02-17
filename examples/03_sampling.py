@@ -6,6 +6,10 @@ import torch
 from vbn import defaults, VBN
 from vbn.display import plot_sampling_outcome
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+OUT_DIR = os.getenv("VBN_OUT_DIR", "out")
+SKIP_PLOTS = os.getenv("VBN_SKIP_PLOTS", "0") == "1"
+
 
 def make_df(n=200, seed=0):
     gen = torch.Generator().manual_seed(seed)
@@ -18,14 +22,15 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs("out", exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
     vbn = VBN(g, seed=0, device="cpu")
+    learning_conf = {**defaults.learning("node_wise"), "epochs": 5, "batch_size": 64}
     vbn.set_learning_method(
-        method=defaults.learning("node_wise"),
+        method=learning_conf,
         nodes_cpds={
             "feature_0": defaults.cpd("softmax_nn"),
             "feature_1": defaults.cpd("softmax_nn"),
@@ -44,12 +49,13 @@ def main():
     }
     samples = vbn.sample(query, n_samples=50)
     assert not samples.requires_grad
-    plot_sampling_outcome(
-        samples,
-        batch_index=0,
-        save_path="out/03_sampling_outcome.png",
-    )
-    print("Sampling plot saved to out/sampling_outcome.png")
+    if not SKIP_PLOTS:
+        plot_sampling_outcome(
+            samples,
+            batch_index=0,
+            save_path=os.path.join(OUT_DIR, "03_sampling_outcome.png"),
+        )
+    print("Sampling complete.")
 
 
 if __name__ == "__main__":

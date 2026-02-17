@@ -6,6 +6,10 @@ import torch
 from vbn import defaults, VBN
 from vbn.display import plot_inference_posterior, plot_sampling_outcome
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+OUT_DIR = os.getenv("VBN_OUT_DIR", "out")
+SKIP_PLOTS = os.getenv("VBN_SKIP_PLOTS", "0") == "1"
+
 
 def make_df(n=200, seed=0):
     gen = torch.Generator().manual_seed(seed)
@@ -18,14 +22,15 @@ def make_df(n=200, seed=0):
 
 
 def main():
-    os.makedirs("out", exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
     df = make_df()
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
     vbn = VBN(g, seed=0, device="cpu")
+    learning_conf = {**defaults.learning("node_wise"), "epochs": 5, "batch_size": 64}
     vbn.set_learning_method(
-        method=defaults.learning("node_wise"),
+        method=learning_conf,
         nodes_cpds={
             "feature_0": defaults.cpd("softmax_nn"),
             "feature_1": defaults.cpd("softmax_nn"),
@@ -39,7 +44,7 @@ def main():
     )
     vbn.set_sampling_method(defaults.sampling("gibbs"), n_samples=50)
 
-    model_path = "out/saved_model.pt"
+    model_path = os.path.join(OUT_DIR, "saved_model.pt")
     vbn.save(model_path)
     print(f"Saved model to {model_path}")
 
@@ -55,20 +60,22 @@ def main():
     assert not pdf.requires_grad and not samples.requires_grad
     print("loaded pdf shape:", pdf.shape)
     print("loaded samples shape:", samples.shape)
-    plot_inference_posterior(
-        pdf,
-        samples,
-        save_path="out/05_loaded_inference_posterior.png",
-    )
+    if not SKIP_PLOTS:
+        plot_inference_posterior(
+            pdf,
+            samples,
+            save_path=os.path.join(OUT_DIR, "05_loaded_inference_posterior.png"),
+        )
 
     samp = loaded.sample(query, n_samples=50)
     assert not samp.requires_grad
     print("loaded sampling shape:", samp.shape)
-    plot_sampling_outcome(
-        samp,
-        save_path="out/05_loaded_sampling_outcome.png",
-    )
-    print("Loaded model plots saved under out/")
+    if not SKIP_PLOTS:
+        plot_sampling_outcome(
+            samp,
+            save_path=os.path.join(OUT_DIR, "05_loaded_sampling_outcome.png"),
+        )
+    print("Loaded model run complete.")
 
 
 if __name__ == "__main__":

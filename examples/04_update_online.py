@@ -1,8 +1,14 @@
+import os
+
 import networkx as nx
 import pandas as pd
 import torch
 from vbn import defaults, VBN
 from vbn.display import plot_inference_posterior
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+OUT_DIR = os.getenv("VBN_OUT_DIR", "out")
+SKIP_PLOTS = os.getenv("VBN_SKIP_PLOTS", "0") == "1"
 
 
 def make_df(n=200):
@@ -20,8 +26,9 @@ def main():
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
     vbn = VBN(g, seed=0, device="cpu")
+    learning_conf = {**defaults.learning("node_wise"), "epochs": 5, "batch_size": 64}
     vbn.set_learning_method(
-        method=defaults.learning("node_wise"),
+        method=learning_conf,
         nodes_cpds={
             "feature_0": defaults.cpd("softmax_nn"),
             "feature_1": defaults.cpd("softmax_nn"),
@@ -41,11 +48,13 @@ def main():
         },
     }
     pdf, samples = vbn.infer_posterior(query)
-    plot_inference_posterior(
-        pdf,
-        samples,
-        save_path="out/04_inference_posterior.png",
-    )
+    if not SKIP_PLOTS:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        plot_inference_posterior(
+            pdf,
+            samples,
+            save_path=os.path.join(OUT_DIR, "04_inference_posterior.png"),
+        )
 
     new_df = make_df(500)
     vbn.update(
@@ -54,11 +63,12 @@ def main():
     print("Update complete")
 
     pdf, samples = vbn.infer_posterior(query)
-    plot_inference_posterior(
-        pdf,
-        samples,
-        save_path="out/04_inference_posterior_after_refit.png",
-    )
+    if not SKIP_PLOTS:
+        plot_inference_posterior(
+            pdf,
+            samples,
+            save_path=os.path.join(OUT_DIR, "04_inference_posterior_after_refit.png"),
+        )
 
 
 if __name__ == "__main__":
