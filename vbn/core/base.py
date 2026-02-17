@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Optional, Protocol
 
@@ -20,7 +21,7 @@ class Query:
     evidence: Dict[str, torch.Tensor]
 
 
-class BaseCPD(nn.Module):
+class BaseCPD(nn.Module, ABC):
     def __init__(
         self,
         input_dim: int,
@@ -37,9 +38,11 @@ class BaseCPD(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
+    @abstractmethod
     def sample(self, parents: Optional[torch.Tensor], n_samples: int) -> torch.Tensor:
         raise NotImplementedError
 
+    @abstractmethod
     def log_prob(
         self, x: torch.Tensor, parents: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -51,13 +54,15 @@ class BaseCPD(nn.Module):
         pdf = torch.exp(log_prob)
         return CPDOutput(samples=samples, log_prob=log_prob, pdf=pdf)
 
+    @abstractmethod
     def fit(self, parents: Optional[torch.Tensor], x: torch.Tensor, **kwargs) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def update(
         self, parents: Optional[torch.Tensor], x: torch.Tensor, **kwargs
     ) -> None:
-        raise NotImplementedError("Incremental update not implemented for this CPD.")
+        raise NotImplementedError
 
     def get_init_kwargs(self) -> Dict[str, object]:
         """Return CPD-specific init kwargs needed for reconstruction."""

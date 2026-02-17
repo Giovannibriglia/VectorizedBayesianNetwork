@@ -1,5 +1,5 @@
 # Ensure registries are populated on import.
-from vbn import (  # noqa: F401  # noqa: F401  # noqa: F401  # noqa: F401  # noqa: F401
+from vbn import (
     cpds as _cpds,
     inference as _inference,
     learning as _learning,
