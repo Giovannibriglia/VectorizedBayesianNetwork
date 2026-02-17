@@ -1,6 +1,7 @@
 # VectorizedBayesianNetwork (VBN)
 
 [![Tests](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml/badge.svg)](https://github.com/Giovannibriglia/VectorizedBayesianNetwork/actions/workflows/tests.yml)
+![GitHub stars](https://img.shields.io/github/stars/Giovannibriglia/VectorizedBayesianNetwork?style=social)
 [![Coverage](https://img.shields.io/codecov/c/github/Giovannibriglia/VectorizedBayesianNetwork/main)](https://codecov.io/gh/Giovannibriglia/VectorizedBayesianNetwork)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
@@ -139,16 +140,36 @@ pip uninstall -y vbn
 pip install -e ".[test]"
 ```
 
-Run the full test suite:
+Quick Run:
 
 ```bash
 pytest -q
 ```
 
+Verbose (recommended for dev):
+
+```bash
+pytest -vv
+```
+
+`-q` = quiet, `-vv` = verbose (shows each test function).
+
 Benchmarking-only tests:
 
 ```bash
-pytest benchmarking/ -q
+pytest benchmarking/ -vv
+```
+
+With Coverage:
+
+```bash
+pytest --cov=vbn --cov-report=term-missing
+```
+
+Focus Single Test:
+
+```bash
+pytest tests/test_learning.py -vv
 ```
 
 ## Running Examples (Module Execution)
