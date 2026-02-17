@@ -7,8 +7,6 @@ import torch
 from vbn import defaults, VBN
 from vbn.display import plot_inference_posterior
 
-os.environ.setdefault("MPLBACKEND", "Agg")
-
 
 def make_df(n=200):
     x0 = torch.randn(n)
@@ -20,6 +18,9 @@ def make_df(n=200):
 
 
 def main():
+    if os.getenv("CI") and "VBN_SKIP_PLOTS" not in os.environ:
+        os.environ["VBN_SKIP_PLOTS"] = "1"
+    os.environ.setdefault("MPLBACKEND", "Agg")
     # Directory of the current script
     SCRIPT_DIR = Path(__file__).resolve().parent
 

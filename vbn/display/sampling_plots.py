@@ -21,6 +21,9 @@ def plot_sampling_outcome(
     save_path: Optional[str] = None,
     show: bool = False,
 ) -> None:
+    plt = _import_plt()
+    if plt is None:
+        return
     if not isinstance(samples, torch.Tensor):
         samples = torch.tensor(samples)
 
@@ -32,8 +35,6 @@ def plot_sampling_outcome(
 
     n, d = samples_b.shape
     samples_np = _to_numpy(samples_b)
-
-    plt = _import_plt()
 
     if d == 1:
         fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(6, 5), squeeze=False)

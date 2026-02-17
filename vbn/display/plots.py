@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 import numpy as np
 import torch
 
 
+def plots_enabled() -> bool:
+    return os.getenv("VBN_SKIP_PLOTS", "0") not in ("1", "true", "True")
+
+
 def _import_plt():
+    if not plots_enabled():
+        return None
     try:
         import matplotlib.pyplot as plt
-    except Exception as exc:  # pragma: no cover - import guard
-        raise RuntimeError(
-            "matplotlib is required for plotting. Install it with 'pip install matplotlib'."
-        ) from exc
+    except Exception:  # pragma: no cover - import guard
+        if not os.getenv("CI"):
+            print(
+                "matplotlib is not installed; skipping plots. Install it with 'pip install matplotlib'.",
+                file=sys.stderr,
+            )
+        return None
     return plt
 
 
@@ -35,6 +45,8 @@ def _normalize_weights(weights: Optional[np.ndarray]) -> Optional[np.ndarray]:
 
 def _finalize_figure(fig, save_path: Optional[str], show: bool) -> None:
     plt = _import_plt()
+    if plt is None:
+        return
     fig.tight_layout()
     if save_path:
         directory = os.path.dirname(save_path)

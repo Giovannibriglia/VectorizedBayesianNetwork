@@ -19,6 +19,7 @@ EXAMPLES = [
 @pytest.mark.parametrize("module", EXAMPLES)
 def test_examples_run(module: str, tmp_path: Path) -> None:
     env = os.environ.copy()
+    env["VBN_SKIP_PLOTS"] = "1"
     env.setdefault("MPLBACKEND", "Agg")
     subprocess.run(
         [sys.executable, "-m", module],

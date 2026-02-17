@@ -24,6 +24,9 @@ def plot_cpd_fit(
     save_path: Optional[str] = None,
     show: bool = False,
 ) -> None:
+    plt = _import_plt()
+    if plt is None:
+        return
     if isinstance(vbn_or_handle, CPDHandle):
         handle = vbn_or_handle
         node = handle.node
@@ -60,7 +63,6 @@ def plot_cpd_fit(
     samples_np = _to_numpy(samples)
 
     b, _, d = samples_np.shape
-    plt = _import_plt()
     fig, axes = plt.subplots(
         nrows=d,
         ncols=1,

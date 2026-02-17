@@ -26,6 +26,9 @@ def plot_inference_posterior(
     save_path: Optional[str] = None,
     show: bool = False,
 ) -> None:
+    plt = _import_plt()
+    if plt is None:
+        return
     if not isinstance(samples, torch.Tensor):
         samples = torch.tensor(samples)
     if not isinstance(pdf, torch.Tensor):
@@ -43,7 +46,6 @@ def plot_inference_posterior(
     samples_np = _to_numpy(samples_b)
     pdf_np = _to_numpy(pdf_b)
 
-    plt = _import_plt()
     fig, axes = plt.subplots(
         nrows=d,
         ncols=1,

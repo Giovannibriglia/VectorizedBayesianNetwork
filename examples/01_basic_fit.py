@@ -7,8 +7,6 @@ import torch
 from vbn import defaults, VBN
 from vbn.display import plot_cpd_fit
 
-os.environ.setdefault("MPLBACKEND", "Agg")
-
 
 def make_df(n=200, seed=0):
     gen = torch.Generator().manual_seed(seed)
@@ -21,6 +19,9 @@ def make_df(n=200, seed=0):
 
 
 def main():
+    if os.getenv("CI") and "VBN_SKIP_PLOTS" not in os.environ:
+        os.environ["VBN_SKIP_PLOTS"] = "1"
+    os.environ.setdefault("MPLBACKEND", "Agg")
     # Directory of the current script
     SCRIPT_DIR = Path(__file__).resolve().parent
 
