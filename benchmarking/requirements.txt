@@ -1,3 +1,5 @@
 bnlearn
 pandas
 numpy
+fastparquet
+pyarrow
