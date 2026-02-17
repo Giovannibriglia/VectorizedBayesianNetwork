@@ -4,6 +4,7 @@ from typing import Dict
 
 import torch
 
+from vbn.config_cast import coerce_numbers, UPDATE_SCHEMA
 from vbn.core.registry import register_update
 from vbn.update.base_update import BaseUpdatePolicy
 from vbn.utils import concat_parents
@@ -21,6 +22,20 @@ class OnlineSGDUpdate(BaseUpdatePolicy):
         weight_decay: float = 0.0,
         **kwargs,
     ):
+        params = coerce_numbers(
+            {
+                "lr": lr,
+                "n_steps": n_steps,
+                "batch_size": batch_size,
+                "weight_decay": weight_decay,
+            },
+            UPDATE_SCHEMA,
+        )
+        lr = params["lr"]
+        n_steps = params["n_steps"]
+        batch_size = params["batch_size"]
+        weight_decay = params["weight_decay"]
+
         for node in vbn.dag.topological_order():
             parents = vbn.dag.parents(node)
             parent_tensor = concat_parents(data, parents)
