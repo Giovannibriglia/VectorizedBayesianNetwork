@@ -5,6 +5,7 @@ from typing import Dict, Optional
 import torch
 from tqdm import tqdm
 
+from vbn.config_cast import coerce_numbers, CPD_SCHEMAS, FIT_SCHEMA
 from vbn.core.base import BaseCPD
 from vbn.core.registry import CPD_REGISTRY, register_learning
 from vbn.utils import concat_parents
@@ -69,6 +70,11 @@ class NodeWiseLearner:
                 cpd_cls = cpd_name
             output_dim = int(x.shape[-1])
             input_dim = int(parent_tensor.shape[-1]) if parent_tensor is not None else 0
+            key = cpd_name.lower().strip() if isinstance(cpd_name, str) else None
+            if key and key in CPD_SCHEMAS:
+                node_conf = coerce_numbers(node_conf, CPD_SCHEMAS[key])
+            node_fit_conf = coerce_numbers(node_fit_conf, FIT_SCHEMA)
+
             cpd = cpd_cls(
                 input_dim=input_dim,
                 output_dim=output_dim,
