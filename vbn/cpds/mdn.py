@@ -6,6 +6,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
+from vbn.config_cast import coerce_numbers, UPDATE_SCHEMA
 from vbn.core.base import BaseCPD
 from vbn.core.registry import register_cpd
 from vbn.core.utils import broadcast_samples, ensure_2d, flatten_samples
@@ -80,6 +81,96 @@ class MDNCPD(BaseCPD):
             "min_scale": self.min_scale,
         }
 
+    def _prepare_training_tensors(
+        self, parents: Optional[torch.Tensor], x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if parents is None:
+            parents = torch.zeros(x.shape[0], 0, device=self.device)
+        return ensure_2d(parents), ensure_2d(x)
+
+    def _train_loop(
+        self,
+        parents: Optional[torch.Tensor],
+        x: torch.Tensor,
+        epochs: int = 1,
+        lr: float = 1e-3,
+        batch_size: int = 128,
+        weight_decay: float = 0.0,
+        n_steps: Optional[int] = None,
+    ) -> None:
+        params = {
+            "epochs": epochs,
+            "lr": lr,
+            "batch_size": batch_size,
+            "weight_decay": weight_decay,
+        }
+        if n_steps is not None:
+            params["n_steps"] = n_steps
+        params = coerce_numbers(params, UPDATE_SCHEMA | {"epochs": int})
+        parents, x = self._prepare_training_tensors(parents, x)
+        epochs = params["epochs"]
+        lr = params["lr"]
+        batch_size = params["batch_size"]
+        weight_decay = params["weight_decay"]
+        n_steps = params.get("n_steps", n_steps)
+
+        dataset = torch.utils.data.TensorDataset(parents, x)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True
+        )
+        optimizer = getattr(self, "_optimizer", None)
+        if optimizer is None:
+            optimizer = torch.optim.Adam(
+                self.parameters(), lr=lr, weight_decay=weight_decay
+            )
+            self._optimizer = optimizer
+        steps = int(n_steps) if n_steps is not None else int(epochs)
+        for _ in range(steps):
+            for batch_parents, batch_x in loader:
+                log_prob = self.log_prob(batch_x, batch_parents)
+                loss = -log_prob.mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+    def fit(
+        self,
+        parents: Optional[torch.Tensor],
+        x: torch.Tensor,
+        epochs: int = 1,
+        lr: float = 1e-3,
+        batch_size: int = 128,
+        weight_decay: float = 0.0,
+        **kwargs,
+    ) -> None:
+        self._train_loop(
+            parents,
+            x,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            weight_decay=weight_decay,
+        )
+
+    def update(
+        self,
+        parents: Optional[torch.Tensor],
+        x: torch.Tensor,
+        lr: float = 1e-3,
+        n_steps: int = 1,
+        batch_size: int = 128,
+        weight_decay: float = 0.0,
+        **kwargs,
+    ) -> None:
+        self._train_loop(
+            parents,
+            x,
+            lr=lr,
+            batch_size=batch_size,
+            weight_decay=weight_decay,
+            n_steps=n_steps,
+        )
+
     def _params(
         self, parents: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -121,16 +212,14 @@ class MDNCPD(BaseCPD):
                 raise ValueError("parents cannot be None when input_dim > 0")
             parents = broadcast_samples(parents, n_samples)
             logits, loc, scale = self._params(parents)
-        probs = torch.softmax(logits, dim=-1)
-        b, s, k = probs.shape
-        comp = torch.multinomial(probs.reshape(b * s, k), num_samples=1).reshape(b, s)
-        comp_expanded = (
-            comp.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.output_dim)
-        )
-        loc_sel = torch.gather(loc, dim=2, index=comp_expanded).squeeze(2)
-        scale_sel = torch.gather(scale, dim=2, index=comp_expanded).squeeze(2)
-        eps = torch.randn_like(scale_sel)
-        return loc_sel + eps * scale_sel
+        b, s, _ = logits.shape
+        logits = logits.reshape(b * s, self.n_components)
+        comps = torch.distributions.Categorical(logits=logits).sample().reshape(b, s)
+        idx = comps.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.output_dim)
+        loc = loc.gather(dim=2, index=idx).squeeze(2)
+        scale = scale.gather(dim=2, index=idx).squeeze(2)
+        eps = torch.randn_like(loc)
+        return loc + eps * scale
 
     def log_prob(
         self, x: torch.Tensor, parents: Optional[torch.Tensor]
@@ -145,82 +234,21 @@ class MDNCPD(BaseCPD):
             loc = self._loc.view(1, 1, self.n_components, self.output_dim).expand(
                 b, s, -1, -1
             )
-            scale = (
-                (torch.nn.functional.softplus(self._log_scale) + self.min_scale)
-                .view(1, 1, self.n_components, self.output_dim)
-                .expand(b, s, -1, -1)
-            )
+            log_scale = self._log_scale.view(
+                1, 1, self.n_components, self.output_dim
+            ).expand(b, s, -1, -1)
         else:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")
             parents = broadcast_samples(parents, x.shape[1])
             logits, loc, scale = self._params(parents)
-        x_exp = x.unsqueeze(2)  # [B, S, 1, Dx]
-        var = scale**2
-        log_prob = -0.5 * (
-            (x_exp - loc) ** 2 / var + 2 * torch.log(scale) + math.log(2 * math.pi)
-        )
-        log_prob = log_prob.sum(dim=-1)  # [B, S, K]
+            log_scale = torch.log(scale)
+
+        b, s, _ = logits.shape
+        x_exp = x.unsqueeze(2).expand(-1, -1, self.n_components, -1)
+        var = torch.exp(2 * log_scale)
+        log_comp = -0.5 * (
+            ((x_exp - loc) ** 2) / var + 2 * log_scale + math.log(2 * math.pi)
+        ).sum(dim=-1)
         log_mix = torch.log_softmax(logits, dim=-1)
-        return torch.logsumexp(log_mix + log_prob, dim=-1)
-
-    def _get_optimizer(self, lr: float, weight_decay: float) -> torch.optim.Optimizer:
-        if self._optimizer is None:
-            self._optimizer = torch.optim.Adam(
-                self.parameters(), lr=lr, weight_decay=weight_decay
-            )
-        return self._optimizer
-
-    def fit(
-        self,
-        parents: Optional[torch.Tensor],
-        x: torch.Tensor,
-        epochs: int = 100,
-        lr: float = 1e-3,
-        batch_size: int = 128,
-        weight_decay: float = 0.0,
-        **kwargs,
-    ) -> None:
-        if parents is None:
-            parents = torch.zeros(x.shape[0], 0, device=self.device)
-        parents = ensure_2d(parents)
-        x = ensure_2d(x)
-        dataset = torch.utils.data.TensorDataset(parents, x)
-        loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True
-        )
-        optimizer = self._get_optimizer(float(lr), weight_decay)
-        for _ in range(int(epochs)):
-            for batch_parents, batch_x in loader:
-                log_prob = self.log_prob(batch_x, batch_parents)
-                loss = -log_prob.mean()
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-    def update(
-        self,
-        parents: Optional[torch.Tensor],
-        x: torch.Tensor,
-        n_steps: int = 1,
-        lr: float = 1e-3,
-        batch_size: int = 128,
-        weight_decay: float = 0.0,
-        **kwargs,
-    ) -> None:
-        if parents is None:
-            parents = torch.zeros(x.shape[0], 0, device=self.device)
-        parents = ensure_2d(parents)
-        x = ensure_2d(x)
-        dataset = torch.utils.data.TensorDataset(parents, x)
-        loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True
-        )
-        optimizer = self._get_optimizer(lr, weight_decay)
-        for _ in range(int(n_steps)):
-            for batch_parents, batch_x in loader:
-                log_prob = self.log_prob(batch_x, batch_parents)
-                loss = -log_prob.mean()
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+        return torch.logsumexp(log_mix + log_comp, dim=-1)
