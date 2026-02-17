@@ -90,13 +90,13 @@ To be updated after the first full benchmark run.
 Run the benchmarking pipeline tests from the project root:
 
 ```bash
-pytest benchmarking/ -q
+pytest benchmarking/ -vv
 ```
 
 Optional (single stage):
 
 ```bash
-pytest benchmarking/tests/test_01_data_generation.py -q
+pytest benchmarking/tests/test_01_data_generation.py -vv
 ```
 
 ---

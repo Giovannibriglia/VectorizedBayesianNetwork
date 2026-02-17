@@ -90,7 +90,7 @@ The metadata must include:
 Run:
 
 ```bash
-pytest benchmarking/ -q
+pytest benchmarking/ -vv
 ```
 
 The Step‑01 test validates:
