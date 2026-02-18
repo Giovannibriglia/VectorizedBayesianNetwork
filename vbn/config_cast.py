@@ -99,6 +99,7 @@ FIT_SCHEMA = {
     "weight_decay": float,
     "n_steps": int,
     "show_progress": bool,
+    "verbosity": int,
     "max_grad_norm": float,
 }
 
@@ -110,9 +111,17 @@ UPDATE_SCHEMA = {
 }
 
 CPD_SCHEMAS = {
-    "softmax_nn": {
+    "gaussian_nn": {
         "hidden_dims": list_of(int),
         "min_scale": float,
+    },
+    "softmax_nn": {
+        "n_classes": int,
+        "hidden_dims": list_of(int),
+        "label_smoothing": float,
+        "min_bin_width": float,
+        "within_bin_scale": float,
+        "within_bin_clip": bool,
     },
     "mdn": {
         "n_components": int,

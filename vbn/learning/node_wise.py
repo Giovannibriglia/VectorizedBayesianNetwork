@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional
 
 import torch
@@ -8,6 +9,7 @@ from tqdm import tqdm
 from vbn.config_cast import coerce_numbers, CPD_SCHEMAS, FIT_SCHEMA
 from vbn.core.base import BaseCPD
 from vbn.core.registry import CPD_REGISTRY, register_learning
+from vbn.core.utils import resolve_verbosity
 from vbn.utils import concat_parents
 
 FIT_KEYS = {
@@ -17,6 +19,7 @@ FIT_KEYS = {
     "weight_decay",
     "n_steps",
     "show_progress",
+    "verbosity",
 }
 
 
@@ -36,7 +39,7 @@ class NodeWiseLearner:
     def __init__(
         self,
         nodes_cpds: Optional[Dict[str, Dict]] = None,
-        default_cpd: str = "softmax_nn",
+        default_cpd: str = "gaussian_nn",
         **kwargs,
     ):
         self.nodes_cpds = nodes_cpds or {}
@@ -46,9 +49,37 @@ class NodeWiseLearner:
             k: v for k, v in kwargs.items() if k not in FIT_KEYS
         }
 
-    def fit(self, vbn, data: Dict[str, torch.Tensor], **kwargs) -> Dict[str, BaseCPD]:
+    def fit(
+        self,
+        vbn,
+        data: Dict[str, torch.Tensor],
+        verbosity: Optional[int] = None,
+        **kwargs,
+    ) -> Dict[str, BaseCPD]:
+        if verbosity is None:
+            verbosity = kwargs.pop("verbosity", None)
+        else:
+            kwargs.pop("verbosity", None)
+        if "verbose" in kwargs:
+            if verbosity is None:
+                verbosity = kwargs.pop("verbose")
+            else:
+                kwargs.pop("verbose")
+        verbosity = resolve_verbosity(verbosity)
+        show_progress = kwargs.pop("show_progress", None)
+        if show_progress is None:
+            show_progress = self.default_fit_kwargs.get("show_progress")
+        progress_enabled = verbosity > 0
+        if show_progress is not None:
+            progress_enabled = progress_enabled and bool(show_progress)
+        if os.getenv("CI"):
+            progress_enabled = False
         nodes: Dict[str, BaseCPD] = {}
-        for node in tqdm(vbn.dag.topological_order(), desc="Fitting CPDs"):
+        for node in tqdm(
+            vbn.dag.topological_order(),
+            desc="Fitting CPDs",
+            disable=not progress_enabled,
+        ):
             parents = vbn.dag.parents(node)
             parent_tensor = concat_parents(data, parents)
             x = data[node]
@@ -82,6 +113,7 @@ class NodeWiseLearner:
                 seed=vbn.seed,
                 **node_conf,
             )
+            node_fit_conf = {**node_fit_conf, "verbosity": verbosity}
             cpd.fit(parent_tensor, x, **node_fit_conf)
             nodes[node] = cpd
         return nodes
