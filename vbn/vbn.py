@@ -26,6 +26,7 @@ from vbn.core.utils import (
     ensure_2d,
     ensure_tensor,
     resolve_device,
+    resolve_verbosity,
     set_seed,
     to_plain_dict,
 )
@@ -336,20 +337,50 @@ class VBN:
         return tensor_data
 
     # ----------------- fit/update -----------------
-    def fit(self, data: Dict[str, torch.Tensor] | pd.DataFrame, **kwargs) -> None:
+    def fit(
+        self,
+        data: Dict[str, torch.Tensor] | pd.DataFrame,
+        *,
+        verbosity: Optional[int] = None,
+        **kwargs,
+    ) -> None:
         if self._learning is None:
             raise RuntimeError("Call set_learning_method(...) before fit().")
+        if verbosity is None:
+            verbosity = kwargs.pop("verbosity", None)
+        else:
+            kwargs.pop("verbosity", None)
+        if "verbose" in kwargs:
+            if verbosity is None:
+                verbosity = kwargs.pop("verbose")
+            else:
+                kwargs.pop("verbose")
+        verbosity = resolve_verbosity(verbosity)
         tensor_data = self._prepare_data(data)
-        self.nodes = self._learning.fit(self, tensor_data, **kwargs)
+        self.nodes = self._learning.fit(
+            self, tensor_data, verbosity=verbosity, **kwargs
+        )
 
     def update(
         self,
         data: Dict[str, torch.Tensor] | pd.DataFrame,
         update_method: Optional[str] = None,
+        *,
+        verbosity: Optional[int] = None,
         **kwargs,
     ):
         if not self.nodes:
             raise RuntimeError("Call fit(...) before update(...).")
+        if verbosity is None:
+            verbosity = kwargs.pop("verbosity", None)
+        else:
+            kwargs.pop("verbosity", None)
+        if "verbose" in kwargs:
+            if verbosity is None:
+                verbosity = kwargs.pop("verbose")
+            else:
+                kwargs.pop("verbose")
+        verbosity = resolve_verbosity(verbosity)
         tensor_data = self._prepare_data(data)
         if update_method is not None:
             if isinstance(update_method, dict):
@@ -406,6 +437,7 @@ class VBN:
                     "update_method must be provided for the first update call"
                 )
             policy_kwargs = kwargs
+        policy_kwargs["verbosity"] = verbosity
         self.nodes = self._update_policy.update(self, tensor_data, **policy_kwargs)
 
     # ----------------- inference/sampling -----------------

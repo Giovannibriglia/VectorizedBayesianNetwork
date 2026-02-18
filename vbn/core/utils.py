@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, is_dataclass
 from typing import Optional, Tuple
 
@@ -10,6 +11,30 @@ def resolve_device(device: Optional[str | torch.device]) -> torch.device:
     if device is None or (isinstance(device, str) and device.lower() == "auto"):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+def resolve_verbosity(verbosity: Optional[int | bool]) -> int:
+    if verbosity is None:
+        env = os.getenv("VBN_VERBOSITY")
+        if env is not None:
+            env = env.strip()
+            if env:
+                try:
+                    verbosity = int(env)
+                except ValueError:
+                    lowered = env.lower()
+                    if lowered in {"0", "false", "no", "off"}:
+                        verbosity = 0
+                    elif lowered in {"1", "true", "yes", "on"}:
+                        verbosity = 1
+    if verbosity is None:
+        return 1
+    if isinstance(verbosity, bool):
+        return 1 if verbosity else 0
+    try:
+        return int(verbosity)
+    except Exception:
+        return 1
 
 
 def set_seed(seed: Optional[int]) -> None:
