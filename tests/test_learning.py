@@ -32,8 +32,8 @@ def test_learning_methods_suite():
         vbn.set_learning_method(
             method,
             nodes_cpds={
-                "x": {"cpd": "softmax_nn"},
-                "z": {"cpd": "softmax_nn"},
+                "x": {"cpd": "gaussian_nn"},
+                "z": {"cpd": "gaussian_nn"},
                 "y": {"cpd": "mdn", "n_components": 3},
             },
         )

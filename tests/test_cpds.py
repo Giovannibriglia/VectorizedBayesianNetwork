@@ -36,8 +36,43 @@ def test_cpds_registry_suite():
         log_prob_2d = cpd.log_prob(x, parents)
         assert log_prob_2d.shape == (batch, 1)
 
-        if name in {"softmax_nn", "mdn"}:
+        if name in {"softmax_nn", "gaussian_nn", "mdn"}:
             loss = -cpd.log_prob(x, parents).mean()
             loss.backward()
             grads = [p.grad for p in cpd.parameters() if p.requires_grad]
             assert any(g is not None for g in grads)
+
+
+def test_softmax_nn_detects_discrete_classes():
+    device = torch.device("cpu")
+    n_classes = 3
+    x = torch.tensor([0.0, 1.0, 2.0, 1.0, 0.0], device=device).unsqueeze(1)
+    cpd = CPD_REGISTRY["softmax_nn"](
+        input_dim=0, output_dim=1, device=device, n_classes=n_classes
+    )
+    cpd.fit(None, x, epochs=1, batch_size=2)
+    assert bool(cpd._is_discrete.item()) is True
+    class_values = cpd._class_values.squeeze(0)
+    expected = torch.tensor([0.0, 1.0, 2.0], device=device)
+    assert torch.allclose(class_values, expected)
+    samples = cpd.sample(None, 10)
+    assert torch.isin(samples.flatten(), class_values).all()
+
+
+def test_softmax_nn_continuous_binning_clamps():
+    device = torch.device("cpu")
+    n_classes = 4
+    x = torch.linspace(0.0, 1.0, steps=9, device=device).unsqueeze(1)
+    cpd = CPD_REGISTRY["softmax_nn"](
+        input_dim=0,
+        output_dim=1,
+        device=device,
+        n_classes=n_classes,
+        binning="uniform",
+    )
+    cpd.fit(None, x, epochs=1, batch_size=3)
+    assert bool(cpd._is_discrete.item()) is False
+    x_out = torch.tensor([[-1.0], [2.0]], device=device)
+    bins = cpd._x_to_bin(x_out)
+    assert int(bins.min().item()) == 0
+    assert int(bins.max().item()) == n_classes - 1

@@ -11,7 +11,7 @@ def test_save_load_roundtrip(tmp_path):
         "node_wise",
         nodes_cpds={
             "x": {"cpd": "kde"},
-            "y": {"cpd": "softmax_nn"},
+            "y": {"cpd": "gaussian_nn"},
         },
     )
     data = {"x": torch.randn(30, 1), "y": torch.randn(30, 1)}

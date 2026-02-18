@@ -10,8 +10,8 @@ def test_full_pipeline():
     vbn.set_learning_method(
         "node_wise",
         nodes_cpds={
-            "x": {"cpd": "softmax_nn"},
-            "y": {"cpd": "softmax_nn"},
+            "x": {"cpd": "gaussian_nn"},
+            "y": {"cpd": "gaussian_nn"},
             "z": {"cpd": "mdn", "n_components": 2},
         },
     )

@@ -10,8 +10,8 @@ def test_device_consistency_cpu():
     vbn.set_learning_method(
         "node_wise",
         nodes_cpds={
-            "x": {"cpd": "softmax_nn"},
-            "y": {"cpd": "softmax_nn"},
+            "x": {"cpd": "gaussian_nn"},
+            "y": {"cpd": "gaussian_nn"},
         },
     )
     data = {"x": torch.randn(20, 1), "y": torch.randn(20, 1)}
@@ -32,8 +32,8 @@ def test_sample_output_shape():
     vbn.set_learning_method(
         "node_wise",
         nodes_cpds={
-            "x": {"cpd": "softmax_nn"},
-            "y": {"cpd": "softmax_nn"},
+            "x": {"cpd": "gaussian_nn"},
+            "y": {"cpd": "gaussian_nn"},
         },
     )
     data = {"x": torch.randn(20, 1), "y": torch.randn(20, 1)}

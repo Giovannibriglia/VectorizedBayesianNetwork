@@ -14,8 +14,8 @@ def _make_vbn():
     vbn.set_learning_method(
         "node_wise",
         nodes_cpds={
-            "x": {"cpd": "softmax_nn"},
-            "y": {"cpd": "softmax_nn"},
+            "x": {"cpd": "gaussian_nn"},
+            "y": {"cpd": "gaussian_nn"},
         },
     )
     data = {"x": torch.randn(40, 1), "y": torch.randn(40, 1)}

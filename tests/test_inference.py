@@ -14,7 +14,7 @@ def _make_vbn():
     vbn.set_learning_method(
         "node_wise",
         nodes_cpds={
-            "x": {"cpd": "softmax_nn"},
+            "x": {"cpd": "gaussian_nn"},
             "y": {"cpd": "mdn", "n_components": 2},
         },
     )
