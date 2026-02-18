@@ -9,10 +9,10 @@
 [![Pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen.svg)](https://pre-commit.com/)
 [![License](https://img.shields.io/github/license/Giovannibriglia/VectorizedBayesianNetwork)](LICENSE)
 
-Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian Network library built for **batched learning, inference, and sampling**. The goal is a research-grade, extensible framework that stays differentiable end-to-end and scales to modern estimators.
+Vectorized Bayesian Networks is a **continuous-first**, **torch-native** Bayesian Network library built for **batched learning, inference, and sampling**. The goal is a research-grade, extensible framework that stays differentiable end-to-end and scales to modern estimators.
 
 ## Philosophy
-- Continuous variables only (no discrete special casing in core).
+- Continuous variables by default, with optional binned categorical CPDs.
 - Batched operations everywhere.
 - PyTorch-first: all core math in torch.
 - Global device invariant: `VBN(device=...)` is the single source of truth for device placement.
@@ -20,7 +20,8 @@ Vectorized Bayesian Networks is a **continuous-only**, **torch-native** Bayesian
 
 ## Implemented Methods
 **CPDs**
-- `softmax_nn`: neural Gaussian CPD
+- `gaussian_nn`: neural Gaussian CPD
+- `softmax_nn`: binned categorical CPD (softmax classifier)
 - `kde`: (conditional) Gaussian KDE CPD
 - `mdn`: mixture density network CPD
 
@@ -82,8 +83,8 @@ vbn = VBN(G, seed=0, device="cpu")
 vbn.set_learning_method(
     method=vbn.config.learning.node_wise,
     nodes_cpds={
-        "feature_0": {"cpd": "softmax_nn"},
-        "feature_1": {"cpd": "softmax_nn"},
+        "feature_0": {"cpd": "gaussian_nn"},
+        "feature_1": {"cpd": "gaussian_nn"},
         "feature_2": {"cpd": "mdn", "n_components": 3},
     },
 )

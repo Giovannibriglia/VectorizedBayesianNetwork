@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict
 import numpy as np
 import torch
 
+# IMPORTANT: DECODING STRING IS NOT SUPPORTED, HANDLE THEM INSIDE THE CLASSES
+
 
 def coerce_scalar(value: Any) -> Any:
     if isinstance(value, (np.generic,)):
@@ -122,6 +124,8 @@ CPD_SCHEMAS = {
         "min_bin_width": float,
         "within_bin_scale": float,
         "within_bin_clip": bool,
+        "debug": bool,
+        "debug_every": int,
     },
     "mdn": {
         "n_components": int,
