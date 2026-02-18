@@ -38,8 +38,8 @@ def main():
     vbn.set_learning_method(
         method=learning_conf,
         nodes_cpds={
-            "feature_0": defaults.cpd("softmax_nn"),
-            "feature_1": defaults.cpd("softmax_nn"),
+            "feature_0": defaults.cpd("gaussian_nn"),
+            "feature_1": defaults.cpd("gaussian_nn"),
             "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
         },
     )
@@ -53,6 +53,19 @@ def main():
         n_samples=256,
         save_path=os.path.join(OUT_DIR, "01_basic_fit_cpd_features2.png"),
     )
+
+    vbn_cat = VBN(g, seed=0, device="cpu")
+    vbn_cat.set_learning_method(
+        method=learning_conf,
+        nodes_cpds={
+            "feature_0": defaults.cpd("softmax_nn"),
+            "feature_1": defaults.cpd("softmax_nn"),
+            "feature_2": defaults.cpd("softmax_nn"),
+        },
+    )
+    vbn_cat.fit(df)
+    cat_samples = vbn_cat.cpd("feature_1").sample(None, 5)
+    print("Categorical samples shape:", cat_samples.shape)
     print("Fit complete.")
 
 

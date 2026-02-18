@@ -37,8 +37,8 @@ def main():
     vbn.set_learning_method(
         method=learning_conf,
         nodes_cpds={
-            "feature_0": defaults.cpd("softmax_nn"),
-            "feature_1": defaults.cpd("softmax_nn"),
+            "feature_0": defaults.cpd("gaussian_nn"),
+            "feature_1": defaults.cpd("gaussian_nn"),
             "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
         },
     )
