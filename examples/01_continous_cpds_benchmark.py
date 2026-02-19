@@ -67,20 +67,15 @@ def main():
     # Store results for all CPDs
     results = {}
 
-    pbar = tqdm(cpd_keys)
+    pbar = tqdm(cpd_keys, desc="training...")
     for cpd_key in pbar:
-        pbar.set_description(cpd_key)
+        pbar.set_postfix(cpd_key=cpd_key)
 
         vbn = VBN(g, seed=0, device="cpu")
-
-        learning_conf = {
-            **defaults.learning("node_wise"),
-            "epochs": 50,
-            "batch_size": 1024,
-        }
-
         nodes_cpds = {node: defaults.cpd(cpd_key) for node in ("x1", "x2", "y")}
-        vbn.set_learning_method(method=learning_conf, nodes_cpds=nodes_cpds)
+        vbn.set_learning_method(
+            method=defaults.learning("node_wise"), nodes_cpds=nodes_cpds
+        )
         vbn.fit(df, verbosity=0)
 
         handle = vbn.cpd("y")

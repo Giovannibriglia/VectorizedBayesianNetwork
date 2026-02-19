@@ -2,3 +2,13 @@ name: gaussian_nn
 hidden_dims: [32, 32]
 activation: relu
 min_scale: 1e-3
+fit:
+  epochs: 200
+  batch_size: 128
+  lr: 1e-3
+  weight_decay: 0.0
+update:
+  n_steps: 1
+  batch_size: 128
+  lr: 1e-3
+  weight_decay: 0.0

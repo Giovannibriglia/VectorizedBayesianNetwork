@@ -4,9 +4,8 @@ from typing import Dict
 
 import torch
 
-from vbn.config_cast import coerce_numbers, UPDATE_SCHEMA
 from vbn.core.registry import register_update
-from vbn.update.base_update import BaseUpdatePolicy
+from vbn.update.base_update import _resolve_node_update, BaseUpdatePolicy
 from vbn.utils import concat_parents
 
 
@@ -14,10 +13,13 @@ from vbn.utils import concat_parents
 class StreamingStatsUpdate(BaseUpdatePolicy):
     def update(self, vbn, data: Dict[str, torch.Tensor], **kwargs):
         verbosity = kwargs.pop("verbosity", None)
-        params = coerce_numbers(dict(kwargs), UPDATE_SCHEMA)
+        # Update hyperparameters are pulled from each node's CPD 'update' config.
         if verbosity is not None:
-            params["verbosity"] = verbosity
+            kwargs["verbosity"] = verbosity
         for node in vbn.dag.topological_order():
+            params = _resolve_node_update(vbn, node)
+            if verbosity is not None:
+                params["verbosity"] = verbosity
             parents = vbn.dag.parents(node)
             parent_tensor = concat_parents(data, parents)
             vbn.nodes[node].update(parent_tensor, data[node], **params)

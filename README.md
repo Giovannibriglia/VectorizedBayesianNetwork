@@ -19,23 +19,25 @@ Vectorized Bayesian Networks is a **continuous-first**, **torch-native** Bayesia
 - Modular and registry-driven: CPDs, learning, inference, sampling, and update policies are pluggable.
 
 ## Implemented Methods
+**Learning**
+- `node_wise`
+- `amortized` (in progress)
+
 **CPDs**
 - `gaussian_nn`: neural Gaussian CPD
 - `softmax_nn`: binned categorical CPD (softmax classifier)
 - `kde`: (conditional) Gaussian KDE CPD
 - `mdn`: mixture density network CPD
 
-**Learning**
-- `node_wise`
 
 **Inference**
-- Monte Carlo marginalization
-- Importance sampling
+- `monte_carlo_marginalization`
+- `importance_sampling`
 - SVGP (placeholder, MC fallback)
 
 **Sampling**
-- Ancestral sampling
-- Gibbs sampling (simple conditional sampling)
+- `ancestral`
+- `gibbs` (simple conditional sampling)
 - HMC (placeholder, ancestral fallback)
 
 **Update policies**
@@ -62,7 +64,7 @@ python setup.py install
 import networkx as nx
 import torch
 import pandas as pd
-from vbn import VBN
+from vbn import VBN, defaults
 
 def make_df(n, seed=0):
     gen = torch.Generator().manual_seed(seed)
@@ -80,12 +82,13 @@ df = make_df(1000)
 
 vbn = VBN(G, seed=0, device="cpu")
 
+learning_conf = defaults.learning("node_wise")
 vbn.set_learning_method(
-    method=vbn.config.learning.node_wise,
+    method=learning_conf,
     nodes_cpds={
-        "feature_0": {"cpd": "gaussian_nn"},
-        "feature_1": {"cpd": "gaussian_nn"},
-        "feature_2": {"cpd": "mdn", "n_components": 3},
+        "feature_0": defaults.cpd("gaussian_nn"),
+        "feature_1": defaults.cpd("gaussian_nn"),
+        "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
     },
 )
 
@@ -105,8 +108,31 @@ vbn.set_sampling_method(vbn.config.sampling.gibbs)
 samples = vbn.sample(query, n_samples=200)
 
 new_df = df.sample(64)
-vbn.update(new_df, update_method="online_sgd", lr=1e-4, n_steps=5)
+vbn.update(new_df, update_method="online_sgd")
 ```
+
+## Per-CPD Training Hyperparameters
+Training hyperparameters are defined per CPD under `fit` and `update`. The learning config is orchestration-only.
+
+```python
+from vbn import VBN, defaults
+
+learning_conf = defaults.learning("node_wise")
+nodes_cpds = {
+    "x1": {**defaults.cpd("gaussian_nn"), "fit": {"epochs": 50, "batch_size": 256, "min_scale": 0.0001}},
+    "x2": {**defaults.cpd("softmax_nn"), "fit": {"epochs": 200, "batch_size": 128, "binning": "uniform"}},
+    "y": {**defaults.cpd("kde"), "fit": {"epochs": 1, "batch_size": 1024}},
+}
+vbn.set_learning_method(method=learning_conf, nodes_cpds=nodes_cpds)
+```
+
+## Learner Update Policies
+Update policies (`online_sgd`, `ema`, `replay_buffer`, `streaming_stats`) are learner-level scheduling/data policies used in `vbn.update(...)`.
+
+- They only affect CPDs via the data passed into `cpd.update(...)` (batching, replay sampling, streaming stats),
+- and by applying optimizer steps to CPD parameters in the update policy implementation (e.g., `online_sgd`, `ema`, `replay_buffer`).
+
+Update hyperparameters (`lr`, `n_steps`, `batch_size`, `weight_decay`) are defined per CPD under `update` and are used by update policies. Update method configs only carry policy-level parameters (for example `alpha`, `max_size`, `replay_ratio`).
 
 ## Config Loading
 Config YAMLs are packaged under `vbn/configs/**` and loaded via `importlib.resources` from the installed package.

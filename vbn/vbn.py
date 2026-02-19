@@ -411,6 +411,14 @@ class VBN:
                     )
                 params = kwargs
                 name = key
+            update_training_keys = {"lr", "n_steps", "batch_size", "weight_decay"}
+            bad = sorted(set(params) & update_training_keys)
+            if bad:
+                raise ValueError(
+                    "Update training hyperparameters are defined per-CPD under "
+                    "'nodes_cpds[node][\"update\"]'. Remove these from update_method/"
+                    f"update(...) arguments: {bad}."
+                )
             update_cls = UPDATE_REGISTRY[name]
             init_kwargs = {
                 k: v for k, v in params.items() if k in {"max_size", "replay_ratio"}
@@ -435,6 +443,14 @@ class VBN:
             if self._update_policy is None:
                 raise RuntimeError(
                     "update_method must be provided for the first update call"
+                )
+            update_training_keys = {"lr", "n_steps", "batch_size", "weight_decay"}
+            bad = sorted(set(kwargs) & update_training_keys)
+            if bad:
+                raise ValueError(
+                    "Update training hyperparameters are defined per-CPD under "
+                    "'nodes_cpds[node][\"update\"]'. Remove these from update(...): "
+                    f"{bad}."
                 )
             policy_kwargs = kwargs
         policy_kwargs["verbosity"] = verbosity

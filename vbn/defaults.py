@@ -47,11 +47,50 @@ class Defaults:
     def cpd(self, name_or_item) -> Dict:
         entry = _get_item("cpds", name_or_item)
         params = copy.deepcopy(entry["params"])
-        return {"cpd": entry["name"], **params}
+        training_keys = {
+            "epochs",
+            "lr",
+            "batch_size",
+            "weight_decay",
+            "n_steps",
+            "max_grad_norm",
+        }
+        legacy = sorted(set(params) & training_keys)
+        if legacy:
+            raise ValueError(
+                "CPD defaults must not include training keys at top level "
+                f"({legacy}). Move them under 'fit'/'update'."
+            )
+        if "fit" not in params or "update" not in params:
+            raise ValueError(
+                "CPD defaults must include explicit 'fit' and 'update' dicts."
+            )
+        fit = params.pop("fit")
+        update = params.pop("update")
+        if not isinstance(fit, dict):
+            raise TypeError("CPD 'fit' defaults must be a dict.")
+        if not isinstance(update, dict):
+            raise TypeError("CPD 'update' defaults must be a dict.")
+        return {"cpd": entry["name"], **params, "fit": fit, "update": update}
 
     def learning(self, name_or_item) -> Dict:
         entry = _get_item("learning", name_or_item)
         params = copy.deepcopy(entry["params"])
+        if entry["name"] == "node_wise":
+            training_keys = {
+                "epochs",
+                "lr",
+                "batch_size",
+                "weight_decay",
+                "n_steps",
+                "max_grad_norm",
+            }
+            bad = sorted(set(params) & training_keys)
+            if bad:
+                raise ValueError(
+                    "node_wise learning defaults must not include training keys "
+                    f"({bad}). Move them into per-CPD 'fit'/'update' configs."
+                )
         return {"name": entry["name"], **params}
 
     def inference(self, name_or_item) -> Dict:

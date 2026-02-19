@@ -34,9 +34,8 @@ def main():
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
     vbn = VBN(g, seed=0, device="cpu")
-    learning_conf = {**defaults.learning("node_wise"), "epochs": 5, "batch_size": 64}
     vbn.set_learning_method(
-        method=learning_conf,
+        method=defaults.learning("node_wise"),
         nodes_cpds={
             "feature_0": defaults.cpd("gaussian_nn"),
             "feature_1": defaults.cpd("gaussian_nn"),
@@ -56,7 +55,7 @@ def main():
 
     vbn_cat = VBN(g, seed=0, device="cpu")
     vbn_cat.set_learning_method(
-        method=learning_conf,
+        method=defaults.learning("node_wise"),
         nodes_cpds={
             "feature_0": defaults.cpd("softmax_nn"),
             "feature_1": defaults.cpd("softmax_nn"),
