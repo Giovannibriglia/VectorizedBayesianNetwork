@@ -37,14 +37,14 @@ def test_update_methods_suite(monkeypatch):
 
             monkeypatch.setattr(cpd, "fit", _raise)
         update_data = {"x": torch.randn(10, 1), "y": torch.randn(10, 1)}
-        vbn.update(update_data, update_method=method, n_steps=1)
+        vbn.update(update_data, update_method=method)
 
 
 def test_update_keeps_optimizer_state():
     vbn = _make_vbn()
     update_data = {"x": torch.randn(10, 1), "y": torch.randn(10, 1)}
-    vbn.update(update_data, update_method="online_sgd", n_steps=1)
+    vbn.update(update_data, update_method="online_sgd")
     first_opt = next(iter(vbn.nodes.values()))._optimizer
-    vbn.update(update_data, update_method="online_sgd", n_steps=1)
+    vbn.update(update_data, update_method="online_sgd")
     second_opt = next(iter(vbn.nodes.values()))._optimizer
     assert first_opt is second_opt

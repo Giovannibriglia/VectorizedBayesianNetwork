@@ -41,7 +41,7 @@ def test_full_pipeline():
         "y": torch.randn(10, 1),
         "z": torch.randn(10, 1),
     }
-    vbn.update(update_data, update_method="online_sgd", n_steps=1)
+    vbn.update(update_data, update_method="online_sgd")
 
     pdf2, samples3 = vbn.infer_posterior(query)
     assert pdf2.shape == (4, 5)

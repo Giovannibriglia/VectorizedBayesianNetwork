@@ -119,9 +119,23 @@ from vbn import VBN, defaults
 
 learning_conf = defaults.learning("node_wise")
 nodes_cpds = {
-    "x1": {**defaults.cpd("gaussian_nn"), "fit": {"epochs": 50, "batch_size": 256, "min_scale": 0.0001}},
-    "x2": {**defaults.cpd("softmax_nn"), "fit": {"epochs": 200, "batch_size": 128, "binning": "uniform"}},
-    "y": {**defaults.cpd("kde"), "fit": {"epochs": 1, "batch_size": 1024}},
+    "x1": {
+        **defaults.cpd("gaussian_nn"),
+        "min_scale": 0.0001,
+        "fit": {"epochs": 50, "batch_size": 256},
+        "update": {"n_steps": 1, "batch_size": 256, "lr": 1e-3, "weight_decay": 0.0},
+    },
+    "x2": {
+        **defaults.cpd("softmax_nn"),
+        "binning": "uniform",
+        "fit": {"epochs": 200, "batch_size": 128},
+        "update": {"n_steps": 1, "batch_size": 128, "lr": 1e-3, "weight_decay": 0.0},
+    },
+    "y": {
+        **defaults.cpd("kde"),
+        "fit": {"epochs": 1, "batch_size": 1024},
+        "update": {"n_steps": 1, "batch_size": 512, "lr": 1e-3, "weight_decay": 0.0},
+    },
 }
 vbn.set_learning_method(method=learning_conf, nodes_cpds=nodes_cpds)
 ```

@@ -121,6 +121,23 @@ def _cpd_key_from_class(cpd_cls) -> Optional[str]:
     return None
 
 
+def _merge_cpd_defaults(conf: Dict[str, Any]) -> Dict[str, Any]:
+    cpd_value = conf.get("cpd")
+    if not isinstance(cpd_value, str):
+        return conf
+    base = defaults.cpd(cpd_value)
+    merged = {**base, **conf}
+    # Per-CPD training hyperparameters live under fit/update; merge defaults first.
+    for key in ("fit", "update"):
+        base_section = base.get(key) or {}
+        conf_section = conf.get(key)
+        if isinstance(conf_section, dict):
+            merged[key] = {**base_section, **conf_section}
+        else:
+            merged[key] = dict(base_section)
+    return merged
+
+
 def _serialize_nodes_cpds(nodes_cpds: Optional[Dict[str, Any]]) -> Optional[Dict]:
     if nodes_cpds is None:
         return None
@@ -130,13 +147,10 @@ def _serialize_nodes_cpds(nodes_cpds: Optional[Dict[str, Any]]) -> Optional[Dict
             serialized[node] = {}
             continue
         if isinstance(conf, str):
-            conf_copy = defaults.cpd(conf)
+            conf_copy = {"cpd": conf}
         else:
             conf_copy = to_plain_dict(conf)
-            cpd_value = conf_copy.get("cpd")
-            if isinstance(cpd_value, str):
-                base = defaults.cpd(cpd_value)
-                conf_copy = {**base, **conf_copy}
+        conf_copy = _merge_cpd_defaults(conf_copy)
         cpd_value = conf_copy.get("cpd")
         if cpd_value is None or isinstance(cpd_value, str):
             serialized[node] = conf_copy

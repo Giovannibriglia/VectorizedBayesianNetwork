@@ -1,6 +1,7 @@
 .venv
 .venv_test
 .idea
+.coverage
 build
 dist
 vbn.egg-info
