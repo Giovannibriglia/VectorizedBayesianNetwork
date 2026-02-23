@@ -226,7 +226,7 @@
     "category": "gaussian_medium",
     "source": "generated",
     "generated": {
-      "model_json": "benchmarking/bnrepo/generated/ecoli70/model.json"
+      "model_json": "https://www.bnlearn.com/bnrepository/ecoli70/ecoli70.bif.gz"
     },
     "stats": { "nodes": 46, "arcs": 70, "parameters": 162 }
   },
@@ -236,7 +236,7 @@
     "category": "gaussian_medium",
     "source": "generated",
     "generated": {
-      "model_json": "benchmarking/bnrepo/generated/magic_niab/model.json"
+      "model_json": "https://www.bnlearn.com/bnrepository/magic-niab/magic-niab.bif.gz"
     },
     "stats": { "nodes": 44, "arcs": 66, "parameters": 154 }
   },
@@ -256,7 +256,7 @@
     "category": "gaussian_very_large",
     "source": "generated",
     "generated": {
-      "model_json": "benchmarking/bnrepo/generated/arth150/model.json"
+      "model_json": "https://www.bnlearn.com/bnrepository/arht150/arht150.bif.gz"
     },
     "stats": { "nodes": 107, "arcs": 150, "parameters": 364 }
   },
@@ -267,7 +267,7 @@
     "category": "clgaussian_small",
     "source": "generated",
     "generated": {
-      "model_json": "benchmarking/bnrepo/generated/healthcare/model.json"
+      "model_json": "https://www.bnlearn.com/bnrepository/healthcare/healthcare.bif.gz"
     },
     "stats": { "nodes": 7, "arcs": 9, "parameters": 42 }
   },
@@ -277,7 +277,7 @@
     "category": "clgaussian_small",
     "source": "generated",
     "generated": {
-      "model_json": "benchmarking/bnrepo/generated/sangiovese/model.json"
+      "model_json": "https://www.bnlearn.com/bnrepository/sangiovese/sangiovese.bif.gz"
     },
     "stats": { "nodes": 15, "arcs": 55, "parameters": 259 }
   },
@@ -287,7 +287,7 @@
     "category": "clgaussian_medium",
     "source": "generated",
     "generated": {
-      "model_json": "benchmarking/bnrepo/generated/mehra/model.json"
+      "model_json": "https://www.bnlearn.com/bnrepository/mehra/mehra.bif.gz"
     },
     "stats": { "nodes": 24, "arcs": 71, "parameters": 324423 }
   }
