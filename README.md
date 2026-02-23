@@ -52,6 +52,8 @@ Vectorized Bayesian Networks is a **continuous-first**, **torch-native** Bayesia
 - Temporal/Dynamic DAGs
 - Additional CPD families and inference backends
 - Saving to .onnx
+- Example of handling missing values
+- Example of prediction and diagnosis
 
 ## Installation
 ```bash
