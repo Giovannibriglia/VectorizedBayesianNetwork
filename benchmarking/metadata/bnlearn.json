@@ -1,0 +1,498 @@
+{
+  "alarm": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "medium",
+    "name": "ALARM",
+    "stats": {
+      "arcs": 46,
+      "nodes": 37,
+      "parameters": 509
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/alarm/alarm.bif.gz"
+    }
+  },
+  "andes": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "very_large",
+    "name": "ANDES",
+    "stats": {
+      "arcs": 338,
+      "nodes": 223,
+      "parameters": 1157
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/andes/andes.bif.gz"
+    }
+  },
+  "arth150": {
+    "artifacts": [],
+    "category": "gaussian_very_large",
+    "generated": {
+      "model_json": "https://www.bnlearn.com/bnrepository/arht150/arht150.bif.gz"
+    },
+    "name": "ARTH150",
+    "source": "generated",
+    "stats": {
+      "arcs": 150,
+      "nodes": 107,
+      "parameters": 364
+    },
+    "type": "gaussian",
+    "urls": {}
+  },
+  "asia": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "small",
+    "name": "ASIA",
+    "stats": {
+      "arcs": 8,
+      "nodes": 8,
+      "parameters": 18
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/asia/asia.bif.gz"
+    }
+  },
+  "barley": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "medium",
+    "name": "BARLEY",
+    "stats": {
+      "arcs": 84,
+      "nodes": 48,
+      "parameters": 114005
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/barley/barley.bif.gz"
+    }
+  },
+  "cancer": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "small",
+    "name": "CANCER",
+    "stats": {
+      "arcs": 4,
+      "nodes": 5,
+      "parameters": 10
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/cancer/cancer.bif.gz"
+    }
+  },
+  "child": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "medium",
+    "name": "CHILD",
+    "stats": {
+      "arcs": 25,
+      "nodes": 20,
+      "parameters": 230
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/child/child.bif.gz"
+    }
+  },
+  "diabetes": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "very_large",
+    "name": "DIABETES",
+    "stats": {
+      "arcs": 602,
+      "nodes": 413,
+      "parameters": 429409
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/diabetes/diabetes.bif.gz"
+    }
+  },
+  "earthquake": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "small",
+    "name": "EARTHQUAKE",
+    "stats": {
+      "arcs": 4,
+      "nodes": 5,
+      "parameters": 10
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/earthquake/earthquake.bif.gz"
+    }
+  },
+  "ecoli70": {
+    "artifacts": [],
+    "category": "gaussian_medium",
+    "generated": {
+      "model_json": "https://www.bnlearn.com/bnrepository/ecoli70/ecoli70.bif.gz"
+    },
+    "name": "ECOLI70",
+    "source": "generated",
+    "stats": {
+      "arcs": 70,
+      "nodes": 46,
+      "parameters": 162
+    },
+    "type": "gaussian",
+    "urls": {}
+  },
+  "hailfinder": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "large",
+    "name": "HAILFINDER",
+    "stats": {
+      "arcs": 66,
+      "nodes": 56,
+      "parameters": 2656
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/hailfinder/hailfinder.bif.gz"
+    }
+  },
+  "healthcare": {
+    "artifacts": [],
+    "category": "clgaussian_small",
+    "generated": {
+      "model_json": "https://www.bnlearn.com/bnrepository/healthcare/healthcare.bif.gz"
+    },
+    "name": "HEALTHCARE",
+    "source": "generated",
+    "stats": {
+      "arcs": 9,
+      "nodes": 7,
+      "parameters": 42
+    },
+    "type": "clgaussian",
+    "urls": {}
+  },
+  "hepar2": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "large",
+    "name": "HEPAR2",
+    "stats": {
+      "arcs": 123,
+      "nodes": 70,
+      "parameters": 1453
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/hepar2/hepar2.bif.gz"
+    }
+  },
+  "insurance": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "medium",
+    "name": "INSURANCE",
+    "stats": {
+      "arcs": 52,
+      "nodes": 27,
+      "parameters": 1008
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/insurance/insurance.bif.gz"
+    }
+  },
+  "link": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "very_large",
+    "name": "LINK",
+    "stats": {
+      "arcs": 1125,
+      "nodes": 724,
+      "parameters": 14211
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/link/link.bif.gz"
+    }
+  },
+  "magic_irri": {
+    "artifacts": [],
+    "category": "gaussian_large",
+    "generated": {
+      "model_json": "benchmarking/bnrepo/generated/magic_irri/model.json"
+    },
+    "name": "MAGIC-IRRI",
+    "source": "generated",
+    "stats": {
+      "arcs": 102,
+      "nodes": 64,
+      "parameters": 230
+    },
+    "type": "gaussian",
+    "urls": {}
+  },
+  "magic_niab": {
+    "artifacts": [],
+    "category": "gaussian_medium",
+    "generated": {
+      "model_json": "https://www.bnlearn.com/bnrepository/magic-niab/magic-niab.bif.gz"
+    },
+    "name": "MAGIC-NIAB",
+    "source": "generated",
+    "stats": {
+      "arcs": 66,
+      "nodes": 44,
+      "parameters": 154
+    },
+    "type": "gaussian",
+    "urls": {}
+  },
+  "mehra": {
+    "artifacts": [],
+    "category": "clgaussian_medium",
+    "generated": {
+      "model_json": "https://www.bnlearn.com/bnrepository/mehra/mehra.bif.gz"
+    },
+    "name": "MEHRA",
+    "source": "generated",
+    "stats": {
+      "arcs": 71,
+      "nodes": 24,
+      "parameters": 324423
+    },
+    "type": "clgaussian",
+    "urls": {}
+  },
+  "mildew": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "medium",
+    "name": "MILDEW",
+    "stats": {
+      "arcs": 46,
+      "nodes": 35,
+      "parameters": 540150
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/mildew/mildew.bif.gz"
+    }
+  },
+  "munin_full": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "massive",
+    "name": "MUNIN (full network)",
+    "stats": {
+      "arcs": 1397,
+      "nodes": 1041,
+      "parameters": 80592
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/munin/munin.bif.gz"
+    }
+  },
+  "munin_sub1": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "very_large",
+    "name": "MUNIN (subnetwork #1)",
+    "stats": {
+      "arcs": 273,
+      "nodes": 186,
+      "parameters": 15622
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/munin4/munin1.bif.gz"
+    }
+  },
+  "munin_sub2": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "massive",
+    "name": "MUNIN (subnetwork #2)",
+    "stats": {
+      "arcs": 1244,
+      "nodes": 1003,
+      "parameters": 69431
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/munin4/munin2.bif.gz"
+    }
+  },
+  "munin_sub3": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "massive",
+    "name": "MUNIN (subnetwork #3)",
+    "stats": {
+      "arcs": 1306,
+      "nodes": 1041,
+      "parameters": 71059
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/munin4/munin3.bif.gz"
+    }
+  },
+  "munin_sub4": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "massive",
+    "name": "MUNIN (subnetwork #4)",
+    "stats": {
+      "arcs": 1388,
+      "nodes": 1038,
+      "parameters": 80352
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/munin4/munin4.bif.gz"
+    }
+  },
+  "pathfinder": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "very_large",
+    "name": "PATHFINDER",
+    "stats": {
+      "arcs": 195,
+      "nodes": 109,
+      "parameters": 72079
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/pathfinder/pathfinder.bif.gz"
+    }
+  },
+  "pigs": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "very_large",
+    "name": "PIGS",
+    "stats": {
+      "arcs": 592,
+      "nodes": 441,
+      "parameters": 5618
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/pigs/pigs.bif.gz"
+    }
+  },
+  "sachs": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "small",
+    "name": "SACHS",
+    "stats": {
+      "arcs": 17,
+      "nodes": 11,
+      "parameters": 178
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/sachs/sachs.bif.gz"
+    }
+  },
+  "sangiovese": {
+    "artifacts": [],
+    "category": "clgaussian_small",
+    "generated": {
+      "model_json": "https://www.bnlearn.com/bnrepository/sangiovese/sangiovese.bif.gz"
+    },
+    "name": "SANGIOVESE",
+    "source": "generated",
+    "stats": {
+      "arcs": 55,
+      "nodes": 15,
+      "parameters": 259
+    },
+    "type": "clgaussian",
+    "urls": {}
+  },
+  "survey": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "small",
+    "name": "SURVEY",
+    "stats": {
+      "arcs": 6,
+      "nodes": 6,
+      "parameters": 21
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/survey/survey.bif.gz"
+    }
+  },
+  "water": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "medium",
+    "name": "WATER",
+    "stats": {
+      "arcs": 66,
+      "nodes": 32,
+      "parameters": 10083
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/water/water.bif.gz"
+    }
+  },
+  "win95pts": {
+    "artifacts": [
+      "bif"
+    ],
+    "category": "large",
+    "name": "WIN95PTS",
+    "stats": {
+      "arcs": 112,
+      "nodes": 76,
+      "parameters": 574
+    },
+    "type": "discrete",
+    "urls": {
+      "bif_gz": "https://www.bnlearn.com/bnrepository/win95pts/win95pts.bif.gz"
+    }
+  }
+}
