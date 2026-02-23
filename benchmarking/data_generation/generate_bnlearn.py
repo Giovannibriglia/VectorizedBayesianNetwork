@@ -271,7 +271,9 @@ class BNLearnGenerator(BaseDataGenerator):
 
         registry = json.loads(registry_path.read_text())
         available_networks = [
-            key for key, meta in registry.items() if meta.get("type") == "discrete"
+            key
+            for key, meta in registry.items()
+            if meta.get("type") == "discrete"  # TODO: check here if gaussian is easy
         ]
 
         if networks:
