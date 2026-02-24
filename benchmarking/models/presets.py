@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict
 
-from .config import make_component, ModelBenchmarkConfig
+from .config import ComponentSpec, make_component, ModelBenchmarkConfig
 
 
 def _vbn_presets() -> Dict[str, ModelBenchmarkConfig]:
@@ -47,8 +47,72 @@ def _vbn_presets() -> Dict[str, ModelBenchmarkConfig]:
     return presets
 
 
+def pgmpy_presets() -> Dict[str, ModelBenchmarkConfig]:
+    model = "pgmpy"
+    return {
+        "default": ModelBenchmarkConfig(
+            model=model,
+            config_id="default",
+            learning=ComponentSpec(
+                name="mle",
+                key="learn:mle",
+                kwargs={},
+            ),
+            cpd=ComponentSpec(
+                name="tabular_mle",
+                key="cpd:tabular_mle",
+                kwargs={},
+            ),
+            inference=ComponentSpec(
+                name="exact_variable_elimination",
+                key="inf:exact_ve",
+                kwargs={},
+            ),
+        ),
+        "pgmpy_mle_ei": ModelBenchmarkConfig(
+            model=model,
+            config_id="pgmpy_mle_ei",
+            learning=ComponentSpec(
+                name="mle",
+                key="learn:mle",
+                kwargs={},
+            ),
+            cpd=ComponentSpec(
+                name="tabular_mle",
+                key="cpd:tabular_mle",
+                kwargs={},
+            ),
+            inference=ComponentSpec(
+                name="exact_variable_elimination",
+                key="inf:exact_ve",
+                kwargs={},
+            ),
+        ),
+        "pgmpy_bdeu_ei": ModelBenchmarkConfig(
+            model=model,
+            config_id="pgmpy_bdeu_ei",
+            learning=ComponentSpec(
+                name="bdeu",
+                key="learn:bdeu",
+                kwargs={"equivalent_sample_size": 10},
+            ),
+            cpd=ComponentSpec(
+                name="tabular_bdeu",
+                key="cpd:tabular_bdeu",
+                kwargs={},
+            ),
+            inference=ComponentSpec(
+                name="exact_variable_elimination",
+                key="inf:exact_ve",
+                kwargs={},
+            ),
+        ),
+    }
+
+
 MODEL_PRESETS: Dict[str, Dict[str, ModelBenchmarkConfig]] = {
     "vbn": _vbn_presets(),
+    "pgmpy": pgmpy_presets(),
 }
 
 
