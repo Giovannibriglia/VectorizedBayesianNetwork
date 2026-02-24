@@ -106,6 +106,35 @@ benchmarking/data/metadata/<generator>/<problem>/domain.json
 
 ---
 
+## 3. Learning Data Generation
+
+**Purpose.** Generate tabular datasets (i.i.d. samples) for model fitting / CPD learning.
+
+**How to run.**
+
+```bash
+python -m benchmarking.scripts.03_generate_data \
+    --generator bnlearn \
+    --n_samples 100000 \
+    --seed 0 \
+    --generation_strategy default
+```
+
+**Where data is stored.**
+
+```
+benchmarking/data/datasets/<generator>/<problem>/data_<strategy>_n<n_samples>_seed<seed>.(parquet|csv|pkl)
+benchmarking/data/datasets/log/<generator>/<problem>_seed<seed>.log
+benchmarking/data/metadata/<generator>/<problem>/data_generation.json
+benchmarking/data/metadata/<generator>/<problem>/domain.json
+```
+
+**Numeric coding for discrete variables.**
+
+Discrete variables are stored as integer codes. The mapping from state label to code is stored in `domain.json` under each node’s `codes` mapping, and `data_generation.json` records the schema used for each generated file.
+
+---
+
 ## Data Encoding (Preprocessing Helpers)
 
 The benchmarking package provides one-hot encoding helpers for datasets with non-numeric variables. Encoding metadata is stored under:
@@ -124,13 +153,13 @@ The encoding pipeline uses a stable category ordering (sorted labels) and a dete
 
 ---
 
-## 3. Benchmark Setup (Coming Next)
+## 4. Benchmark Setup (Coming Next)
 
 This stage will configure model combinations, generate queries, run inference and sampling, and define metrics. The goal is to make setup fully declarative so new models and datasets can be added without changing core benchmarking code.
 
 ---
 
-## 4. Running the Benchmark (Coming Next)
+## 5. Running the Benchmark (Coming Next)
 
 Planned entry point:
 
@@ -142,7 +171,7 @@ This stage will support batch execution, automatic model combinations, and fit c
 
 ---
 
-## 5. Summarizing Results (Coming Next)
+## 6. Summarizing Results (Coming Next)
 
 Planned entry point:
 
@@ -154,7 +183,7 @@ This stage will produce tables and plots, and split results into learning, CPD, 
 
 ---
 
-## 6. Current Benchmark Results
+## 7. Current Benchmark Results
 
 To be updated after the first full benchmark run.
 
@@ -176,6 +205,51 @@ Optional (single stage):
 
 ```bash
 pytest benchmarking/tests/test_01_data_download.py -vv
+```
+
+---
+
+## Folder Layout (Current)
+
+```
+benchmarking/data/
+  datasets/
+    <generator>/<problem>/...
+    log/<generator>/<problem>_seed<seed>.log
+  queries/
+    <generator>/<problem>/queries.json
+    log/<generator>/<problem>_seed<seed>.log
+  metadata/
+    <generator>/<problem>/download.json
+    <generator>/<problem>/domain.json
+    <generator>/<problem>/data_generation.json
+```
+
+---
+
+## Generator Kwargs
+
+Both query and data generation accept generator-specific keyword arguments:
+
+- Query generation (e.g., Monte Carlo samples):
+
+```bash
+python -m benchmarking.scripts.02_generate_benchmark_queries \
+    --generator bnlearn \
+    --n_queries_cpds 64 \
+    --n_queries_inference 128 \
+    --seed 42 \
+    --generator-kwargs '{"n_mc": 32}'
+```
+
+- Data generation (forwarded to the generator implementation):
+
+```bash
+python -m benchmarking.scripts.03_generate_data \
+    --generator bnlearn \
+    --n_samples 50000 \
+    --seed 7 \
+    --generator-kwargs '{"batch_size": 4096}'
 ```
 
 ---

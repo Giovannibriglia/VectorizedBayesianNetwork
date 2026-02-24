@@ -73,6 +73,15 @@ def get_dataset_domain_metadata_path(
     )
 
 
+def get_dataset_data_generation_metadata_path(
+    root_path: Optional[Path], generator: str, problem: str
+) -> Path:
+    return (
+        get_dataset_metadata_dir_generated(root_path, generator, problem)
+        / "data_generation.json"
+    )
+
+
 def get_queries_dir(root_path: Optional[Path] = None) -> Path:
     return get_data_dir(root_path) / "queries"
 
@@ -93,6 +102,14 @@ def get_queries_log_dir(root_path: Optional[Path] = None) -> Path:
 
 def get_generator_queries_log_dir(root_path: Optional[Path], generator: str) -> Path:
     return get_queries_log_dir(root_path) / generator
+
+
+def get_datasets_log_dir(root_path: Optional[Path] = None) -> Path:
+    return get_datasets_dir(root_path) / "log"
+
+
+def get_generator_datasets_log_dir(root_path: Optional[Path], generator: str) -> Path:
+    return get_datasets_log_dir(root_path) / generator
 
 
 def ensure_dir(path: Path) -> Path:
