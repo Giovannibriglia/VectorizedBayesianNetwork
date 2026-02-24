@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -9,15 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-import pandas as pd
-
-from benchmarking.paths import (
+from benchmarking.utils import (
     ensure_dir,
     get_dataset_data_generation_metadata_path,
     get_dataset_metadata_dir_generated,
     get_datasets_dir,
     get_generator_datasets_dir,
     get_generator_datasets_log_dir,
+    write_json,
 )
 
 
@@ -39,61 +37,6 @@ def stable_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
-
-
-def _has_parquet_support() -> bool:
-    try:
-        import pyarrow  # noqa: F401
-
-        return True
-    except Exception:
-        pass
-    try:
-        import fastparquet  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-def save_dataframe(
-    df: pd.DataFrame,
-    path_prefix: Path,
-    prefer: Literal["parquet", "csv", "pkl"] = "parquet",
-) -> tuple[Path, Literal["parquet", "csv", "pkl"]]:
-    path_prefix.parent.mkdir(parents=True, exist_ok=True)
-    order: list[str]
-    if prefer == "csv":
-        order = ["csv", "parquet", "pkl"]
-    elif prefer == "pkl":
-        order = ["pkl", "parquet", "csv"]
-    else:
-        order = ["parquet", "csv", "pkl"]
-
-    last_error: Exception | None = None
-    for fmt in order:
-        try:
-            if fmt == "parquet":
-                if not _has_parquet_support():
-                    continue
-                path = path_prefix.with_suffix(".parquet")
-                df.to_parquet(path, index=False)
-                return path, "parquet"
-            if fmt == "csv":
-                path = path_prefix.with_suffix(".csv")
-                df.to_csv(path, index=False, float_format="%.10g")
-                return path, "csv"
-            path = path_prefix.with_suffix(".pkl")
-            df.to_pickle(path)
-            return path, "pkl"
-        except Exception as exc:  # pragma: no cover - best-effort fallback
-            last_error = exc
-            continue
-    if last_error is None:
-        raise RuntimeError("Failed to save dataframe")
-    raise RuntimeError(
-        f"Failed to save dataframe: {type(last_error).__name__}: {last_error}"
-    )
 
 
 class BaseDataGenerator(ABC):
@@ -216,7 +159,7 @@ class BaseDataGenerator(ABC):
                     "approx_domain_reason"
                 )
 
-        meta_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        write_json(meta_path, payload)
         return meta_path
 
     def generate_all(self) -> list[Path]:

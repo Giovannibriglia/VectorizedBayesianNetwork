@@ -54,7 +54,7 @@ def _prepare_dataset(root: Path, generator: str, problem: str) -> Path:
 
 def test_02_query_generation_registry_and_determinism(tmp_path: Path) -> None:
     print("\n[Benchmark Test] Step 2: Query Generation")
-    module = importlib.import_module("benchmarking.02_query_generation")
+    module = importlib.import_module("benchmarking.II_query_generation")
     registry = module.QUERY_GENERATOR_REGISTRY
     assert "bnlearn" in registry
 

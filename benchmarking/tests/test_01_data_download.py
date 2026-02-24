@@ -82,7 +82,7 @@ def _prepare_root_for_downloader(name: str, root: Path) -> list[str]:
 
 def test_01_download_data_pipeline(tmp_path: Path) -> None:
     print("\n[Benchmark Test] Step 1: Data Download")
-    module = importlib.import_module("benchmarking.01_data_download")
+    module = importlib.import_module("benchmarking.I_data_download")
     registry = module.DATA_DOWNLOADER_REGISTRY
     assert registry, "No data downloaders registered"
 

@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import random
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from benchmarking.paths import (
+from benchmarking.utils import (
     ensure_dir,
     get_generator_datasets_dir,
     get_generator_queries_dir,
     get_generator_queries_log_dir,
+    write_json,
 )
 
 
@@ -113,7 +113,7 @@ class BaseQueryGenerator(ABC):
         return dataset_dirs
 
     def _warn_legacy_layout(self) -> None:
-        from benchmarking.paths import get_datasets_dir
+        from benchmarking.utils import get_datasets_dir
 
         legacy_root = get_datasets_dir(self.root_path)
         if not legacy_root.exists():
@@ -173,7 +173,7 @@ class BaseQueryGenerator(ABC):
                 root_logger.warning("Skipping dataset %s", dataset_id)
                 continue
             out_path = self._output_path(dataset_id)
-            out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            write_json(out_path, payload)
             logger.info("Wrote query payload to %s", out_path)
             root_logger.info("Wrote query payload to %s", out_path)
             outputs.append(out_path)

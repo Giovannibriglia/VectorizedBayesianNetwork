@@ -10,7 +10,7 @@ import pytest
 
 
 def _bnlearn_module():
-    return importlib.import_module("benchmarking.03_data_generation.bnlearn")
+    return importlib.import_module("benchmarking.III_data_generation.bnlearn")
 
 
 def _read_dataset(path: Path) -> pd.DataFrame:

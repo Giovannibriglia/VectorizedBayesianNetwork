@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import gzip
-import json
 import shutil
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
 
-from benchmarking.paths import get_static_metadata_dir
+from benchmarking.utils import get_static_metadata_dir, read_json
 from .base import BaseDataDownloader
 from .registry import register_downloader
 
@@ -47,7 +46,7 @@ class BNLearnDownloader(BaseDataDownloader):
         if not registry_path.exists():
             raise FileNotFoundError(f"Missing registry: {registry_path}")
 
-        registry: Dict[str, Dict[str, Any]] = json.loads(registry_path.read_text())
+        registry: Dict[str, Dict[str, Any]] = read_json(registry_path)
 
         if datasets:
             datasets = list(dict.fromkeys(datasets))

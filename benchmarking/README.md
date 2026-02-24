@@ -4,6 +4,20 @@ This benchmarking suite compares VBN and other probabilistic graphical model lib
 
 ---
 
+## Pipeline Overview
+
+```
+01_download_data
+        ↓
+02_generate_benchmark_queries
+        ↓
+03_generate_data
+        ↓
+04_run_benchmark
+```
+
+---
+
 ## 1. Data Download
 
 **Purpose.** Download and prepare dataset artifacts from registered sources so downstream stages can reuse the same inputs.
@@ -135,6 +149,33 @@ Discrete variables are stored as integer codes. The mapping from state label to 
 
 ---
 
+## 4. Run Benchmark
+
+**Purpose.** Fit registered models on learning data and run CPD + inference query workloads.
+
+**How to run.**
+
+```bash
+python -m benchmarking.scripts.04_run_benchmark \
+    --generator bnlearn \
+    --seed 0 \
+    --models vbn
+```
+
+**Where outputs are stored.**
+
+```
+benchmarking/out/<generator>/benchmark_<timestamp>/
+  cpds/<model>.json
+  inference/<model>.json
+  summary.json
+  logs/run.log
+```
+
+Each query result includes the original query payload, `ok/error`, and `timing_ms`. Results are deterministic given the same seed and model configuration.
+
+---
+
 ## Data Encoding (Preprocessing Helpers)
 
 The benchmarking package provides one-hot encoding helpers for datasets with non-numeric variables. Encoding metadata is stored under:
@@ -153,13 +194,13 @@ The encoding pipeline uses a stable category ordering (sorted labels) and a dete
 
 ---
 
-## 4. Benchmark Setup (Coming Next)
+## 5. Benchmark Setup (Coming Next)
 
 This stage will configure model combinations, generate queries, run inference and sampling, and define metrics. The goal is to make setup fully declarative so new models and datasets can be added without changing core benchmarking code.
 
 ---
 
-## 5. Running the Benchmark (Coming Next)
+## 6. Running the Benchmark (Coming Next)
 
 Planned entry point:
 
@@ -171,7 +212,7 @@ This stage will support batch execution, automatic model combinations, and fit c
 
 ---
 
-## 6. Summarizing Results (Coming Next)
+## 7. Summarizing Results (Coming Next)
 
 Planned entry point:
 
@@ -183,7 +224,7 @@ This stage will produce tables and plots, and split results into learning, CPD, 
 
 ---
 
-## 7. Current Benchmark Results
+## 8. Current Benchmark Results
 
 To be updated after the first full benchmark run.
 
@@ -223,6 +264,8 @@ benchmarking/data/
     <generator>/<problem>/download.json
     <generator>/<problem>/domain.json
     <generator>/<problem>/data_generation.json
+benchmarking/out/
+  <generator>/benchmark_<timestamp>/...
 ```
 
 ---

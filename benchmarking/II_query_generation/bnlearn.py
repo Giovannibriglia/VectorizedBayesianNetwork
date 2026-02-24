@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
-from benchmarking.paths import (
+from benchmarking.utils import (
     ensure_dir,
     get_dataset_domain_metadata_path,
     get_dataset_download_metadata_path,
     get_static_metadata_dir,
+    read_json,
+    write_json,
 )
 from .base import BaseQueryGenerator
 from .registry import register_query_generator
@@ -272,7 +274,7 @@ def _write_domain(
 ) -> Path:
     path = get_dataset_domain_metadata_path(root_path, generator, dataset_id)
     ensure_dir(path.parent)
-    path.write_text(json.dumps(domain, indent=2, sort_keys=True))
+    write_json(path, domain)
     return path
 
 
@@ -1068,7 +1070,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
         static_path = get_static_metadata_dir(self.root_path) / "bnlearn.json"
         if static_path.exists():
             try:
-                static_meta = json.loads(static_path.read_text())
+                static_meta = read_json(static_path)
                 dataset_type = static_meta.get(dataset_id, {}).get("type")
             except Exception:
                 dataset_type = None
@@ -1087,7 +1089,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
         download_meta: dict = {}
         if download_meta_path.exists():
             try:
-                download_meta = json.loads(download_meta_path.read_text())
+                download_meta = read_json(download_meta_path)
             except Exception as exc:
                 logger.warning(
                     "Failed to read download metadata for %s: %s", dataset_id, exc

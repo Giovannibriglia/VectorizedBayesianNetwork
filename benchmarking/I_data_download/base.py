@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,11 +13,12 @@ except Exception:  # pragma: no cover - best-effort fallback
         return iterable
 
 
-from benchmarking.paths import (
+from benchmarking.utils import (
     ensure_dir,
     get_dataset_metadata_dir_generated,
     get_generator_datasets_dir,
     get_generator_metadata_dir_generated,
+    write_json,
 )
 
 
@@ -75,12 +75,12 @@ class BaseDataDownloader(ABC):
             metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
         name = filename or f"{self.name}.json"
         metadata_path = self.generated_metadata_dir / name
-        metadata_path.write_text(json.dumps(metadata, indent=2))
+        write_json(metadata_path, metadata)
         return metadata_path
 
     def write_dataset_manifest(self, dataset_dir: Path, manifest: dict) -> Path:
         manifest_path = dataset_dir / "dataset.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        write_json(manifest_path, manifest)
         return manifest_path
 
     def write_dataset_metadata(
@@ -90,5 +90,5 @@ class BaseDataDownloader(ABC):
             get_dataset_metadata_dir_generated(self.root_path, self.name, dataset_id)
         )
         path = metadata_dir / filename
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        write_json(path, payload)
         return path

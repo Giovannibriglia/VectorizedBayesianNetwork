@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
-from pathlib import Path
+
+from benchmarking.utils import get_project_root
 
 
 def main() -> None:
@@ -17,9 +18,9 @@ def main() -> None:
     if args.networks is not None and len(args.networks) == 0:
         args.networks = None
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = get_project_root()
 
-    module = importlib.import_module("benchmarking.01_data_download")
+    module = importlib.import_module("benchmarking.I_data_download")
     downloader_cls = module.get_downloader(args.generator)
     downloader = downloader_cls(root_path=project_root, seed=args.seed)
 

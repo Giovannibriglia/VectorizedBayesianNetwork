@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gzip
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -12,12 +11,15 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 
-from benchmarking.paths import (
+from benchmarking.utils import (
     ensure_dir,
     get_dataset_domain_metadata_path,
     get_dataset_download_metadata_path,
+    read_json,
+    save_dataframe,
+    write_json,
 )
-from .base import BaseDataGenerator, DataGenResult, save_dataframe
+from .base import BaseDataGenerator, DataGenResult
 from .registry import register_data_generator
 
 
@@ -492,7 +494,7 @@ def _load_or_create_domain(
 ) -> tuple[Path, dict]:
     path = _domain_path(root_path, generator, dataset_id)
     if path.exists():
-        domain = json.loads(path.read_text())
+        domain = read_json(path)
         return path, domain
 
     domain, unsupported, reason = _build_domain(
@@ -505,7 +507,7 @@ def _load_or_create_domain(
         node_sources=node_sources,
     )
     ensure_dir(path.parent)
-    path.write_text(json.dumps(domain, indent=2, sort_keys=True))
+    write_json(path, domain)
     if unsupported:
         logger.warning("Domain marked unsupported: %s", reason)
     return path, domain
@@ -559,7 +561,7 @@ class BNLearnDataGenerator(BaseDataGenerator):
         )
         download_meta = None
         if download_meta_path.exists():
-            download_meta = json.loads(download_meta_path.read_text())
+            download_meta = read_json(download_meta_path)
 
         dataset_type = None
         if isinstance(download_meta, dict):

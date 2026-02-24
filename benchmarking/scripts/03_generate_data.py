@@ -4,7 +4,8 @@ import argparse
 import importlib
 import json
 import logging
-from pathlib import Path
+
+from benchmarking.utils import get_project_root
 
 
 def _parse_generator_kwargs(raw: str | None) -> dict:
@@ -70,7 +71,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = get_project_root()
     logging.info("Benchmark root: %s", project_root)
 
     generator_kwargs = _parse_generator_kwargs(args.generator_kwargs)
@@ -78,7 +79,7 @@ def main() -> None:
     if generator_kwargs:
         logging.info("Generator kwargs: %s", generator_kwargs)
 
-    module = importlib.import_module("benchmarking.03_data_generation")
+    module = importlib.import_module("benchmarking.III_data_generation")
     generator_cls = module.get_data_generator(args.generator)
     generator = generator_cls(
         root_path=project_root,
