@@ -314,6 +314,29 @@ def aggregate_table(
     return result
 
 
+def aggregate_time_table(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    grouped = df.groupby(group_cols, dropna=False)
+    for keys, group in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {col: val for col, val in zip(group_cols, keys)}
+        times = [
+            float(v)
+            for v in group["time"].tolist()
+            if v is not None and math.isfinite(float(v))
+        ]
+        summary = robust_summary(times)
+        for key, value in summary.items():
+            row[f"time_{key}"] = value
+        row["time_sum_ms"] = float(sum(times)) if times else 0.0
+        row["time_sum_s"] = float(row["time_sum_ms"] / 1000.0)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _safe_tag(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
 
@@ -516,6 +539,19 @@ def _build_records(
                     errors.append(str(exc))
                     continue
 
+                time_ms = None
+                result = (
+                    record.get("result")
+                    if isinstance(record.get("result"), dict)
+                    else {}
+                )
+                timing = result.get("timing_ms")
+                if timing is not None:
+                    try:
+                        time_ms = float(timing)
+                    except Exception:
+                        time_ms = None
+
                 problem_id = record.get("problem", {}).get("id")
                 query_type = query.get("type")
                 target = query.get("target")
@@ -564,6 +600,7 @@ def _build_records(
                         "parent_size": parent_size,
                         "kl": kl,
                         "wass": wass,
+                        "time": time_ms,
                     }
                 )
     df = pd.DataFrame(rows)
@@ -588,15 +625,18 @@ def _two_stage_aggregate(
     df: pd.DataFrame,
     x_col: str,
     metric_cols: list[str],
+    extra_group_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     stage1_rows = []
+    extra_group_cols = list(extra_group_cols or [])
     group_cols = [
         "method_id",
         "model_name",
         "config_id",
         "config_hash",
+        *extra_group_cols,
         "problem_id",
         x_col,
     ]
@@ -611,7 +651,14 @@ def _two_stage_aggregate(
     stage1 = pd.DataFrame(stage1_rows)
     if stage1.empty:
         return pd.DataFrame()
-    stage2_group = ["method_id", "model_name", "config_id", "config_hash", x_col]
+    stage2_group = [
+        "method_id",
+        "model_name",
+        "config_id",
+        "config_hash",
+        *extra_group_cols,
+        x_col,
+    ]
     rows = []
     for keys, group in stage1.groupby(stage2_group, dropna=False):
         if not isinstance(keys, tuple):
@@ -755,6 +802,99 @@ def _plot_category_bars(
     return out_path
 
 
+def _pareto_frontier(points: list[tuple[float, float]]) -> list[bool]:
+    is_pareto = []
+    for i, (x_i, y_i) in enumerate(points):
+        dominated = False
+        for j, (x_j, y_j) in enumerate(points):
+            if i == j:
+                continue
+            if x_j <= x_i and y_j <= y_i and (x_j < x_i or y_j < y_i):
+                dominated = True
+                break
+        is_pareto.append(not dominated)
+    return is_pareto
+
+
+def _plot_pareto(
+    df: pd.DataFrame,
+    *,
+    metric: str,
+    out_dir: Path,
+    filename: str,
+    title: str,
+) -> Path | None:
+    if df.empty:
+        return None
+    sub = df.copy()
+    sub = sub[sub[f"{metric}_iqm"].notna() & sub["time_iqm"].notna()]
+    if sub.empty:
+        return None
+    points = list(
+        zip(sub["time_iqm"].astype(float), sub[f"{metric}_iqm"].astype(float))
+    )
+    pareto_mask = _pareto_frontier(points)
+    plt.figure(figsize=(7.5, 5))
+    pareto_label_added = False
+    other_label_added = False
+    for (time_val, err_val), is_pareto, method_id, xerr, yerr in zip(
+        points,
+        pareto_mask,
+        sub["method_id"].tolist(),
+        sub["time_iqr_std"].tolist(),
+        sub[f"{metric}_iqr_std"].tolist(),
+    ):
+        if is_pareto:
+            plt.errorbar(
+                time_val,
+                err_val,
+                xerr=xerr,
+                yerr=yerr,
+                fmt="o",
+                color="C1",
+                capsize=3,
+                label="Pareto" if not pareto_label_added else None,
+            )
+            plt.annotate(
+                method_id,
+                (time_val, err_val),
+                textcoords="offset points",
+                xytext=(6, 6),
+            )
+            pareto_label_added = True
+        else:
+            plt.errorbar(
+                time_val,
+                err_val,
+                xerr=xerr,
+                yerr=yerr,
+                fmt="x",
+                color="0.6",
+                capsize=2,
+                label="Other" if not other_label_added else None,
+            )
+            other_label_added = True
+    pareto_points = [pt for pt, keep in zip(points, pareto_mask) if keep]
+    if pareto_points:
+        pareto_points = sorted(pareto_points, key=lambda t: t[0])
+        plt.plot(
+            [p[0] for p in pareto_points],
+            [p[1] for p in pareto_points],
+            color="C1",
+            alpha=0.5,
+        )
+    plt.xlabel("IQM time (ms)")
+    plt.ylabel(f"IQM {metric.upper()}")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    out_path = out_dir / filename
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+
+
 def _write_report_md(
     out_dir: Path, table_paths: list[Path], figure_paths: list[Path]
 ) -> None:
@@ -789,6 +929,36 @@ def main() -> None:
     parser.add_argument("--models", type=str, default=None)
     parser.add_argument("--max_records", type=int, default=None)
     parser.add_argument("--eps", type=float, default=1e-12)
+    parser.add_argument(
+        "--include_time",
+        action="store_true",
+        default=True,
+        help="Include time tables and plots (default: true)",
+    )
+    parser.add_argument(
+        "--no-include_time",
+        dest="include_time",
+        action="store_false",
+        help="Disable time tables and plots",
+    )
+    parser.add_argument(
+        "--include_pareto",
+        action="store_true",
+        default=True,
+        help="Include Pareto plots (default: true)",
+    )
+    parser.add_argument(
+        "--no-include_pareto",
+        dest="include_pareto",
+        action="store_false",
+        help="Disable Pareto plots",
+    )
+    parser.add_argument(
+        "--pareto_split",
+        type=str,
+        default="none",
+        choices=["none", "mode", "task", "target_category"],
+    )
     parser.add_argument(
         "--log-level",
         type=str,
@@ -897,27 +1067,99 @@ def main() -> None:
     _write_table(cpd_parent, path)
     tables.append(path)
 
-    inf_ev_size = aggregate_table(
-        inference,
-        ["method_id", "model_name", "config_id", "config_hash", "evidence_size"],
-        metric_cols,
-    )
+    inf_ev_size = _two_stage_aggregate(inference, "evidence_size", metric_cols)
     path = tables_dir / "inference_by_evidence_size.csv"
     _write_table(inf_ev_size, path)
     tables.append(path)
 
-    inf_ev_size_mode = aggregate_table(
-        inference,
-        [
-            "method_id",
-            "model_name",
-            "config_id",
-            "config_hash",
-            "evidence_mode",
-            "evidence_size",
-        ],
-        metric_cols,
+    inf_ev_size_mode = _two_stage_aggregate(
+        inference, "evidence_size", metric_cols, extra_group_cols=["evidence_mode"]
     )
+
+    time_tables: dict[str, pd.DataFrame] = {}
+    if args.include_time:
+        overall_time = aggregate_time_table(
+            df, ["method_id", "model_name", "config_id", "config_hash", "query_type"]
+        )
+        path = tables_dir / "overall_time_by_method.csv"
+        _write_table(overall_time, path)
+        tables.append(path)
+        time_tables["overall"] = overall_time
+
+        cpd_time_by_target = aggregate_time_table(
+            cpd,
+            ["method_id", "model_name", "config_id", "config_hash", "target_category"],
+        )
+        path = tables_dir / "cpd_time_by_target_category.csv"
+        _write_table(cpd_time_by_target, path)
+        tables.append(path)
+        time_tables["cpd_by_target"] = cpd_time_by_target
+
+        cpd_time_by_strategy = aggregate_time_table(
+            cpd,
+            [
+                "method_id",
+                "model_name",
+                "config_id",
+                "config_hash",
+                "evidence_strategy",
+            ],
+        )
+        path = tables_dir / "cpd_time_by_evidence_strategy.csv"
+        _write_table(cpd_time_by_strategy, path)
+        tables.append(path)
+        time_tables["cpd_by_strategy"] = cpd_time_by_strategy
+
+        cpd_time_mb = _two_stage_aggregate(cpd, "mb_size", ["time"])
+        path = tables_dir / "cpd_time_by_mb_size.csv"
+        _write_table(cpd_time_mb, path)
+        tables.append(path)
+        time_tables["cpd_mb"] = cpd_time_mb
+
+        cpd_time_parent = _two_stage_aggregate(cpd, "parent_size", ["time"])
+        path = tables_dir / "cpd_time_by_parent_size.csv"
+        _write_table(cpd_time_parent, path)
+        tables.append(path)
+        time_tables["cpd_parent"] = cpd_time_parent
+
+        cpd_time_ev_size = _two_stage_aggregate(cpd, "evidence_size", ["time"])
+        path = tables_dir / "cpd_time_by_evidence_size.csv"
+        _write_table(cpd_time_ev_size, path)
+        tables.append(path)
+        time_tables["cpd_ev_size"] = cpd_time_ev_size
+
+        inf_time_by_target = aggregate_time_table(
+            inference,
+            ["method_id", "model_name", "config_id", "config_hash", "target_category"],
+        )
+        path = tables_dir / "inference_time_by_target_category.csv"
+        _write_table(inf_time_by_target, path)
+        tables.append(path)
+        time_tables["inf_by_target"] = inf_time_by_target
+
+        inf_time_by_task = aggregate_time_table(
+            inference,
+            ["method_id", "model_name", "config_id", "config_hash", "task"],
+        )
+        path = tables_dir / "inference_time_by_task.csv"
+        _write_table(inf_time_by_task, path)
+        tables.append(path)
+        time_tables["inf_by_task"] = inf_time_by_task
+
+        inf_time_by_mode = aggregate_time_table(
+            inference,
+            ["method_id", "model_name", "config_id", "config_hash", "evidence_mode"],
+        )
+        path = tables_dir / "inference_time_by_evidence_mode.csv"
+        _write_table(inf_time_by_mode, path)
+        tables.append(path)
+        time_tables["inf_by_mode"] = inf_time_by_mode
+
+        inf_time_ev_size = _two_stage_aggregate(inference, "evidence_size", ["time"])
+        path = tables_dir / "inference_time_by_evidence_size.csv"
+        _write_table(inf_time_ev_size, path)
+        tables.append(path)
+        time_tables["inf_ev_size"] = inf_time_ev_size
 
     if not inference.empty:
         skeleton = aggregate_table(
@@ -1002,6 +1244,110 @@ def main() -> None:
             out_dir=figures_dir,
             filename_prefix="inference_wass_vs_evidence_size",
             mode=mode,
+        )
+        if fig:
+            figures.append(fig)
+
+    if args.include_pareto:
+        pareto_summary = aggregate_table(
+            df,
+            ["method_id", "model_name", "config_id", "config_hash", "query_type"],
+            ["kl", "wass", "time"],
+        )
+        for metric in ("kl", "wass"):
+            sub = pareto_summary[pareto_summary["query_type"] == "cpd"]
+            fig = _plot_pareto(
+                sub,
+                metric=metric,
+                out_dir=figures_dir,
+                filename=f"pareto_cpd_{metric}_vs_time.png",
+                title=f"CPD {metric.upper()} vs Time",
+            )
+            if fig:
+                figures.append(fig)
+            sub = pareto_summary[pareto_summary["query_type"] == "inference"]
+            fig = _plot_pareto(
+                sub,
+                metric=metric,
+                out_dir=figures_dir,
+                filename=f"pareto_inference_{metric}_vs_time.png",
+                title=f"Inference {metric.upper()} vs Time",
+            )
+            if fig:
+                figures.append(fig)
+
+        if args.pareto_split != "none":
+            split_col = {
+                "mode": "evidence_mode",
+                "task": "task",
+                "target_category": "target_category",
+            }[args.pareto_split]
+            split_df = df[df[split_col].notna()]
+            if not split_df.empty:
+                split_summary = aggregate_table(
+                    split_df,
+                    [
+                        "method_id",
+                        "model_name",
+                        "config_id",
+                        "config_hash",
+                        "query_type",
+                        split_col,
+                    ],
+                    ["kl", "wass", "time"],
+                )
+                for (qtype, split_val), group in split_summary.groupby(
+                    ["query_type", split_col], dropna=False
+                ):
+                    tag = _safe_tag(f"{split_col}_{split_val}")
+                    for metric in ("kl", "wass"):
+                        fig = _plot_pareto(
+                            group,
+                            metric=metric,
+                            out_dir=figures_dir,
+                            filename=f"pareto_{qtype}_{metric}_vs_time__{tag}.png",
+                            title=f"{qtype.capitalize()} {metric.upper()} vs Time ({split_col}={split_val})",
+                        )
+                        if fig:
+                            figures.append(fig)
+    if args.include_time:
+        fig = _plot_error_vs_size(
+            time_tables.get("cpd_mb", pd.DataFrame()),
+            size_col="mb_size",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="CPD Time vs Markov Blanket Size",
+            filename_prefix="cpd_time_vs_mb_size",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
+            time_tables.get("cpd_parent", pd.DataFrame()),
+            size_col="parent_size",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="CPD Time vs Parent Set Size",
+            filename_prefix="cpd_time_vs_parent_size",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
+            time_tables.get("cpd_ev_size", pd.DataFrame()),
+            size_col="evidence_size",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="CPD Time vs Evidence Size",
+            filename_prefix="cpd_time_vs_evidence_size",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
+            time_tables.get("inf_ev_size", pd.DataFrame()),
+            size_col="evidence_size",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="Inference Time vs Evidence Size",
+            filename_prefix="inference_time_vs_evidence_size",
         )
         if fig:
             figures.append(fig)
@@ -1094,6 +1440,63 @@ def main() -> None:
     )
     if fig:
         figures.append(fig)
+
+    if args.include_time:
+        fig = _plot_category_bars(
+            time_tables.get("cpd_by_target", pd.DataFrame()),
+            category_col="target_category",
+            metric="time",
+            out_dir=figures_dir,
+            filename_prefix="cpd_time_by_target_category",
+            title_prefix="CPD Time by Target Category",
+            category_order=CPD_TARGET_CATEGORIES,
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_category_bars(
+            time_tables.get("cpd_by_strategy", pd.DataFrame()),
+            category_col="evidence_strategy",
+            metric="time",
+            out_dir=figures_dir,
+            filename_prefix="cpd_time_by_evidence_strategy",
+            title_prefix="CPD Time by Evidence Strategy",
+            category_order=CPD_EVIDENCE_STRATEGIES,
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_category_bars(
+            time_tables.get("inf_by_target", pd.DataFrame()),
+            category_col="target_category",
+            metric="time",
+            out_dir=figures_dir,
+            filename_prefix="inference_time_by_target_category",
+            title_prefix="Inference Time by Target Category",
+            category_order=INF_TARGET_CATEGORIES,
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_category_bars(
+            time_tables.get("inf_by_task", pd.DataFrame()),
+            category_col="task",
+            metric="time",
+            out_dir=figures_dir,
+            filename_prefix="inference_time_by_task",
+            title_prefix="Inference Time by Task",
+            category_order=INF_TASKS,
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_category_bars(
+            time_tables.get("inf_by_mode", pd.DataFrame()),
+            category_col="evidence_mode",
+            metric="time",
+            out_dir=figures_dir,
+            filename_prefix="inference_time_by_evidence_mode",
+            title_prefix="Inference Time by Evidence Mode",
+            category_order=INF_EVIDENCE_MODES,
+        )
+        if fig:
+            figures.append(fig)
 
     if not figures:
         figures = sorted(figures_dir.glob("*.png"))

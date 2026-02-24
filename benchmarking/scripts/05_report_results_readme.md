@@ -23,6 +23,9 @@ python -m benchmarking.scripts.05_report_results \
 - `--models` (optional): comma-separated filter of model names/config ids.
 - `--max_records` (optional): limit records for debugging.
 - `--eps` (optional): smoothing epsilon for KL (default: `1e-12`).
+- `--include_time` / `--no-include_time`: include time tables and plots (default: enabled).
+- `--include_pareto` / `--no-include_pareto`: include Pareto plots (default: enabled).
+- `--pareto_split` (optional): `none|mode|task|target_category` (default: `none`).
 
 ---
 
@@ -55,6 +58,16 @@ Tables produced in `tables/`:
 - `cpd_by_parent_size.csv` (two-stage aggregation)
 - `inference_by_evidence_size.csv`
 - `inference_by_skeleton.csv` (per-skeleton aggregation for MC queries)
+- `overall_time_by_method.csv`
+- `cpd_time_by_target_category.csv`
+- `cpd_time_by_evidence_strategy.csv`
+- `cpd_time_by_mb_size.csv`
+- `cpd_time_by_parent_size.csv`
+- `cpd_time_by_evidence_size.csv`
+- `inference_time_by_target_category.csv`
+- `inference_time_by_task.csv`
+- `inference_time_by_evidence_mode.csv`
+- `inference_time_by_evidence_size.csv`
 
 ### Figures
 
@@ -68,6 +81,17 @@ All plots are saved as PNG in `figures/`:
   - Inference target category
   - Inference task
   - Inference evidence mode
+  - CPD time by target/evidence strategy
+  - Inference time by target/task/mode
+
+Efficiency (Pareto) plots:
+
+- `pareto_cpd_kl_vs_time.png`
+- `pareto_cpd_wass_vs_time.png`
+- `pareto_inference_kl_vs_time.png`
+- `pareto_inference_wass_vs_time.png`
+
+Optional stratified plots depend on `--pareto_split`.
 
 ---
 
