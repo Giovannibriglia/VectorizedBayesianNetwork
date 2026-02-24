@@ -86,9 +86,12 @@ python -m benchmarking.scripts.02_generate_benchmark_queries \
 
 ```
 benchmarking/data/queries/<generator>/<problem>/queries.json
+benchmarking/data/queries/<generator>/<problem>/ground_truth.jsonl
 benchmarking/data/queries/log/<generator>/<problem>_seed<seed>.log
 benchmarking/data/metadata/<generator>/<problem>/domain.json
 ```
+
+Ground truth distributions are computed during query generation (pgmpy exact inference) and stored once per dataset in `ground_truth.jsonl`. The `queries.json` payload records a pointer under `ground_truth.path` along with a status/reason if GT could not be computed.
 
 **Query JSON schema (stable).**
 
@@ -205,12 +208,37 @@ python -m benchmarking.scripts.04_run_benchmark \
 benchmarking/out/<generator>/benchmark_<timestamp>/
   cpds/<model>.jsonl
   inference/<model>.jsonl
+  ground_truth_sources.json
   configs/<model>.json
   summary.json
   logs/run.log
 ```
 
 Each query result includes model metadata (config id + component keys + config hash), the query payload (compact by default), `ok/error`, and `timing_ms`. Results are deterministic given the same seed and model configuration.
+
+---
+
+## 5. Report Results
+
+**Purpose.** Join predictions with ground truth and generate summary tables/plots (KL/Wasserstein with robust IQM ± IQR-STD).
+
+**How to run.**
+
+```bash
+python -m benchmarking.scripts.05_report_results \
+    --run_dir benchmarking/out/<generator>/benchmark_<timestamp>
+```
+
+**Where outputs are stored.**
+
+```
+benchmarking/out/<generator>/benchmark_<timestamp>/report/
+  tables/
+  figures/
+  report.md
+```
+
+See `benchmarking/scripts/05_report_results_readme.md` for full flag details and plotting outputs.
 
 ---
 

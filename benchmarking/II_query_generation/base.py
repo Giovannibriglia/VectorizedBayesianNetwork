@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import random
 from abc import ABC, abstractmethod
@@ -150,6 +151,16 @@ class BaseQueryGenerator(ABC):
         dataset_dir = ensure_dir(self.queries_dir / dataset_id)
         return dataset_dir / "queries.json"
 
+    def _ground_truth_path(self, dataset_id: str) -> Path:
+        dataset_dir = ensure_dir(self.queries_dir / dataset_id)
+        return dataset_dir / "ground_truth.jsonl"
+
+    def _write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+
     def generate_all(self) -> list[Path]:
         outputs: list[Path] = []
         dataset_dirs = self.list_dataset_dirs()
@@ -172,6 +183,29 @@ class BaseQueryGenerator(ABC):
                 logger.info("Skipping dataset %s", dataset_id)
                 root_logger.warning("Skipping dataset %s", dataset_id)
                 continue
+            gt_records = payload.pop("ground_truth_records", None)
+            gt_path = payload.pop("ground_truth_path", None)
+            gt_status = payload.pop("ground_truth_status", None)
+            gt_reason = payload.pop("ground_truth_reason", None)
+            if gt_records is not None:
+                gt_path = (
+                    Path(gt_path) if gt_path else self._ground_truth_path(dataset_id)
+                )
+                self._write_jsonl(gt_path, list(gt_records))
+                try:
+                    rel_path = gt_path.resolve().relative_to(self.root_path)
+                    gt_path_value = str(rel_path)
+                except Exception:
+                    gt_path_value = str(gt_path)
+                payload["ground_truth"] = {
+                    "source": "query_generation",
+                    "path": gt_path_value,
+                    "count": int(len(gt_records)),
+                }
+                if gt_status:
+                    payload["ground_truth"]["status"] = str(gt_status)
+                if gt_reason:
+                    payload["ground_truth"]["reason"] = str(gt_reason)
             out_path = self._output_path(dataset_id)
             write_json(out_path, payload)
             logger.info("Wrote query payload to %s", out_path)

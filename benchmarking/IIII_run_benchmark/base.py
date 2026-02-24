@@ -378,6 +378,7 @@ class BaseBenchmarkRunner(ABC):
             "models": {},
             "run": {"progress": bool(self.progress)},
         }
+        ground_truth_sources: dict[str, dict] = {}
 
         for model_name in self.models:
             model_tag = self._safe_model_tag(model_name)
@@ -421,6 +422,9 @@ class BaseBenchmarkRunner(ABC):
             n_edges = int(dag.number_of_edges())
             cpd_queries = assets.queries.get("cpd_queries", [])
             inf_queries = assets.queries.get("inference_queries", [])
+            gt_meta = assets.queries.get("ground_truth")
+            if isinstance(gt_meta, dict):
+                ground_truth_sources[problem] = dict(gt_meta)
             self.logger.info(
                 "Starting problem %s (%s/%s)",
                 problem,
@@ -656,6 +660,10 @@ class BaseBenchmarkRunner(ABC):
                 else 0.0
             )
             summary["models"][model_name] = stats
+
+        if ground_truth_sources:
+            summary["ground_truth"] = ground_truth_sources
+            write_json(run_dir / "ground_truth_sources.json", ground_truth_sources)
 
         summary_path = run_dir / "summary.json"
         write_json(summary_path, summary)

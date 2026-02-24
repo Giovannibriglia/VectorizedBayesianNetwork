@@ -137,6 +137,7 @@ benchmarking/out/<generator>/benchmark_<timestamp>/
   cpds/<model>.jsonl
   inference/<model>.jsonl
   configs/<model>.json
+  ground_truth_sources.json
   summary.json
   logs/run.log
 ```
@@ -148,6 +149,8 @@ Each query record includes:
 - `ok`, `error`, `timing_ms`, `result`
 
 Per-query `timing_ms` is always recorded. Output is deterministic given the same seed, dataset selection, and model configuration.
+
+`ground_truth_sources.json` records paths to the per-dataset ground truth files generated during query generation so reporting can reuse them without copying.
 
 ---
 

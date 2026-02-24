@@ -36,12 +36,35 @@ class EvidenceSpec:
         }
 
 
+def _sample_discrete_value(meta: dict, rng: random.Random) -> int | None:
+    if meta.get("type") != "discrete":
+        return None
+    states = meta.get("states") or []
+    if not states:
+        return None
+    return int(rng.randrange(len(states)))
+
+
+def _sample_evidence_values(
+    evidence_vars: List[str], domain_nodes: Dict[str, dict], rng: random.Random
+) -> dict:
+    values: dict[str, int] = {}
+    for var in evidence_vars:
+        meta = domain_nodes.get(var, {}) if isinstance(domain_nodes, dict) else {}
+        value = _sample_discrete_value(meta, rng)
+        if value is None:
+            continue
+        values[var] = int(value)
+    return values
+
+
 @dataclass(frozen=True)
 class CPDQuery:
     target: str
     target_category: str
     evidence_strategy: str
     evidence_vars: List[str]
+    evidence_values: dict | None
     seed: int
     dataset_id: str
 
@@ -53,8 +76,8 @@ class CPDQuery:
             "target_category": self.target_category,
             "evidence_strategy": self.evidence_strategy,
             "evidence_vars": evidence_vars,
-            "evidence_values": None,
-            "evidence": {"vars": evidence_vars, "values": None},
+            "evidence_values": self.evidence_values,
+            "evidence": {"vars": evidence_vars, "values": self.evidence_values},
             "seed": int(self.seed),
             "dataset_id": self.dataset_id,
         }
@@ -790,6 +813,7 @@ def _generate_cpd_queries(
     undirected: Dict[str, Set[str]],
     dist_cache: Dict[str, Dict[str, int]],
     rng: random.Random,
+    domain_nodes: Dict[str, dict],
 ) -> tuple[List[CPDQuery], dict]:
     pool_union: Set[str] = set()
     evidence_union: Set[str] = set()
@@ -811,6 +835,7 @@ def _generate_cpd_queries(
             component_cache=component_cache,
         )
         evidence_vars = _sample_evidence(pool, rng)
+        evidence_values = _sample_evidence_values(evidence_vars, domain_nodes, rng)
 
         queries.append(
             CPDQuery(
@@ -818,6 +843,7 @@ def _generate_cpd_queries(
                 target_category=category,
                 evidence_strategy=strategy,
                 evidence_vars=evidence_vars,
+                evidence_values=evidence_values or {},
                 seed=seed,
                 dataset_id=dataset_id,
             )
@@ -1046,6 +1072,136 @@ def _generate_inference_queries(
     )
 
     return queries, evidence_metrics
+
+
+def _build_state_maps(domain_nodes: Dict[str, dict]) -> tuple[dict, dict]:
+    code_to_state: dict[str, dict[int, str]] = {}
+    state_to_code: dict[str, dict[str, int]] = {}
+    for node, meta in domain_nodes.items():
+        codes = meta.get("codes") if isinstance(meta, dict) else None
+        if not isinstance(codes, dict):
+            continue
+        inv = {int(v): str(k) for k, v in codes.items() if v is not None}
+        code_to_state[node] = inv
+        state_to_code[node] = {
+            str(k): int(v) for k, v in codes.items() if v is not None
+        }
+    return code_to_state, state_to_code
+
+
+def _build_gt_query_payload(
+    query: dict, *, dataset_id: str, qtype: str, index: int
+) -> dict:
+    payload = dict(query)
+    payload["type"] = qtype
+    payload["index"] = int(index)
+    payload["id"] = f"{dataset_id}::{qtype}::{index}"
+    return payload
+
+
+def _compute_ground_truth_records(
+    *,
+    dataset_id: str,
+    bif_path: Path,
+    domain_nodes: Dict[str, dict],
+    cpd_queries: List[CPDQuery],
+    inference_queries: List[InferenceQuery],
+    logger: logging.Logger,
+) -> tuple[list[dict], str, str | None]:
+    try:
+        from pgmpy.inference import VariableElimination
+        from pgmpy.readwrite import BIFReader
+    except Exception as exc:  # pragma: no cover
+        reason = f"pgmpy unavailable: {exc}"
+        logger.warning("Skipping ground truth for %s: %s", dataset_id, reason)
+        return [], "unavailable", reason
+
+    try:
+        model = BIFReader(str(bif_path)).get_model()
+        infer = VariableElimination(model)
+    except Exception as exc:
+        reason = f"failed to load BIF: {exc}"
+        logger.warning("Skipping ground truth for %s: %s", dataset_id, reason)
+        return [], "unavailable", reason
+
+    code_to_state, state_to_code = _build_state_maps(domain_nodes)
+
+    def _evidence_to_states(evidence_values: dict) -> dict | None:
+        evidence = {}
+        for var, value in evidence_values.items():
+            if var not in code_to_state:
+                return None
+            try:
+                code = int(value)
+            except Exception:
+                return None
+            state = code_to_state[var].get(code)
+            if state is None:
+                return None
+            evidence[var] = state
+        return evidence
+
+    def _query_probs(target: str, evidence_values: dict) -> list[float] | None:
+        if target not in state_to_code:
+            return None
+        evidence = _evidence_to_states(evidence_values)
+        if evidence is None:
+            return None
+        try:
+            result = infer.query([target], evidence=evidence, show_progress=False)
+        except Exception:
+            return None
+        if target not in result.state_names:
+            return None
+        state_names = list(result.state_names[target])
+        values = result.values
+        if hasattr(values, "reshape"):
+            values = values.reshape(-1)
+        flat = [float(v) for v in values]
+        label_to_code = state_to_code[target]
+        max_code = max(label_to_code.values()) if label_to_code else -1
+        if max_code < 0:
+            return None
+        probs = [0.0] * (max_code + 1)
+        for label, prob in zip(state_names, flat):
+            code = label_to_code.get(str(label))
+            if code is None:
+                continue
+            probs[code] = float(prob)
+        return probs
+
+    records: list[dict] = []
+    for idx, query in enumerate(cpd_queries):
+        query_payload = _build_gt_query_payload(
+            query.to_dict(), dataset_id=dataset_id, qtype="cpd", index=idx
+        )
+        evidence_values = query.evidence_values or {}
+        probs = _query_probs(query.target, evidence_values)
+        if probs is None:
+            continue
+        records.append(
+            {
+                "problem": {"id": dataset_id},
+                "query": query_payload,
+                "gt_probs": probs,
+            }
+        )
+    for idx, query in enumerate(inference_queries):
+        query_payload = _build_gt_query_payload(
+            query.to_dict(), dataset_id=dataset_id, qtype="inference", index=idx
+        )
+        evidence_values = query.evidence.values if query.evidence else {}
+        probs = _query_probs(query.target, evidence_values or {})
+        if probs is None:
+            continue
+        records.append(
+            {
+                "problem": {"id": dataset_id},
+                "query": query_payload,
+                "gt_probs": probs,
+            }
+        )
+    return records, "ok", None
 
 
 @register_query_generator
@@ -1278,6 +1434,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             undirected=undirected,
             dist_cache=dist_cache,
             rng=rng,
+            domain_nodes=domain.get("nodes", {}),
         )
 
         inference_queries, inference_evidence_metrics = _generate_inference_queries(
@@ -1412,6 +1569,15 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             )
             return None
 
+        ground_truth_records, gt_status, gt_reason = _compute_ground_truth_records(
+            dataset_id=dataset_id,
+            bif_path=bif_path,
+            domain_nodes=domain.get("nodes", {}),
+            cpd_queries=cpd_queries,
+            inference_queries=inference_queries,
+            logger=logger,
+        )
+
         payload = {
             "dataset_id": dataset_id,
             "generator": self.name,
@@ -1431,6 +1597,13 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             },
             "notes": {},
         }
+        payload["ground_truth_records"] = ground_truth_records
+        payload["ground_truth_path"] = str(
+            (self.queries_dir / dataset_id / "ground_truth.jsonl")
+        )
+        payload["ground_truth_status"] = gt_status
+        if gt_reason:
+            payload["ground_truth_reason"] = gt_reason
 
         has_continuous = any(
             meta.get("type") == "continuous"

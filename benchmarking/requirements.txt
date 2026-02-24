@@ -3,3 +3,4 @@ pandas
 numpy
 fastparquet
 pyarrow
+scipy

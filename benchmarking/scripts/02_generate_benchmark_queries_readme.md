@@ -100,6 +100,17 @@ Evidence values must be numeric:
 - Discrete variables use the domain mapping (state label → integer code).
 - Variable identifiers remain strings (BN node names).
 
+### Ground Truth (GT)
+
+During query generation, exact ground truth distributions are computed (pgmpy exact inference) and stored once per dataset:
+
+```
+benchmarking/data/queries/<generator>/<problem>/ground_truth.jsonl
+```
+
+The `queries.json` payload records a pointer under `ground_truth.path` so later stages can reuse the GT without copying.
+If pgmpy is unavailable, the ground-truth file is still created but may be empty and annotated with a status/reason in `queries.json`.
+
 ### bnlearn metadata
 
 Dataset types and download URLs are defined in:

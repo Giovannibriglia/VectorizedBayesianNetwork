@@ -98,7 +98,12 @@ def test_02_query_generation_registry_and_determinism(tmp_path: Path) -> None:
     assert "target_category" in sample_cpd
     assert "evidence_strategy" in sample_cpd
     assert isinstance(sample_cpd["evidence_vars"], list)
-    assert sample_cpd["evidence_values"] is None
+    assert isinstance(sample_cpd["evidence_values"], dict)
+
+    gt_path = get_queries_dir(root) / generator_name / dataset_id / "ground_truth.jsonl"
+    assert gt_path.exists()
+    assert "ground_truth" in payload_first
+    assert payload_first["ground_truth"]["path"]
 
     sample_inf = payload_first["inference_queries"][0]
     assert sample_inf["query_type"] == "inference"
