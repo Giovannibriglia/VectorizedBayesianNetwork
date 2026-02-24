@@ -2,20 +2,32 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from .config import ModelBenchmarkConfig
 
 
 class BaseBenchmarkModel(ABC):
     name: str
 
-    def __init__(self, *, dag, seed: int, domain: dict, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        dag,
+        seed: int,
+        domain: dict,
+        benchmark_config: "ModelBenchmarkConfig | None" = None,
+        **kwargs: Any,
+    ) -> None:
         if not getattr(self, "name", None):
             raise ValueError("Benchmark model must define a non-empty 'name'.")
         self.dag = dag
         self.seed = int(seed)
         self.domain = domain
+        self.benchmark_config = benchmark_config
         self.model_kwargs = dict(kwargs)
 
     @abstractmethod

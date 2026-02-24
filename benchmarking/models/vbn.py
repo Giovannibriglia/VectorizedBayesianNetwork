@@ -79,6 +79,24 @@ def _normalize_probs(probs: Iterable[float]) -> list[float]:
     return (arr / total).tolist()
 
 
+def _build_nodes_cpds(domain: dict, cpd_name: str, cpd_kwargs: dict) -> dict:
+    nodes_cpds: dict[str, dict] = {}
+    nodes = domain.get("nodes", {}) if isinstance(domain, dict) else {}
+    for node, meta in nodes.items():
+        node_type = meta.get("type")
+        if node_type not in {"discrete", "continuous"}:
+            continue
+        conf = {"cpd": cpd_name}
+        if cpd_kwargs:
+            conf.update(dict(cpd_kwargs))
+        if node_type == "discrete" and cpd_name == "softmax_nn":
+            k = len(meta.get("states") or [])
+            if k > 0:
+                conf["n_classes"] = k
+        nodes_cpds[node] = conf
+    return nodes_cpds
+
+
 def _estimate_discrete_posterior(
     samples: torch.Tensor,
     weights: torch.Tensor,
@@ -109,26 +127,57 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
     family = "neural_bn"
     version = _package_version()
 
-    def __init__(self, *, dag, seed: int, domain: dict, **kwargs: Any) -> None:
-        super().__init__(dag=dag, seed=seed, domain=domain, **kwargs)
+    def __init__(
+        self,
+        *,
+        dag,
+        seed: int,
+        domain: dict,
+        benchmark_config=None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            dag=dag,
+            seed=seed,
+            domain=domain,
+            benchmark_config=benchmark_config,
+            **kwargs,
+        )
         self._vbn = VBN(dag, seed=seed)
-        learning_method = kwargs.get("learning_method", "node_wise")
-        inference_method = kwargs.get("inference_method", "importance_sampling")
-        nodes_cpds = kwargs.get("nodes_cpds")
+        if benchmark_config is not None:
+            learning_method = benchmark_config.learning.name
+            learning_kwargs = dict(benchmark_config.learning.kwargs)
+            inference_method = benchmark_config.inference.name
+            inference_kwargs = dict(benchmark_config.inference.kwargs)
+            nodes_cpds = kwargs.get("nodes_cpds")
+            if nodes_cpds is None:
+                nodes_cpds = _build_nodes_cpds(
+                    domain,
+                    benchmark_config.cpd.name,
+                    benchmark_config.cpd.kwargs,
+                )
+            self._vbn.set_learning_method(
+                learning_method, nodes_cpds=nodes_cpds, **learning_kwargs
+            )
+            self._vbn.set_inference_method(inference_method, **inference_kwargs)
+        else:
+            learning_method = kwargs.get("learning_method", "node_wise")
+            inference_method = kwargs.get("inference_method", "importance_sampling")
+            nodes_cpds = kwargs.get("nodes_cpds")
 
-        if nodes_cpds is None:
-            nodes_cpds = {}
-            nodes = domain.get("nodes", {}) if isinstance(domain, dict) else {}
-            for node, meta in nodes.items():
-                if meta.get("type") == "discrete":
-                    k = len(meta.get("states") or [])
-                    if k > 0:
-                        nodes_cpds[node] = {"cpd": "softmax_nn", "n_classes": k}
-                elif meta.get("type") == "continuous":
-                    nodes_cpds[node] = {"cpd": "gaussian_nn"}
+            if nodes_cpds is None:
+                nodes_cpds = {}
+                nodes = domain.get("nodes", {}) if isinstance(domain, dict) else {}
+                for node, meta in nodes.items():
+                    if meta.get("type") == "discrete":
+                        k = len(meta.get("states") or [])
+                        if k > 0:
+                            nodes_cpds[node] = {"cpd": "softmax_nn", "n_classes": k}
+                    elif meta.get("type") == "continuous":
+                        nodes_cpds[node] = {"cpd": "gaussian_nn"}
 
-        self._vbn.set_learning_method(learning_method, nodes_cpds=nodes_cpds)
-        self._vbn.set_inference_method(inference_method)
+            self._vbn.set_learning_method(learning_method, nodes_cpds=nodes_cpds)
+            self._vbn.set_inference_method(inference_method)
 
     def supports(self) -> dict:
         return {

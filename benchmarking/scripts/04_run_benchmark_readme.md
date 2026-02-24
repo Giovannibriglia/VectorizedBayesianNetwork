@@ -11,7 +11,7 @@ Step 04 orchestrates the full execution by combining data + queries + model impl
 The implementation is split into three layers:
 
 - **Models abstraction** (`benchmarking/models/`): standardized model interface across libraries.
-- **Generator-specific runners** (`benchmarking/04_run_benchmark/`): dataset/asset loading per generator (e.g., bnlearn).
+- **Generator-specific runners** (`benchmarking/IIII_run_benchmark/`): dataset/asset loading per generator (e.g., bnlearn).
 - **CLI script** (`benchmarking/scripts/04_run_benchmark.py`): entry point and argument parsing.
 
 ---
@@ -29,6 +29,8 @@ This folder defines a minimal model API for benchmarking:
   - `supports()`
 - `registry.py`: model registry (`register_benchmark_model`, `get_benchmark_model`, `list_benchmark_models`).
 - `vbn.py`: VBN implementation of the base interface.
+- `config.py`: model benchmark config dataclasses (`ModelBenchmarkConfig`, `ComponentSpec`).
+- `presets.py`: default config presets per model (VBN presets included).
 
 **Per-query timing** is mandatory. Each query result must include:
 
@@ -45,7 +47,7 @@ For discrete targets, results must expose a probability vector aligned with inte
 
 ---
 
-### 2) `benchmarking/04_run_benchmark/`
+### 2) `benchmarking/IIII_run_benchmark/`
 
 Runner layer loads assets and executes models:
 
@@ -58,16 +60,17 @@ Responsibilities include:
 - Deterministic ordering of problems, models, and queries.
 - Recording per-query results and timings.
 - Writing outputs under `benchmarking/out/`.
+- Resolving model benchmark configs + writing config snapshots.
 
 ---
 
 ## CLI Usage
 
 ```bash
-python -m benchmarking.scripts.IIII_run_benchmark \
-    --generator bnlearn \
-    --seed 0 \
-    --models vbn
+python -m benchmarking.scripts.04_run_benchmark \
+  --generator bnlearn \
+  --seed 0 \
+  --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
 ```
 
 ### Flags
@@ -76,8 +79,54 @@ python -m benchmarking.scripts.IIII_run_benchmark \
 - `--seed` (required): seed used for deterministic dataset selection and model init.
 - `--models` (required): comma-separated or repeatable list of models.
   - Example: `--models vbn,pgmpy` or `--models vbn --models pgmpy`.
+  - To run multiple configs for the same model in one run, use aliases:
+    - `--models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm`
+- `--config` (optional): model config preset selector.
+  - Single value applies to all models (default: `default`).
+  - Or per-model pairs: `model:config_id` (comma-separated).
+- `--config-overrides` (optional): JSON dict of component overrides (learning/cpd/inference).
 - `--model-kwargs` (optional): JSON dict forwarded to model constructors.
 - `--max_problems` (optional): limit number of problems (debugging).
+- `--store_full_query` (optional): store full query payloads in each JSONL record.
+
+### Config Example
+
+```bash
+python -m benchmarking.scripts.04_run_benchmark \
+    --generator bnlearn \
+    --seed 0 \
+    --models vbn \
+    --config vbn_softmax_is \
+    --config-overrides '{"vbn":{"inference":{"kwargs":{"n_particles":512}}}}'
+```
+
+### Multiple Configs In One Run
+
+```bash
+python -m benchmarking.scripts.04_run_benchmark \
+    --generator bnlearn \
+    --seed 0 \
+    --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
+```
+
+Override payload shape:
+
+```json
+{
+  "vbn": {
+    "learning": {"kwargs": {"batch_size": 2048}},
+    "cpd": {"name": "softmax_nn", "kwargs": {"hidden_sizes": [128, 128]}},
+    "inference": {"name": "importance_sampling", "kwargs": {"n_particles": 256}}
+  }
+}
+```
+
+Override rules:
+
+- Only `learning`, `cpd`, `inference` keys allowed per model.
+- If `name` changes, `key` becomes `"<component>:<name>"` unless explicitly provided.
+  - Override keys may refer to the base model name (apply to all aliases) or the alias
+    name (apply to that alias only).
 
 ---
 
@@ -85,16 +134,17 @@ python -m benchmarking.scripts.IIII_run_benchmark \
 
 ```
 benchmarking/out/<generator>/benchmark_<timestamp>/
-  cpds/<model>.json
-  inference/<model>.json
+  cpds/<model>.jsonl
+  inference/<model>.jsonl
+  configs/<model>.json
   summary.json
   logs/run.log
 ```
 
 Each query record includes:
 
-- `index`
-- original `query` payload
+- `model` metadata: model name, config id, component keys, config hash
+- `query` payload (compact by default, full if `--store_full_query`)
 - `ok`, `error`, `timing_ms`, `result`
 
 Per-query `timing_ms` is always recorded. Output is deterministic given the same seed, dataset selection, and model configuration.

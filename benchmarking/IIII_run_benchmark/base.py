@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from benchmarking.models import get_benchmark_model
+from benchmarking.models.config import apply_overrides, config_hash
+from benchmarking.models.presets import get_preset_config
 from benchmarking.utils import ensure_dir, get_generator_out_dir, timed_call, write_json
 
 
@@ -152,6 +155,9 @@ class BaseBenchmarkRunner(ABC):
         seed: int,
         models: list[str],
         model_kwargs: dict | None = None,
+        model_configs: dict[str, str] | None = None,
+        model_aliases: dict[str, str] | None = None,
+        config_overrides: dict | None = None,
         max_problems: int | None = None,
         store_full_query: bool = False,
         progress: bool = True,
@@ -162,6 +168,9 @@ class BaseBenchmarkRunner(ABC):
         self.seed = int(seed)
         self.models = list(models)
         self.model_kwargs = dict(model_kwargs or {})
+        self.model_configs = dict(model_configs or {})
+        self.model_aliases = dict(model_aliases or {})
+        self.config_overrides = dict(config_overrides or {})
         self.max_problems = max_problems
         self.store_full_query = bool(store_full_query)
         self.progress = bool(progress)
@@ -182,6 +191,7 @@ class BaseBenchmarkRunner(ABC):
         ensure_dir(run_dir / "cpds")
         ensure_dir(run_dir / "inference")
         ensure_dir(run_dir / "logs")
+        ensure_dir(run_dir / "configs")
         return run_dir
 
     def _hash_kwargs(self) -> str:
@@ -189,13 +199,72 @@ class BaseBenchmarkRunner(ABC):
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return f"sha256:{digest}"
 
-    def _model_info(self, model) -> dict:
+    def _safe_model_tag(self, name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+    def _base_model_name(self, alias: str) -> str:
+        return self.model_aliases.get(alias, alias)
+
+    def _model_info(self, model, *, config, config_hash_value: str) -> dict:
         return {
             "name": getattr(model, "name", "unknown"),
             "version": getattr(model, "version", None),
             "family": getattr(model, "family", "unknown"),
             "kwargs_hash": self._hash_kwargs(),
+            "config_id": config.config_id,
+            "config_hash": config_hash_value,
+            "components": {
+                "learning": {
+                    "name": config.learning.name,
+                    "key": config.learning.key,
+                },
+                "cpd": {
+                    "name": config.cpd.name,
+                    "key": config.cpd.key,
+                },
+                "inference": {
+                    "name": config.inference.name,
+                    "key": config.inference.key,
+                },
+            },
         }
+
+    def _resolve_model_configs(self) -> tuple[dict[str, Any], dict[str, str]]:
+        configs: Dict[str, Any] = {}
+        hashes: Dict[str, str] = {}
+        unknown_models = set(self.model_configs) - set(self.models)
+        if unknown_models:
+            raise ValueError(
+                f"Config provided for unknown models: {sorted(unknown_models)}"
+            )
+        allowed_override_keys = set(self.models) | set(self.model_aliases.values())
+        unknown_overrides = set(self.config_overrides) - allowed_override_keys
+        if unknown_overrides:
+            raise ValueError(
+                f"Config overrides provided for unknown models: {sorted(unknown_overrides)}"
+            )
+        for model_name in self.models:
+            config_id = self.model_configs.get(model_name, "default")
+            base_model = self._base_model_name(model_name)
+            base_config = get_preset_config(base_model, config_id)
+            base_overrides = self.config_overrides.get(base_model)
+            alias_overrides = self.config_overrides.get(model_name)
+            for label, overrides in (
+                (base_model, base_overrides),
+                (model_name, alias_overrides),
+            ):
+                if overrides is not None and not isinstance(overrides, dict):
+                    raise ValueError(
+                        f"Config overrides for '{label}' must be a JSON object"
+                    )
+            resolved = base_config
+            if base_overrides:
+                resolved = apply_overrides(resolved, base_overrides)
+            if alias_overrides:
+                resolved = apply_overrides(resolved, alias_overrides)
+            configs[model_name] = resolved
+            hashes[model_name] = config_hash(resolved)
+        return configs, hashes
 
     def _problem_info(self, problem: str, dag) -> dict:
         return {
@@ -270,6 +339,14 @@ class BaseBenchmarkRunner(ABC):
 
     def run_all(self) -> Path:
         run_dir = self._init_output_dir()
+        model_configs, model_config_hashes = self._resolve_model_configs()
+        configs_dir = run_dir / "configs"
+        for model_name, config in model_configs.items():
+            model_tag = self._safe_model_tag(model_name)
+            snapshot = config.to_dict()
+            snapshot["config_hash"] = model_config_hashes[model_name]
+            snapshot["run_key"] = config.run_key()
+            write_json(configs_dir / f"{model_tag}.json", snapshot)
         run_id = run_dir.name
         timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_path = run_dir / "logs" / "run.log"
@@ -303,8 +380,9 @@ class BaseBenchmarkRunner(ABC):
         }
 
         for model_name in self.models:
-            cpd_path = run_dir / "cpds" / f"{model_name}.jsonl"
-            inf_path = run_dir / "inference" / f"{model_name}.jsonl"
+            model_tag = self._safe_model_tag(model_name)
+            cpd_path = run_dir / "cpds" / f"{model_tag}.jsonl"
+            inf_path = run_dir / "inference" / f"{model_tag}.jsonl"
             model_files[model_name] = {
                 "cpd": cpd_path.open("w", encoding="utf-8"),
                 "inf": inf_path.open("w", encoding="utf-8"),
@@ -364,11 +442,15 @@ class BaseBenchmarkRunner(ABC):
                 inf_timing_sum = 0.0
 
                 try:
-                    model_cls = get_benchmark_model(model_name)
+                    base_model = self._base_model_name(model_name)
+                    model_cls = get_benchmark_model(base_model)
+                    model_config = model_configs[model_name]
+                    model_config_hash = model_config_hashes[model_name]
                     model = model_cls(
                         dag=assets.dag,
                         seed=self.seed,
                         domain=assets.domain,
+                        benchmark_config=model_config,
                         **self.model_kwargs,
                     )
                 except Exception as exc:
@@ -396,7 +478,9 @@ class BaseBenchmarkRunner(ABC):
                     "run_id": run_id,
                     "progress": bool(self.progress),
                 }
-                model_meta = self._model_info(model)
+                model_meta = self._model_info(
+                    model, config=model_config, config_hash_value=model_config_hash
+                )
                 problem_meta = self._problem_info(problem, assets.dag)
 
                 cpd_desc = f"{self.generator}/{problem} | {model_name} | CPD"

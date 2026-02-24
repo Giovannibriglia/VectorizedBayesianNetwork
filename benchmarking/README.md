@@ -162,17 +162,55 @@ python -m benchmarking.scripts.04_run_benchmark \
     --models vbn
 ```
 
+### Parameters
+
+- `--generator` (required): dataset generator name (e.g., `bnlearn`).
+- `--seed` (required): seed used for dataset selection and model init.
+- `--models` (required): comma-separated or repeatable list of models.
+  - Example: `--models vbn,pgmpy` or `--models vbn --models pgmpy`.
+  - To run multiple configs for the same model in one run, use aliases:
+    - `--models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm`
+- `--config` (optional): model config preset selector.
+  - Single value applies to all models (default: `default`).
+  - Or per-model pairs: `model:config_id` (comma-separated).
+- `--config-overrides` (optional): JSON dict of component overrides (learning/cpd/inference).
+  - Keys can be the base model name (apply to all aliases) or the alias name (apply to one).
+- `--model-kwargs` (optional): JSON dict forwarded to model constructors.
+- `--max_problems` (optional): limit number of problems (debugging).
+- `--store_full_query` (optional): store full query payloads in each JSONL record.
+
+**Config example**
+
+```bash
+python -m benchmarking.scripts.04_run_benchmark \
+    --generator bnlearn \
+    --seed 0 \
+    --models vbn \
+    --config vbn_softmax_is \
+    --config-overrides '{"vbn":{"inference":{"kwargs":{"n_particles":512}}}}'
+```
+
+**Multiple configs in one run**
+
+```bash
+python -m benchmarking.scripts.04_run_benchmark \
+    --generator bnlearn \
+    --seed 0 \
+    --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
+```
+
 **Where outputs are stored.**
 
 ```
 benchmarking/out/<generator>/benchmark_<timestamp>/
-  cpds/<model>.json
-  inference/<model>.json
+  cpds/<model>.jsonl
+  inference/<model>.jsonl
+  configs/<model>.json
   summary.json
   logs/run.log
 ```
 
-Each query result includes the original query payload, `ok/error`, and `timing_ms`. Results are deterministic given the same seed and model configuration.
+Each query result includes model metadata (config id + component keys + config hash), the query payload (compact by default), `ok/error`, and `timing_ms`. Results are deterministic given the same seed and model configuration.
 
 ---
 
