@@ -36,6 +36,20 @@ def _vbn_presets() -> Dict[str, ModelBenchmarkConfig]:
             cpd=make_component("cpd", "gaussian_nn"),
             inference=make_component("inference", "monte_carlo_marginalization"),
         ),
+        "vbn_linear_gauss_is": ModelBenchmarkConfig(
+            model=model,
+            config_id="vbn_linear_gauss_is",
+            learning=make_component("learning", "node_wise"),
+            cpd=make_component("cpd", "linear_gaussian"),
+            inference=make_component("inference", "importance_sampling"),
+        ),
+        "vbn_linear_gauss_mcm": ModelBenchmarkConfig(
+            model=model,
+            config_id="vbn_linear_gauss_mcm",
+            learning=make_component("learning", "node_wise"),
+            cpd=make_component("cpd", "linear_gaussian"),
+            inference=make_component("inference", "monte_carlo_marginalization"),
+        ),
     }
     return presets
 
