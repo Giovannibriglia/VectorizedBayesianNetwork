@@ -87,7 +87,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "01_categorical_cpds_benchmark.png"
 
-    df = make_df(n=5000, seed=0)
+    df = make_df(n=4096, seed=0)
     g = nx.DiGraph()
     g.add_edges_from([("x1", "y"), ("x2", "y")])
 

@@ -25,6 +25,7 @@ Vectorized Bayesian Networks is a **continuous-first**, **torch-native** Bayesia
 
 **CPDs**
 - `gaussian_nn`: neural Gaussian CPD
+- `linear_gaussian`: linear Gaussian CPD (ridge regression)
 - `softmax_nn`: binned categorical CPD (softmax classifier)
 - `kde`: (conditional) Gaussian KDE CPD
 - `mdn`: mixture density network CPD
@@ -225,6 +226,7 @@ python -m examples.03_sampling
 ## Benchmarking
 
 See `benchmarking/README.md` for the full benchmarking workflow.
+The reporting script now produces plots vs `n_nodes` and `n_edges` plus a flat results table with network sizes.
 
 ## Why We Use `python -m`
 Module execution avoids `PYTHONPATH`/`sys.path` hacks, ensures consistent imports from the repo root, and works cleanly with editable installs and CI. Registries remain in place to keep the system extensible without modifying core scripts.

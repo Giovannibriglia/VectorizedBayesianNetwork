@@ -74,6 +74,13 @@ Predicts `μ(x), σ(x)` (diagonal Gaussian).
 - **Eval time (per conditioning batch):** `O(B · H · D_x)` for forward + `O(B · D_y)` for Gaussian log_prob
 - **Sampling time:** `O(B · D_y)` after forward pass
 
+### `linear_gaussian` (Linear Gaussian CPD)
+Closed-form ridge regression: `Y | X ~ N(XW + b, σ²)` (diagonal).
+
+- **Fit time:** `O(M · D_x² + D_x³ + M · D_x · D_y)` (normal equation solve)
+- **Eval time:** `O(B · D_x · D_y)` for mean + `O(B · D_y)` for Gaussian log_prob
+- **Sampling time:** `O(B · D_y)` after mean computation
+
 ### `softmax_nn` (Binned categorical CPD)
 Predicts logits over `C` bins/classes.
 

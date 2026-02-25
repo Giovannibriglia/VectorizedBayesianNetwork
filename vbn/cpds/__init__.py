@@ -4,6 +4,7 @@ from vbn.core.registry import CPD_REGISTRY
 from vbn.cpds.base_cpd import BaseCPD, CPDOutput
 from vbn.cpds.gaussian_nn import GaussianNNCPD
 from vbn.cpds.kde import KDECPD
+from vbn.cpds.linear_gaussian import LinearGaussianCPD
 from vbn.cpds.mdn import MDNCPD
 from vbn.cpds.softmax_nn import SoftmaxNNCPD
 
@@ -13,6 +14,7 @@ __all__ = [
     "CPD_REGISTRY",
     "GaussianNNCPD",
     "KDECPD",
+    "LinearGaussianCPD",
     "MDNCPD",
     "SoftmaxNNCPD",
 ]

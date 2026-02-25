@@ -1,0 +1,13 @@
+name: linear_gaussian
+ridge: 1e-6
+min_scale: 1e-3
+fit:
+  epochs: 1
+  batch_size: 4096
+  lr: 1e-3
+  weight_decay: 0.0
+update:
+  n_steps: 1
+  batch_size: 4096
+  lr: 1e-3
+  weight_decay: 0.0

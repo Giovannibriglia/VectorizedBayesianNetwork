@@ -76,3 +76,61 @@ def test_softmax_nn_continuous_binning_clamps():
     bins = cpd._x_to_bin(x_out)
     assert int(bins.min().item()) == 0
     assert int(bins.max().item()) == n_classes - 1
+
+
+def test_gaussian_nn_shapes_and_finite():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    batch = 12
+    in_dim = 3
+    out_dim = 1
+    parents = torch.randn(batch, in_dim, device=device)
+    x = torch.randn(batch, out_dim, device=device)
+    cpd = CPD_REGISTRY["gaussian_nn"](
+        input_dim=in_dim, output_dim=out_dim, device=device
+    )
+    cpd.fit(parents, x, epochs=2, batch_size=4)
+
+    n_samples = 6
+    samples = cpd.sample(parents, n_samples)
+    assert samples.shape == (batch, n_samples, out_dim)
+    assert torch.isfinite(samples).all()
+
+    log_prob = cpd.log_prob(samples, parents)
+    assert log_prob.shape == (batch, n_samples)
+    assert torch.isfinite(log_prob).all()
+
+    log_prob_2d = cpd.log_prob(x, parents)
+    assert log_prob_2d.shape == (batch, 1)
+    assert torch.isfinite(log_prob_2d).all()
+
+
+def test_linear_gaussian_fit_and_sample():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    n = 256
+    in_dim = 3
+    out_dim = 2
+    true_w = torch.tensor([[0.7, -0.4], [0.2, 0.5], [-0.3, 0.1]], device=device)
+    true_b = torch.tensor([0.1, -0.2], device=device)
+    parents = torch.randn(n, in_dim, device=device)
+    noise = 0.05 * torch.randn(n, out_dim, device=device)
+    x = parents @ true_w + true_b + noise
+
+    cpd = CPD_REGISTRY["linear_gaussian"](
+        input_dim=in_dim, output_dim=out_dim, device=device, ridge=1e-6
+    )
+    cpd.fit(parents, x, epochs=1, batch_size=64)
+
+    assert torch.allclose(cpd._weight, true_w, atol=0.15, rtol=0.2)
+    assert torch.allclose(cpd._bias, true_b, atol=0.15, rtol=0.2)
+    assert torch.isfinite(cpd._var).all()
+    assert (cpd._var > 0).all()
+
+    n_samples = 500
+    parents_small = parents[:4]
+    samples = cpd.sample(parents_small, n_samples)
+    assert samples.shape == (4, n_samples, out_dim)
+    sample_mean = samples.mean(dim=1)
+    pred_mean = parents_small @ cpd._weight + cpd._bias
+    assert torch.allclose(sample_mean, pred_mean, atol=0.2, rtol=0.2)

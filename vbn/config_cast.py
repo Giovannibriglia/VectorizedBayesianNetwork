@@ -138,4 +138,8 @@ CPD_SCHEMAS = {
         "max_points": int,
         "min_scale": float,
     },
+    "linear_gaussian": {
+        "ridge": float,
+        "min_scale": float,
+    },
 }
