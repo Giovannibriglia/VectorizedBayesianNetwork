@@ -170,6 +170,15 @@ def _read_jsonl(path: Path, max_records: int | None = None) -> list[dict]:
     return records
 
 
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _get_by_path(obj: Any, path: str) -> Any:
     current = obj
     for part in path.split("."):
@@ -454,9 +463,13 @@ def _compute_graph_stats(run_dir: Path) -> dict[str, dict[str, int]]:
             mb = parent_set | child_set | spouses
             mb_sizes[node] = len(mb)
             parent_sizes[node] = len(parent_set)
+        n_nodes = len(parents_map)
+        n_edges = sum(len(parents) for parents in parents_map.values())
         stats[problem_id] = {
             "mb_sizes": mb_sizes,
             "parent_sizes": parent_sizes,
+            "n_nodes": n_nodes,
+            "n_edges": n_edges,
         }
     return stats
 
@@ -496,6 +509,29 @@ def _build_records(
                 model_name = model_meta.get("name") or "unknown"
                 config_id = model_meta.get("config_id")
                 config_hash = model_meta.get("config_hash")
+                components = (
+                    model_meta.get("components")
+                    if isinstance(model_meta.get("components"), dict)
+                    else {}
+                )
+                cpd_meta = (
+                    components.get("cpd")
+                    if isinstance(components.get("cpd"), dict)
+                    else {}
+                )
+                inference_meta = (
+                    components.get("inference")
+                    if isinstance(components.get("inference"), dict)
+                    else {}
+                )
+                learning_meta = (
+                    components.get("learning")
+                    if isinstance(components.get("learning"), dict)
+                    else {}
+                )
+                cpd_name = cpd_meta.get("name")
+                inference_name = inference_meta.get("name")
+                learning_name = learning_meta.get("name")
                 if model_filter:
                     key = f"{model_name}/{config_id or config_hash or 'unknown'}"
                     if (
@@ -574,6 +610,21 @@ def _build_records(
                 task = query.get("task")
                 skeleton_id = evidence.get("skeleton_id") or query.get("skeleton_id")
 
+                problem_meta = (
+                    record.get("problem")
+                    if isinstance(record.get("problem"), dict)
+                    else {}
+                )
+                n_nodes = _coerce_int(problem_meta.get("n_nodes"))
+                n_edges = _coerce_int(problem_meta.get("n_edges"))
+                if problem_id and (n_nodes is None or n_edges is None):
+                    node_stats = graph_stats.get(problem_id)
+                    if node_stats:
+                        if n_nodes is None:
+                            n_nodes = node_stats.get("n_nodes")
+                        if n_edges is None:
+                            n_edges = node_stats.get("n_edges")
+
                 mb_size = None
                 parent_size = None
                 if problem_id and target:
@@ -582,12 +633,25 @@ def _build_records(
                         mb_size = node_stats.get("mb_sizes", {}).get(target)
                         parent_size = node_stats.get("parent_sizes", {}).get(target)
 
+                run_meta = (
+                    record.get("run") if isinstance(record.get("run"), dict) else {}
+                )
+                run_id = run_meta.get("run_id")
+                run_seed = _coerce_int(run_meta.get("seed"))
+                run_generator = run_meta.get("generator")
+                run_timestamp = run_meta.get("timestamp_utc")
+
                 rows.append(
                     {
                         "model_name": model_name,
                         "config_id": config_id,
                         "config_hash": config_hash,
+                        "cpd_name": cpd_name,
+                        "inference_name": inference_name,
+                        "learning_name": learning_name,
                         "problem_id": problem_id,
+                        "n_nodes": n_nodes,
+                        "n_edges": n_edges,
                         "query_type": query_type,
                         "target": target,
                         "target_category": target_category,
@@ -598,6 +662,10 @@ def _build_records(
                         "skeleton_id": skeleton_id,
                         "mb_size": mb_size,
                         "parent_size": parent_size,
+                        "run_id": run_id,
+                        "seed": run_seed,
+                        "generator": run_generator,
+                        "timestamp_utc": run_timestamp,
                         "kl": kl,
                         "wass": wass,
                         "time": time_ms,
@@ -1000,6 +1068,46 @@ def main() -> None:
     tables: list[Path] = []
     figures: list[Path] = []
 
+    flat = df.copy()
+    if "problem_id" in flat.columns:
+        flat["network_name"] = flat["problem_id"]
+    else:
+        flat["network_name"] = None
+    flat_cols = [
+        "network_name",
+        "problem_id",
+        "n_nodes",
+        "n_edges",
+        "model_name",
+        "config_id",
+        "config_hash",
+        "method_id",
+        "cpd_name",
+        "inference_name",
+        "learning_name",
+        "query_type",
+        "run_id",
+        "seed",
+        "generator",
+        "timestamp_utc",
+        "kl",
+        "wass",
+        "time",
+        "target",
+        "target_category",
+        "evidence_strategy",
+        "evidence_mode",
+        "evidence_size",
+        "task",
+        "skeleton_id",
+        "mb_size",
+        "parent_size",
+    ]
+    flat = flat[[col for col in flat_cols if col in flat.columns]]
+    path = tables_dir / "flat_results.csv"
+    _write_table(flat, path)
+    tables.append(path)
+
     overall = aggregate_table(
         df,
         ["method_id", "model_name", "config_id", "config_hash", "query_type"],
@@ -1067,9 +1175,29 @@ def main() -> None:
     _write_table(cpd_parent, path)
     tables.append(path)
 
+    cpd_nodes = _two_stage_aggregate(cpd, "n_nodes", metric_cols)
+    path = tables_dir / "cpd_by_n_nodes.csv"
+    _write_table(cpd_nodes, path)
+    tables.append(path)
+
+    cpd_edges = _two_stage_aggregate(cpd, "n_edges", metric_cols)
+    path = tables_dir / "cpd_by_n_edges.csv"
+    _write_table(cpd_edges, path)
+    tables.append(path)
+
     inf_ev_size = _two_stage_aggregate(inference, "evidence_size", metric_cols)
     path = tables_dir / "inference_by_evidence_size.csv"
     _write_table(inf_ev_size, path)
+    tables.append(path)
+
+    inf_nodes = _two_stage_aggregate(inference, "n_nodes", metric_cols)
+    path = tables_dir / "inference_by_n_nodes.csv"
+    _write_table(inf_nodes, path)
+    tables.append(path)
+
+    inf_edges = _two_stage_aggregate(inference, "n_edges", metric_cols)
+    path = tables_dir / "inference_by_n_edges.csv"
+    _write_table(inf_edges, path)
     tables.append(path)
 
     inf_ev_size_mode = _two_stage_aggregate(
@@ -1122,6 +1250,18 @@ def main() -> None:
         tables.append(path)
         time_tables["cpd_parent"] = cpd_time_parent
 
+        cpd_time_nodes = _two_stage_aggregate(cpd, "n_nodes", ["time"])
+        path = tables_dir / "cpd_time_by_n_nodes.csv"
+        _write_table(cpd_time_nodes, path)
+        tables.append(path)
+        time_tables["cpd_nodes"] = cpd_time_nodes
+
+        cpd_time_edges = _two_stage_aggregate(cpd, "n_edges", ["time"])
+        path = tables_dir / "cpd_time_by_n_edges.csv"
+        _write_table(cpd_time_edges, path)
+        tables.append(path)
+        time_tables["cpd_edges"] = cpd_time_edges
+
         cpd_time_ev_size = _two_stage_aggregate(cpd, "evidence_size", ["time"])
         path = tables_dir / "cpd_time_by_evidence_size.csv"
         _write_table(cpd_time_ev_size, path)
@@ -1160,6 +1300,18 @@ def main() -> None:
         _write_table(inf_time_ev_size, path)
         tables.append(path)
         time_tables["inf_ev_size"] = inf_time_ev_size
+
+        inf_time_nodes = _two_stage_aggregate(inference, "n_nodes", ["time"])
+        path = tables_dir / "inference_time_by_n_nodes.csv"
+        _write_table(inf_time_nodes, path)
+        tables.append(path)
+        time_tables["inf_nodes"] = inf_time_nodes
+
+        inf_time_edges = _two_stage_aggregate(inference, "n_edges", ["time"])
+        path = tables_dir / "inference_time_by_n_edges.csv"
+        _write_table(inf_time_edges, path)
+        tables.append(path)
+        time_tables["inf_edges"] = inf_time_edges
 
     if not inference.empty:
         skeleton = aggregate_table(
@@ -1216,6 +1368,87 @@ def main() -> None:
         out_dir=figures_dir,
         title_prefix="CPD Wasserstein vs Parent Set Size",
         filename_prefix="cpd_wass_vs_parent_size",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        cpd_nodes,
+        size_col="n_nodes",
+        metric="kl",
+        out_dir=figures_dir,
+        title_prefix="CPD KL vs #Nodes",
+        filename_prefix="cpd_kl_vs_n_nodes",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        cpd_nodes,
+        size_col="n_nodes",
+        metric="wass",
+        out_dir=figures_dir,
+        title_prefix="CPD Wasserstein vs #Nodes",
+        filename_prefix="cpd_wass_vs_n_nodes",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        cpd_edges,
+        size_col="n_edges",
+        metric="kl",
+        out_dir=figures_dir,
+        title_prefix="CPD KL vs #Edges",
+        filename_prefix="cpd_kl_vs_n_edges",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        cpd_edges,
+        size_col="n_edges",
+        metric="wass",
+        out_dir=figures_dir,
+        title_prefix="CPD Wasserstein vs #Edges",
+        filename_prefix="cpd_wass_vs_n_edges",
+    )
+    if fig:
+        figures.append(fig)
+
+    fig = _plot_error_vs_size(
+        inf_nodes,
+        size_col="n_nodes",
+        metric="kl",
+        out_dir=figures_dir,
+        title_prefix="Inference KL vs #Nodes",
+        filename_prefix="inference_kl_vs_n_nodes",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        inf_nodes,
+        size_col="n_nodes",
+        metric="wass",
+        out_dir=figures_dir,
+        title_prefix="Inference Wasserstein vs #Nodes",
+        filename_prefix="inference_wass_vs_n_nodes",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        inf_edges,
+        size_col="n_edges",
+        metric="kl",
+        out_dir=figures_dir,
+        title_prefix="Inference KL vs #Edges",
+        filename_prefix="inference_kl_vs_n_edges",
+    )
+    if fig:
+        figures.append(fig)
+    fig = _plot_error_vs_size(
+        inf_edges,
+        size_col="n_edges",
+        metric="wass",
+        out_dir=figures_dir,
+        title_prefix="Inference Wasserstein vs #Edges",
+        filename_prefix="inference_wass_vs_n_edges",
     )
     if fig:
         figures.append(fig)
@@ -1332,6 +1565,26 @@ def main() -> None:
         if fig:
             figures.append(fig)
         fig = _plot_error_vs_size(
+            time_tables.get("cpd_nodes", pd.DataFrame()),
+            size_col="n_nodes",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="CPD Time vs #Nodes",
+            filename_prefix="cpd_time_vs_n_nodes",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
+            time_tables.get("cpd_edges", pd.DataFrame()),
+            size_col="n_edges",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="CPD Time vs #Edges",
+            filename_prefix="cpd_time_vs_n_edges",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
             time_tables.get("cpd_ev_size", pd.DataFrame()),
             size_col="evidence_size",
             metric="time",
@@ -1348,6 +1601,26 @@ def main() -> None:
             out_dir=figures_dir,
             title_prefix="Inference Time vs Evidence Size",
             filename_prefix="inference_time_vs_evidence_size",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
+            time_tables.get("inf_nodes", pd.DataFrame()),
+            size_col="n_nodes",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="Inference Time vs #Nodes",
+            filename_prefix="inference_time_vs_n_nodes",
+        )
+        if fig:
+            figures.append(fig)
+        fig = _plot_error_vs_size(
+            time_tables.get("inf_edges", pd.DataFrame()),
+            size_col="n_edges",
+            metric="time",
+            out_dir=figures_dir,
+            title_prefix="Inference Time vs #Edges",
+            filename_prefix="inference_time_vs_n_edges",
         )
         if fig:
             figures.append(fig)
