@@ -350,10 +350,32 @@ class BaseBenchmarkRunner(ABC):
         run_id = run_dir.name
         timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_path = run_dir / "logs" / "run.log"
-        handler = logging.FileHandler(log_path)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
         root_logger = logging.getLogger()
-        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+        for handler in list(root_logger.handlers):
+            root_logger.removeHandler(handler)
+
+        fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(fmt)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(fmt)
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(console_handler)
+
+        def _flush_logs() -> None:
+            for handler in root_logger.handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+
+        self.logger = logging.getLogger(f"benchmark.{self.generator}")
+        self.logger.info("Logging to %s", log_path)
+        _flush_logs()
 
         self.logger.info("Benchmark output: %s", run_dir)
         problem_dirs = self.list_problem_dirs()
@@ -401,270 +423,405 @@ class BaseBenchmarkRunner(ABC):
                 "inference": _StreamingStats(),
             }
 
-        for idx, dataset_dir in enumerate(problem_dirs, start=1):
-            load_result = self.load_problem_assets(dataset_dir)
-            problem = load_result.problem
-            if load_result.skipped or load_result.assets is None:
-                for model_name in self.models:
-                    model_stats[model_name]["problems"]["skipped"] += 1
+        try:
+            for idx, dataset_dir in enumerate(problem_dirs, start=1):
+                load_result = self.load_problem_assets(dataset_dir)
+                problem = load_result.problem
+                if load_result.skipped or load_result.assets is None:
+                    for model_name in self.models:
+                        model_stats[model_name]["problems"]["skipped"] += 1
+                    self.logger.info(
+                        "Skipping problem %s (%s/%s): %s",
+                        problem,
+                        idx,
+                        len(problem_dirs),
+                        load_result.reason,
+                    )
+                    _flush_logs()
+                    continue
+
+                assets = load_result.assets
+                dag = assets.dag
+                n_nodes = int(dag.number_of_nodes())
+                n_edges = int(dag.number_of_edges())
+                cpd_queries = assets.queries.get("cpd_queries", [])
+                inf_queries = assets.queries.get("inference_queries", [])
+                gt_meta = assets.queries.get("ground_truth")
+                if isinstance(gt_meta, dict):
+                    ground_truth_sources[problem] = dict(gt_meta)
                 self.logger.info(
-                    "Skipping problem %s (%s/%s): %s",
+                    "Starting problem %s (%s/%s)",
                     problem,
                     idx,
                     len(problem_dirs),
-                    load_result.reason,
                 )
-                continue
+                self.logger.info("DAG size: |V|=%s |E|=%s", n_nodes, n_edges)
+                self.logger.info("Data shape: %s", assets.data_df.shape)
+                self.logger.info("#CPD queries: %s", len(cpd_queries))
+                self.logger.info("#Inference queries: %s", len(inf_queries))
+                _flush_logs()
 
-            assets = load_result.assets
-            dag = assets.dag
-            n_nodes = int(dag.number_of_nodes())
-            n_edges = int(dag.number_of_edges())
-            cpd_queries = assets.queries.get("cpd_queries", [])
-            inf_queries = assets.queries.get("inference_queries", [])
-            gt_meta = assets.queries.get("ground_truth")
-            if isinstance(gt_meta, dict):
-                ground_truth_sources[problem] = dict(gt_meta)
-            self.logger.info(
-                "Starting problem %s (%s/%s)",
-                problem,
-                idx,
-                len(problem_dirs),
-            )
-            self.logger.info("DAG size: |V|=%s |E|=%s", n_nodes, n_edges)
-            self.logger.info("Data shape: %s", assets.data_df.shape)
-            self.logger.info("#CPD queries: %s", len(cpd_queries))
-            self.logger.info("#Inference queries: %s", len(inf_queries))
+                for model_name in self.models:
+                    model_start = time.perf_counter()
+                    ok_cpd = 0
+                    err_cpd = 0
+                    ok_inf = 0
+                    err_inf = 0
+                    cpd_err_logged = 0
+                    inf_err_logged = 0
+                    max_logged_query_errors = 5
+                    cpd_timing_sum = 0.0
+                    inf_timing_sum = 0.0
+
+                    try:
+                        base_model = self._base_model_name(model_name)
+                        model_cls = get_benchmark_model(base_model)
+                        model_config = model_configs[model_name]
+                        model_config_hash = model_config_hashes[model_name]
+                        model = model_cls(
+                            dag=assets.dag,
+                            seed=self.seed,
+                            domain=assets.domain,
+                            benchmark_config=model_config,
+                            **self.model_kwargs,
+                        )
+                        self.logger.info(
+                            "[%s] Model init ok. benchmark_config=%s",
+                            model_name,
+                            getattr(model, "benchmark_config", None),
+                        )
+                        self.logger.info(
+                            "[%s] Debug=%s",
+                            model_name,
+                            getattr(model, "_debug", None),
+                        )
+                    except Exception as exc:
+                        reason = f"Model init failed: {type(exc).__name__}: {exc}"
+                        self.logger.info("[%s] %s", model_name, reason)
+                        model_stats[model_name]["problems"]["error"] += 1
+                        _flush_logs()
+                        continue
+
+                    try:
+                        self.logger.info("[%s] Fit start", model_name)
+                        _flush_logs()
+                        _, fit_ms = timed_call(
+                            model.fit, assets.data_df, progress=self.progress
+                        )
+                        self.logger.info("[%s] Fit done in %.3f ms", model_name, fit_ms)
+                        _flush_logs()
+                    except Exception as exc:
+                        self.logger.exception(
+                            "[%s] Fit failed for problem=%s",
+                            model_name,
+                            problem,
+                        )
+                        reason = f"Fit failed: {type(exc).__name__}: {exc}"
+                        self.logger.info("[%s] %s", model_name, reason)
+                        model_stats[model_name]["problems"]["error"] += 1
+                        model_files[model_name]["cpd"].flush()
+                        model_files[model_name]["inf"].flush()
+                        _flush_logs()
+                        continue
+
+                    run_meta = {
+                        "generator": self.generator,
+                        "seed": int(self.seed),
+                        "timestamp_utc": timestamp_utc,
+                        "run_id": run_id,
+                        "progress": bool(self.progress),
+                    }
+                    model_meta = self._model_info(
+                        model, config=model_config, config_hash_value=model_config_hash
+                    )
+                    problem_meta = self._problem_info(problem, assets.dag)
+
+                    self.logger.info(
+                        "[%s] CPD start: n=%s", model_name, len(cpd_queries)
+                    )
+                    _flush_logs()
+                    cpd_desc = f"{self.generator}/{problem} | {model_name} | CPD"
+                    cpd_bar = (
+                        tqdm(cpd_queries, desc=cpd_desc, leave=False)
+                        if self.progress
+                        else None
+                    )
+                    cpd_iter = cpd_bar if cpd_bar is not None else cpd_queries
+                    for q_index, query in enumerate(cpd_iter):
+                        start = time.perf_counter()
+                        response = {}
+                        try:
+                            response = model.answer_cpd_query(query)
+                            response = dict(response or {})
+                            ok = bool(response.get("ok"))
+                            error_msg = response.get("error")
+                            error_type = None if not error_msg else "ModelError"
+                            output = self._normalize_output(response.get("result"))
+                        except Exception as exc:
+                            if cpd_err_logged < max_logged_query_errors:
+                                self.logger.exception(
+                                    "[%s] CPD query error problem=%s idx=%s target=%s evidence_vars=%s",
+                                    model_name,
+                                    problem,
+                                    q_index,
+                                    query.get("target"),
+                                    (query.get("evidence") or {}).get("vars")
+                                    or query.get("evidence_vars"),
+                                )
+                                cpd_err_logged += 1
+                            ok = False
+                            error_type = type(exc).__name__
+                            error_msg = str(exc)
+                            output = None
+                        if (
+                            not ok
+                            and error_msg
+                            and cpd_err_logged < max_logged_query_errors
+                        ):
+                            debug_payload = None
+                            if isinstance(response, dict):
+                                debug_payload = (
+                                    response.get("result", {}) if response else None
+                                )
+                            if (
+                                isinstance(debug_payload, dict)
+                                and "debug" in debug_payload
+                            ):
+                                self.logger.error(
+                                    "[%s] CPD debug payload: %s",
+                                    model_name,
+                                    debug_payload.get("debug"),
+                                )
+                                cpd_err_logged += 1
+                        elapsed = (time.perf_counter() - start) * 1000.0
+                        cpd_timing_sum += elapsed
+                        if ok:
+                            ok_cpd += 1
+                        else:
+                            err_cpd += 1
+                        model_stats[model_name]["_timing"]["cpd"].add(float(elapsed))
+
+                        record = {
+                            "run": run_meta,
+                            "model": model_meta,
+                            "problem": problem_meta,
+                            "query": self._compact_query(
+                                query, "cpd", q_index, problem
+                            ),
+                            "result": {
+                                "ok": bool(ok),
+                                "error_type": error_type,
+                                "error_msg": error_msg,
+                                "timing_ms": float(elapsed),
+                                "output": output,
+                            },
+                        }
+                        model_files[model_name]["cpd"].write(
+                            json.dumps(record, sort_keys=True) + "\n"
+                        )
+                        model_files[model_name]["cpd"].flush()
+
+                        avg_ms = cpd_timing_sum / max(1, ok_cpd + err_cpd)
+                        if cpd_bar is not None:
+                            cpd_bar.set_postfix(
+                                ok=ok_cpd, err=err_cpd, avg=f"{avg_ms:.2f}"
+                            )
+                        if not ok and error_msg:
+                            message = (
+                                f"{self.generator}/{problem} [{model_name}] CPD query "
+                                f"{q_index} error: {error_type}: {error_msg}"
+                            )
+                            if cpd_bar is not None:
+                                tqdm.write(message)
+                            else:
+                                self.logger.warning(message)
+                    if cpd_bar is not None:
+                        cpd_bar.close()
+                    self.logger.info(
+                        "[%s] CPDs done: ok=%s err=%s avg=%.2fms",
+                        model_name,
+                        ok_cpd,
+                        err_cpd,
+                        cpd_timing_sum / max(1, ok_cpd + err_cpd),
+                    )
+                    _flush_logs()
+
+                    inf_desc = f"{self.generator}/{problem} | {model_name} | Inference"
+                    self.logger.info(
+                        "[%s] Inference start: n=%s", model_name, len(inf_queries)
+                    )
+                    _flush_logs()
+                    inf_bar = (
+                        tqdm(inf_queries, desc=inf_desc, leave=False)
+                        if self.progress
+                        else None
+                    )
+                    inf_iter = inf_bar if inf_bar is not None else inf_queries
+                    for q_index, query in enumerate(inf_iter):
+                        start = time.perf_counter()
+                        response = {}
+                        try:
+                            response = model.answer_inference_query(query)
+                            response = dict(response or {})
+                            ok = bool(response.get("ok"))
+                            error_msg = response.get("error")
+                            error_type = None if not error_msg else "ModelError"
+                            output = self._normalize_output(response.get("result"))
+                        except Exception as exc:
+                            if inf_err_logged < max_logged_query_errors:
+                                self.logger.exception(
+                                    "[%s] Inference query error problem=%s idx=%s target=%s evidence_vars=%s",
+                                    model_name,
+                                    problem,
+                                    q_index,
+                                    query.get("target"),
+                                    (query.get("evidence") or {}).get("vars")
+                                    or query.get("evidence_vars"),
+                                )
+                                inf_err_logged += 1
+                            ok = False
+                            error_type = type(exc).__name__
+                            error_msg = str(exc)
+                            output = None
+                        if (
+                            not ok
+                            and error_msg
+                            and inf_err_logged < max_logged_query_errors
+                        ):
+                            debug_payload = None
+                            if isinstance(response, dict):
+                                debug_payload = (
+                                    response.get("result", {}) if response else None
+                                )
+                            if (
+                                isinstance(debug_payload, dict)
+                                and "debug" in debug_payload
+                            ):
+                                self.logger.error(
+                                    "[%s] Inference debug payload: %s",
+                                    model_name,
+                                    debug_payload.get("debug"),
+                                )
+                                inf_err_logged += 1
+                        elapsed = (time.perf_counter() - start) * 1000.0
+                        inf_timing_sum += elapsed
+                        if ok:
+                            ok_inf += 1
+                        else:
+                            err_inf += 1
+                        model_stats[model_name]["_timing"]["inference"].add(
+                            float(elapsed)
+                        )
+
+                        record = {
+                            "run": run_meta,
+                            "model": model_meta,
+                            "problem": problem_meta,
+                            "query": self._compact_query(
+                                query, "inference", q_index, problem
+                            ),
+                            "result": {
+                                "ok": bool(ok),
+                                "error_type": error_type,
+                                "error_msg": error_msg,
+                                "timing_ms": float(elapsed),
+                                "output": output,
+                            },
+                        }
+                        model_files[model_name]["inf"].write(
+                            json.dumps(record, sort_keys=True) + "\n"
+                        )
+                        model_files[model_name]["inf"].flush()
+
+                        avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
+                        if inf_bar is not None:
+                            inf_bar.set_postfix(
+                                ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}"
+                            )
+                        if not ok and error_msg:
+                            message = (
+                                f"{self.generator}/{problem} [{model_name}] Inference query "
+                                f"{q_index} error: {error_type}: {error_msg}"
+                            )
+                            if inf_bar is not None:
+                                tqdm.write(message)
+                            else:
+                                self.logger.warning(message)
+                    if inf_bar is not None:
+                        inf_bar.close()
+                    self.logger.info(
+                        "[%s] Inference done: ok=%s err=%s avg=%.2fms",
+                        model_name,
+                        ok_inf,
+                        err_inf,
+                        inf_timing_sum / max(1, ok_inf + err_inf),
+                    )
+                    _flush_logs()
+
+                    total_ms = (time.perf_counter() - model_start) * 1000.0
+                    model_stats[model_name]["problems"]["ok"] += 1
+                    model_stats[model_name]["queries"]["cpd"]["ok"] += ok_cpd
+                    model_stats[model_name]["queries"]["cpd"]["error"] += err_cpd
+                    model_stats[model_name]["queries"]["inference"]["ok"] += ok_inf
+                    model_stats[model_name]["queries"]["inference"]["error"] += err_inf
+                    model_stats[model_name]["timing_ms"]["per_problem"][problem] = (
+                        float(total_ms)
+                    )
+
+                    model_files[model_name]["cpd"].flush()
+                    model_files[model_name]["inf"].flush()
+
+                del assets
+                gc.collect()
 
             for model_name in self.models:
-                model_start = time.perf_counter()
-                ok_cpd = 0
-                err_cpd = 0
-                ok_inf = 0
-                err_inf = 0
-                cpd_timing_sum = 0.0
-                inf_timing_sum = 0.0
-
-                try:
-                    base_model = self._base_model_name(model_name)
-                    model_cls = get_benchmark_model(base_model)
-                    model_config = model_configs[model_name]
-                    model_config_hash = model_config_hashes[model_name]
-                    model = model_cls(
-                        dag=assets.dag,
-                        seed=self.seed,
-                        domain=assets.domain,
-                        benchmark_config=model_config,
-                        **self.model_kwargs,
-                    )
-                except Exception as exc:
-                    reason = f"Model init failed: {type(exc).__name__}: {exc}"
-                    self.logger.info("[%s] %s", model_name, reason)
-                    model_stats[model_name]["problems"]["error"] += 1
-                    continue
-
-                try:
-                    self.logger.info("[%s] Fit start", model_name)
-                    _, fit_ms = timed_call(
-                        model.fit, assets.data_df, progress=self.progress
-                    )
-                    self.logger.info("[%s] Fit done in %.3f ms", model_name, fit_ms)
-                except Exception as exc:
-                    reason = f"Fit failed: {type(exc).__name__}: {exc}"
-                    self.logger.info("[%s] %s", model_name, reason)
-                    model_stats[model_name]["problems"]["error"] += 1
-                    continue
-
-                run_meta = {
-                    "generator": self.generator,
-                    "seed": int(self.seed),
-                    "timestamp_utc": timestamp_utc,
-                    "run_id": run_id,
-                    "progress": bool(self.progress),
-                }
-                model_meta = self._model_info(
-                    model, config=model_config, config_hash_value=model_config_hash
-                )
-                problem_meta = self._problem_info(problem, assets.dag)
-
-                cpd_desc = f"{self.generator}/{problem} | {model_name} | CPD"
-                cpd_bar = (
-                    tqdm(cpd_queries, desc=cpd_desc, leave=False)
-                    if self.progress
-                    else None
-                )
-                cpd_iter = cpd_bar if cpd_bar is not None else cpd_queries
-                for q_index, query in enumerate(cpd_iter):
-                    start = time.perf_counter()
-                    try:
-                        response = model.answer_cpd_query(query)
-                        response = dict(response or {})
-                        ok = bool(response.get("ok"))
-                        error_msg = response.get("error")
-                        error_type = None if not error_msg else "ModelError"
-                        output = self._normalize_output(response.get("result"))
-                    except Exception as exc:
-                        ok = False
-                        error_type = type(exc).__name__
-                        error_msg = str(exc)
-                        output = None
-                    elapsed = (time.perf_counter() - start) * 1000.0
-                    cpd_timing_sum += elapsed
-                    if ok:
-                        ok_cpd += 1
-                    else:
-                        err_cpd += 1
-                    model_stats[model_name]["_timing"]["cpd"].add(float(elapsed))
-
-                    record = {
-                        "run": run_meta,
-                        "model": model_meta,
-                        "problem": problem_meta,
-                        "query": self._compact_query(query, "cpd", q_index, problem),
-                        "result": {
-                            "ok": bool(ok),
-                            "error_type": error_type,
-                            "error_msg": error_msg,
-                            "timing_ms": float(elapsed),
-                            "output": output,
-                        },
+                model_files[model_name]["cpd"].close()
+                model_files[model_name]["inf"].close()
+                stats = model_stats[model_name]
+                timing = stats.pop("_timing")
+                cpd_summary = timing["cpd"].summary()
+                inf_summary = timing["inference"].summary()
+                stats["queries"]["cpd"].update(
+                    {
+                        "avg_ms": cpd_summary["avg_ms"],
+                        "median_ms": cpd_summary["median_ms"],
                     }
-                    model_files[model_name]["cpd"].write(
-                        json.dumps(record, sort_keys=True) + "\n"
-                    )
-
-                    avg_ms = cpd_timing_sum / max(1, ok_cpd + err_cpd)
-                    if cpd_bar is not None:
-                        cpd_bar.set_postfix(ok=ok_cpd, err=err_cpd, avg=f"{avg_ms:.2f}")
-                    if not ok and error_msg:
-                        message = (
-                            f"{self.generator}/{problem} [{model_name}] CPD query "
-                            f"{q_index} error: {error_type}: {error_msg}"
-                        )
-                        if cpd_bar is not None:
-                            tqdm.write(message)
-                        else:
-                            self.logger.warning(message)
-                if cpd_bar is not None:
-                    cpd_bar.close()
-
-                inf_desc = f"{self.generator}/{problem} | {model_name} | Inference"
-                inf_bar = (
-                    tqdm(inf_queries, desc=inf_desc, leave=False)
-                    if self.progress
-                    else None
                 )
-                inf_iter = inf_bar if inf_bar is not None else inf_queries
-                for q_index, query in enumerate(inf_iter):
-                    start = time.perf_counter()
-                    try:
-                        response = model.answer_inference_query(query)
-                        response = dict(response or {})
-                        ok = bool(response.get("ok"))
-                        error_msg = response.get("error")
-                        error_type = None if not error_msg else "ModelError"
-                        output = self._normalize_output(response.get("result"))
-                    except Exception as exc:
-                        ok = False
-                        error_type = type(exc).__name__
-                        error_msg = str(exc)
-                        output = None
-                    elapsed = (time.perf_counter() - start) * 1000.0
-                    inf_timing_sum += elapsed
-                    if ok:
-                        ok_inf += 1
-                    else:
-                        err_inf += 1
-                    model_stats[model_name]["_timing"]["inference"].add(float(elapsed))
-
-                    record = {
-                        "run": run_meta,
-                        "model": model_meta,
-                        "problem": problem_meta,
-                        "query": self._compact_query(
-                            query, "inference", q_index, problem
-                        ),
-                        "result": {
-                            "ok": bool(ok),
-                            "error_type": error_type,
-                            "error_msg": error_msg,
-                            "timing_ms": float(elapsed),
-                            "output": output,
-                        },
+                stats["queries"]["inference"].update(
+                    {
+                        "avg_ms": inf_summary["avg_ms"],
+                        "median_ms": inf_summary["median_ms"],
                     }
-                    model_files[model_name]["inf"].write(
-                        json.dumps(record, sort_keys=True) + "\n"
-                    )
-
-                    avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
-                    if inf_bar is not None:
-                        inf_bar.set_postfix(ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}")
-                    if not ok and error_msg:
-                        message = (
-                            f"{self.generator}/{problem} [{model_name}] Inference query "
-                            f"{q_index} error: {error_type}: {error_msg}"
-                        )
-                        if inf_bar is not None:
-                            tqdm.write(message)
-                        else:
-                            self.logger.warning(message)
-                if inf_bar is not None:
-                    inf_bar.close()
-
-                total_ms = (time.perf_counter() - model_start) * 1000.0
-                model_stats[model_name]["problems"]["ok"] += 1
-                model_stats[model_name]["queries"]["cpd"]["ok"] += ok_cpd
-                model_stats[model_name]["queries"]["cpd"]["error"] += err_cpd
-                model_stats[model_name]["queries"]["inference"]["ok"] += ok_inf
-                model_stats[model_name]["queries"]["inference"]["error"] += err_inf
-                model_stats[model_name]["timing_ms"]["per_problem"][problem] = float(
-                    total_ms
                 )
-
-                self.logger.info(
-                    "[%s] CPDs done: ok=%s err=%s avg=%.2fms",
-                    model_name,
-                    ok_cpd,
-                    err_cpd,
-                    cpd_timing_sum / max(1, ok_cpd + err_cpd),
+                stats["timing_ms"]["total_ms"] = float(
+                    sum(stats["timing_ms"]["per_problem"].values())
+                    if stats["timing_ms"]["per_problem"]
+                    else 0.0
                 )
-                self.logger.info(
-                    "[%s] Inference done: ok=%s err=%s avg=%.2fms",
-                    model_name,
-                    ok_inf,
-                    err_inf,
-                    inf_timing_sum / max(1, ok_inf + err_inf),
-                )
-                model_files[model_name]["cpd"].flush()
-                model_files[model_name]["inf"].flush()
+                summary["models"][model_name] = stats
 
-            del assets
-            gc.collect()
+            if ground_truth_sources:
+                summary["ground_truth"] = ground_truth_sources
+                write_json(run_dir / "ground_truth_sources.json", ground_truth_sources)
 
-        for model_name in self.models:
-            model_files[model_name]["cpd"].close()
-            model_files[model_name]["inf"].close()
-            stats = model_stats[model_name]
-            timing = stats.pop("_timing")
-            cpd_summary = timing["cpd"].summary()
-            inf_summary = timing["inference"].summary()
-            stats["queries"]["cpd"].update(
-                {"avg_ms": cpd_summary["avg_ms"], "median_ms": cpd_summary["median_ms"]}
-            )
-            stats["queries"]["inference"].update(
-                {"avg_ms": inf_summary["avg_ms"], "median_ms": inf_summary["median_ms"]}
-            )
-            stats["timing_ms"]["total_ms"] = float(
-                sum(stats["timing_ms"]["per_problem"].values())
-                if stats["timing_ms"]["per_problem"]
-                else 0.0
-            )
-            summary["models"][model_name] = stats
-
-        if ground_truth_sources:
-            summary["ground_truth"] = ground_truth_sources
-            write_json(run_dir / "ground_truth_sources.json", ground_truth_sources)
-
-        summary_path = run_dir / "summary.json"
-        write_json(summary_path, summary)
-        return run_dir
+            summary_path = run_dir / "summary.json"
+            write_json(summary_path, summary)
+            return run_dir
+        finally:
+            for model_name, files in model_files.items():
+                for handle in files.values():
+                    try:
+                        handle.flush()
+                        handle.close()
+                    except Exception:
+                        pass
+            for handler in list(root_logger.handlers):
+                try:
+                    handler.flush()
+                    handler.close()
+                except Exception:
+                    pass
+                try:
+                    root_logger.removeHandler(handler)
+                except Exception:
+                    pass

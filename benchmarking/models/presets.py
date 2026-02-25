@@ -8,13 +8,6 @@ from .config import ComponentSpec, make_component, ModelBenchmarkConfig
 def _vbn_presets() -> Dict[str, ModelBenchmarkConfig]:
     model = "vbn"
     presets = {
-        "default": ModelBenchmarkConfig(
-            model=model,
-            config_id="default",
-            learning=make_component("learning", "node_wise"),
-            cpd=make_component("cpd", "softmax_nn"),
-            inference=make_component("inference", "importance_sampling"),
-        ),
         "vbn_softmax_is": ModelBenchmarkConfig(
             model=model,
             config_id="vbn_softmax_is",
@@ -50,25 +43,6 @@ def _vbn_presets() -> Dict[str, ModelBenchmarkConfig]:
 def pgmpy_presets() -> Dict[str, ModelBenchmarkConfig]:
     model = "pgmpy"
     return {
-        "default": ModelBenchmarkConfig(
-            model=model,
-            config_id="default",
-            learning=ComponentSpec(
-                name="mle",
-                key="learn:mle",
-                kwargs={},
-            ),
-            cpd=ComponentSpec(
-                name="tabular_mle",
-                key="cpd:tabular_mle",
-                kwargs={},
-            ),
-            inference=ComponentSpec(
-                name="exact_variable_elimination",
-                key="inf:exact_ve",
-                kwargs={},
-            ),
-        ),
         "pgmpy_mle_ei": ModelBenchmarkConfig(
             model=model,
             config_id="pgmpy_mle_ei",

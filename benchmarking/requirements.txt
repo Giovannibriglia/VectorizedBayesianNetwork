@@ -4,3 +4,4 @@ numpy
 fastparquet
 pyarrow
 scipy
+pgmpy
