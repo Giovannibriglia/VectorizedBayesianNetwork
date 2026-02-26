@@ -48,13 +48,17 @@ Vectorized Bayesian Networks is a **continuous-first**, **torch-native** Bayesia
 - `replay_buffer`
 
 ## Planned Methods
-- Causal inference: instrumental variables, counterfactuals, soft- and back-door adjustments
-- Amortized learning and inference
-- Temporal/Dynamic DAGs
-- Additional CPD families and inference backends
-- Saving to .onnx
-- Example of handling missing values
-- Example of prediction and diagnosis
+- [methods] Causal inference: instrumental variables, counterfactuals, soft- and back-door adjustments
+- [methods] Amortized learning and inference
+- [methods] Temporal/Dynamic DAGs
+- [methods] Additional CPD families and inference backends
+- [methods] Handling missing values in training data
+- [benchmarking] Introducing sensitive analysis on *n_queries*
+- [benchmarking] New generators (rl, cv, protein...)
+- [library] Saving to .onnx
+- [library] pip install
+- [library] installation with clone and with pip
+- [library] check dependencies between vbn and benchmarking
 
 ## Installation
 ```bash
