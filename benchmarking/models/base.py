@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 class BaseBenchmarkModel(ABC):
     name: str
+    supports_batched_inference_queries: bool = False
 
     def __init__(
         self,
@@ -43,6 +44,9 @@ class BaseBenchmarkModel(ABC):
     @abstractmethod
     def answer_inference_query(self, query: dict) -> dict:
         raise NotImplementedError
+
+    def answer_inference_queries(self, queries: list[dict]) -> list[dict]:
+        return [self.answer_inference_query(query) for query in queries]
 
     def supports(self) -> dict:
         return {

@@ -136,11 +136,31 @@ def _estimate_discrete_posterior(
     return _normalize_probs(hist)
 
 
+def _estimate_discrete_posterior_batch(
+    samples: torch.Tensor,
+    weights: torch.Tensor,
+    k: int,
+) -> list[list[float]]:
+    if samples.dim() == 3:
+        samples = samples[:, :, 0]
+    if samples.dim() != 2:
+        raise ValueError(f"Expected samples with 2D shape, got {tuple(samples.shape)}")
+    if weights.dim() != 2:
+        raise ValueError(f"Expected weights with 2D shape, got {tuple(weights.shape)}")
+    if samples.shape[0] != weights.shape[0]:
+        raise ValueError("Samples/weights batch size mismatch")
+    probs: list[list[float]] = []
+    for idx in range(samples.shape[0]):
+        probs.append(_estimate_discrete_posterior(samples[idx], weights[idx], k))
+    return probs
+
+
 @register_benchmark_model
 class VBNBenchmarkModel(BaseBenchmarkModel):
     name = "vbn"
     family = "neural_bn"
     version = _package_version()
+    supports_batched_inference_queries = True
 
     def __init__(
         self,
@@ -313,3 +333,82 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             result = None
         timing_ms = (time.perf_counter() - start) * 1000.0
         return {"ok": ok, "error": error, "timing_ms": timing_ms, "result": result}
+
+    def answer_inference_queries(self, queries: list[dict]) -> list[dict]:
+        if not queries:
+            return []
+        target = queries[0].get("target")
+        if not target:
+            raise ValueError("Missing target in query")
+        evidence_vars = None
+        for query in queries:
+            evidence = (
+                query.get("evidence") if isinstance(query.get("evidence"), dict) else {}
+            )
+            vars_list = evidence.get("vars") or query.get("evidence_vars") or []
+            if not isinstance(vars_list, list):
+                vars_list = list(vars_list) if vars_list is not None else []
+            if evidence_vars is None:
+                evidence_vars = list(vars_list)
+            elif list(vars_list) != list(evidence_vars):
+                raise ValueError("Inconsistent evidence vars in batch")
+        evidence_vars = evidence_vars or []
+
+        evidence_values: dict[str, list[float]] = {v: [] for v in evidence_vars}
+        for query in queries:
+            values = query.get("evidence_values")
+            if values is None:
+                evidence = query.get("evidence")
+                if isinstance(evidence, dict):
+                    values = evidence.get("values")
+            if values is None or not isinstance(values, dict):
+                raise ValueError("Missing evidence values in batch")
+            for var in evidence_vars:
+                if var not in values or values[var] is None:
+                    raise ValueError("Missing evidence value in batch")
+                evidence_values[var].append(values[var])
+
+        def _is_int_like(value: Any) -> bool:
+            return isinstance(value, (int, bool, np.integer))
+
+        batched_evidence: dict[str, torch.Tensor] = {}
+        for var in evidence_vars:
+            values_list = evidence_values[var]
+            dtype = (
+                torch.long
+                if values_list and all(_is_int_like(v) for v in values_list)
+                else torch.float32
+            )
+            batched_evidence[var] = torch.tensor(
+                values_list, dtype=dtype, device=self._vbn.device
+            )
+
+        n_samples = _get_n_mc(queries[0], default=200)
+        pdf, samples = self._vbn.infer_posterior(
+            {"target": target, "evidence": batched_evidence}, n_samples=int(n_samples)
+        )
+        meta = _domain_node(self.domain, target)
+        states = meta.get("states") or []
+        k = len(states)
+        if k == 0:
+            result = {
+                "format": "categorical_probs",
+                "probs": None,
+                "k": 0,
+                "support": [],
+            }
+            return [
+                {"ok": False, "error": "Empty target state space", "result": result}
+                for _ in queries
+            ]
+        probs_list = _estimate_discrete_posterior_batch(samples, pdf, k)
+        results = []
+        for probs in probs_list:
+            output = {
+                "format": "categorical_probs",
+                "probs": probs,
+                "k": k,
+                "support": list(range(k)),
+            }
+            results.append({"ok": True, "error": None, "result": output})
+        return results

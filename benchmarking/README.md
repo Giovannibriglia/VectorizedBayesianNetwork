@@ -308,55 +308,7 @@ See `benchmarking/scripts/05_report_results_readme.md` for full flag details and
 
 ---
 
-## Data Encoding (Preprocessing Helpers)
-
-The benchmarking package provides one-hot encoding helpers for datasets with non-numeric variables. Encoding metadata is stored under:
-
-```
-benchmarking/data/metadata/<generator>/<problem>/encoding.json
-```
-
-The helper functions live in `benchmarking/datasets.py` and expose:
-
-- `encode_dataframe(df)` for deterministic one-hot encoding.
-- `decode_assignment(encoded_assignment, encoding_meta)` to map back to original variables.
-- `lift_query(original_query, encoding_meta)` to map queries into encoded space.
-
-The encoding pipeline uses a stable category ordering (sorted labels) and a deterministic column naming scheme: `<var>__<category>`. Missing values are mapped to the `<NA>` category.
-
----
-
-## 5. Benchmark Setup (Coming Next)
-
-This stage will configure model combinations, generate queries, run inference and sampling, and define metrics. The goal is to make setup fully declarative so new models and datasets can be added without changing core benchmarking code.
-
----
-
-## 6. Running the Benchmark (Coming Next)
-
-Planned entry point:
-
-```bash
-python -m benchmarking.scripts.02_run_all
-```
-
-This stage will support batch execution, automatic model combinations, and fit caching to avoid repeated training on identical datasets.
-
----
-
-## 7. Summarizing Results (Coming Next)
-
-Planned entry point:
-
-```bash
-python -m benchmarking.scripts.03_summarize
-```
-
-This stage will produce tables and plots, and split results into learning, CPD, inference, and sampling performance categories.
-
----
-
-## 8. Current Benchmark Results
+## 6. Current Benchmark Results
 
 To be updated after the first full benchmark run.
 

@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, Iterator
 
 import pandas as pd
 from tqdm.auto import tqdm
@@ -39,6 +39,79 @@ class ProblemLoadResult:
     assets: ProblemAssets | None
     skipped: bool
     reason: str | None
+
+
+def _batch_group_key(
+    query: dict, default_dataset_id: str | None = None
+) -> tuple[str | None, str | None, str | None, str] | None:
+    if not isinstance(query, dict):
+        return None
+    evidence = query.get("evidence") if isinstance(query.get("evidence"), dict) else {}
+    skeleton_id = evidence.get("skeleton_id") or query.get("skeleton_id")
+    if not skeleton_id:
+        return None
+    dataset_id = query.get("dataset_id") or default_dataset_id
+    target = query.get("target")
+    task = query.get("task")
+    return (dataset_id, target, task, skeleton_id)
+
+
+def _iter_inference_batches(
+    queries: list[dict],
+    batch_size: int,
+    *,
+    default_dataset_id: str | None = None,
+) -> Iterator[list[tuple[int, dict]]]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if batch_size == 1:
+        for idx, query in enumerate(queries):
+            yield [(idx, query)]
+        return
+
+    current: list[tuple[int, dict]] = []
+    current_key: tuple[str | None, str | None, str | None, str] | None = None
+
+    def _flush_group(group: list[tuple[int, dict]]) -> Iterable[list[tuple[int, dict]]]:
+        for start in range(0, len(group), batch_size):
+            yield group[start : start + batch_size]
+
+    for idx, query in enumerate(queries):
+        key = _batch_group_key(query, default_dataset_id=default_dataset_id)
+        if key is None:
+            if current:
+                yield from _flush_group(current)
+                current = []
+                current_key = None
+            yield [(idx, query)]
+            continue
+        if current_key is None:
+            current_key = key
+        if key != current_key:
+            if current:
+                yield from _flush_group(current)
+            current = []
+            current_key = key
+        current.append((idx, query))
+
+    if current:
+        yield from _flush_group(current)
+
+
+def _should_use_batched_inference(model: Any, batch_size: int, chunk_size: int) -> bool:
+    return (
+        batch_size > 1
+        and chunk_size > 1
+        and bool(getattr(model, "supports_batched_inference_queries", False))
+    )
+
+
+def _execute_inference_chunk(
+    model: Any, queries: list[dict], *, batch_size: int
+) -> list[dict]:
+    if _should_use_batched_inference(model, batch_size, len(queries)):
+        return list(model.answer_inference_queries(queries))
+    return [model.answer_inference_query(query) for query in queries]
 
 
 class _P2Quantile:
@@ -162,6 +235,7 @@ class BaseBenchmarkRunner(ABC):
         max_problems: int | None = None,
         store_full_query: bool = False,
         progress: bool = True,
+        batch_size_queries: int = 1,
     ) -> None:
         if not getattr(self, "generator", None):
             raise ValueError("Benchmark runner must define 'generator'.")
@@ -181,6 +255,9 @@ class BaseBenchmarkRunner(ABC):
         self.max_problems = max_problems
         self.store_full_query = bool(store_full_query)
         self.progress = bool(progress)
+        self.batch_size_queries = int(batch_size_queries)
+        if self.batch_size_queries < 1:
+            raise ValueError("batch_size_queries must be >= 1")
         self.logger = logging.getLogger(__name__)
 
     @abstractmethod
@@ -711,101 +788,304 @@ class BaseBenchmarkRunner(ABC):
                     )
                     _flush_logs()
                     inf_bar = (
-                        tqdm(inf_queries, desc=inf_desc, leave=False)
+                        tqdm(total=len(inf_queries), desc=inf_desc, leave=False)
                         if self.progress
                         else None
                     )
-                    inf_iter = inf_bar if inf_bar is not None else inf_queries
-                    for q_index, query in enumerate(inf_iter):
-                        start = time.perf_counter()
-                        response = {}
-                        try:
-                            response = model.answer_inference_query(query)
-                            response = dict(response or {})
-                            ok = bool(response.get("ok"))
-                            error_msg = response.get("error")
-                            error_type = None if not error_msg else "ModelError"
-                            output = self._normalize_output(response.get("result"))
-                        except Exception as exc:
-                            if inf_err_logged < max_logged_query_errors:
-                                self.logger.exception(
-                                    "[%s] Inference query error problem=%s idx=%s target=%s evidence_vars=%s",
-                                    model_name,
-                                    problem,
-                                    q_index,
-                                    query.get("target"),
-                                    (query.get("evidence") or {}).get("vars")
-                                    or query.get("evidence_vars"),
+                    batch_size_queries = int(getattr(self, "batch_size_queries", 1))
+                    if batch_size_queries > 1:
+                        self.logger.info(
+                            "[%s] Inference batching: batch_size_queries=%s supported=%s",
+                            model_name,
+                            batch_size_queries,
+                            bool(
+                                getattr(
+                                    model, "supports_batched_inference_queries", False
                                 )
-                                inf_err_logged += 1
-                            ok = False
-                            error_type = type(exc).__name__
-                            error_msg = str(exc)
-                            output = None
-                        if (
-                            not ok
-                            and error_msg
-                            and inf_err_logged < max_logged_query_errors
-                        ):
-                            debug_payload = None
-                            if isinstance(response, dict):
-                                debug_payload = (
-                                    response.get("result", {}) if response else None
-                                )
-                            if (
-                                isinstance(debug_payload, dict)
-                                and "debug" in debug_payload
-                            ):
-                                self.logger.error(
-                                    "[%s] Inference debug payload: %s",
-                                    model_name,
-                                    debug_payload.get("debug"),
-                                )
-                                inf_err_logged += 1
-                        elapsed = (time.perf_counter() - start) * 1000.0
-                        inf_timing_sum += elapsed
-                        if ok:
-                            ok_inf += 1
-                        else:
-                            err_inf += 1
-                        model_stats[model_name]["_timing"]["inference"].add(
-                            float(elapsed)
-                        )
-
-                        record = {
-                            "run": run_meta,
-                            "model": model_meta,
-                            "problem": problem_meta,
-                            "query": self._compact_query(
-                                query, "inference", q_index, problem
                             ),
-                            "result": {
-                                "ok": bool(ok),
-                                "error_type": error_type,
-                                "error_msg": error_msg,
-                                "timing_ms": float(elapsed),
-                                "output": output,
-                            },
-                        }
-                        model_files[model_name]["inf"].write(
-                            json.dumps(record, sort_keys=True) + "\n"
                         )
-                        model_files[model_name]["inf"].flush()
-
-                        avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
-                        if inf_bar is not None:
-                            inf_bar.set_postfix(
-                                ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}"
-                            )
-                        if not ok and error_msg:
-                            message = (
-                                f"{self.generator}/{problem} [{model_name}] Inference query "
-                                f"{q_index} error: {error_type}: {error_msg}"
-                            )
-                            if inf_bar is not None:
-                                tqdm.write(message)
+                        _flush_logs()
+                    for chunk in _iter_inference_batches(
+                        inf_queries,
+                        batch_size_queries,
+                        default_dataset_id=problem,
+                    ):
+                        if not chunk:
+                            continue
+                        batch_queries = [query for _, query in chunk]
+                        use_batch = _should_use_batched_inference(
+                            model, batch_size_queries, len(batch_queries)
+                        )
+                        if use_batch:
+                            start = time.perf_counter()
+                            responses: list[dict] | None = None
+                            batch_error: Exception | None = None
+                            try:
+                                responses = _execute_inference_chunk(
+                                    model,
+                                    batch_queries,
+                                    batch_size=batch_size_queries,
+                                )
+                                if len(responses) != len(batch_queries):
+                                    raise ValueError(
+                                        "Batched inference returned unexpected response count"
+                                    )
+                            except Exception as exc:
+                                batch_error = exc
+                                responses = None
+                            elapsed = (time.perf_counter() - start) * 1000.0
+                            per_query_ms = elapsed / max(1, len(batch_queries))
+                            if batch_error is not None:
+                                if inf_err_logged < max_logged_query_errors:
+                                    self.logger.exception(
+                                        "[%s] Inference batch error problem=%s target=%s batch_size=%s",
+                                        model_name,
+                                        problem,
+                                        (
+                                            batch_queries[0].get("target")
+                                            if batch_queries
+                                            else None
+                                        ),
+                                        len(batch_queries),
+                                    )
+                                    inf_err_logged += 1
+                                for q_index, query in chunk:
+                                    error_type = type(batch_error).__name__
+                                    error_msg = str(batch_error)
+                                    ok = False
+                                    output = None
+                                    inf_timing_sum += per_query_ms
+                                    err_inf += 1
+                                    model_stats[model_name]["_timing"]["inference"].add(
+                                        float(per_query_ms)
+                                    )
+                                    skeleton_id = (query.get("evidence") or {}).get(
+                                        "skeleton_id"
+                                    ) or query.get("skeleton_id")
+                                    record = {
+                                        "run": run_meta,
+                                        "model": model_meta,
+                                        "problem": problem_meta,
+                                        "query": self._compact_query(
+                                            query, "inference", q_index, problem
+                                        ),
+                                        "result": {
+                                            "ok": bool(ok),
+                                            "error_type": error_type,
+                                            "error_msg": error_msg,
+                                            "timing_ms": float(per_query_ms),
+                                            "output": output,
+                                        },
+                                        "batching": {
+                                            "enabled": True,
+                                            "batch_size": int(len(batch_queries)),
+                                            "skeleton_id": skeleton_id,
+                                        },
+                                    }
+                                    model_files[model_name]["inf"].write(
+                                        json.dumps(record, sort_keys=True) + "\n"
+                                    )
+                                    model_files[model_name]["inf"].flush()
+                                    if not ok and error_msg:
+                                        message = (
+                                            f"{self.generator}/{problem} [{model_name}] Inference query "
+                                            f"{q_index} error: {error_type}: {error_msg}"
+                                        )
+                                        if inf_bar is not None:
+                                            tqdm.write(message)
+                                        else:
+                                            self.logger.warning(message)
                             else:
-                                self.logger.warning(message)
+                                for (q_index, query), response in zip(
+                                    chunk, responses or []
+                                ):
+                                    if isinstance(response, dict):
+                                        response = dict(response or {})
+                                    else:
+                                        response = {}
+                                    ok = bool(response.get("ok"))
+                                    error_msg = response.get("error")
+                                    error_type = None if not error_msg else "ModelError"
+                                    output = self._normalize_output(
+                                        response.get("result")
+                                    )
+                                    if (
+                                        not ok
+                                        and error_msg
+                                        and inf_err_logged < max_logged_query_errors
+                                    ):
+                                        debug_payload = None
+                                        if isinstance(response, dict):
+                                            debug_payload = (
+                                                response.get("result", {})
+                                                if response
+                                                else None
+                                            )
+                                        if (
+                                            isinstance(debug_payload, dict)
+                                            and "debug" in debug_payload
+                                        ):
+                                            self.logger.error(
+                                                "[%s] Inference debug payload: %s",
+                                                model_name,
+                                                debug_payload.get("debug"),
+                                            )
+                                            inf_err_logged += 1
+                                    inf_timing_sum += per_query_ms
+                                    if ok:
+                                        ok_inf += 1
+                                    else:
+                                        err_inf += 1
+                                    model_stats[model_name]["_timing"]["inference"].add(
+                                        float(per_query_ms)
+                                    )
+
+                                    skeleton_id = (query.get("evidence") or {}).get(
+                                        "skeleton_id"
+                                    ) or query.get("skeleton_id")
+                                    record = {
+                                        "run": run_meta,
+                                        "model": model_meta,
+                                        "problem": problem_meta,
+                                        "query": self._compact_query(
+                                            query, "inference", q_index, problem
+                                        ),
+                                        "result": {
+                                            "ok": bool(ok),
+                                            "error_type": error_type,
+                                            "error_msg": error_msg,
+                                            "timing_ms": float(per_query_ms),
+                                            "output": output,
+                                        },
+                                        "batching": {
+                                            "enabled": True,
+                                            "batch_size": int(len(batch_queries)),
+                                            "skeleton_id": skeleton_id,
+                                        },
+                                    }
+                                    model_files[model_name]["inf"].write(
+                                        json.dumps(record, sort_keys=True) + "\n"
+                                    )
+                                    model_files[model_name]["inf"].flush()
+                                    if not ok and error_msg:
+                                        message = (
+                                            f"{self.generator}/{problem} [{model_name}] Inference query "
+                                            f"{q_index} error: {error_type}: {error_msg}"
+                                        )
+                                        if inf_bar is not None:
+                                            tqdm.write(message)
+                                        else:
+                                            self.logger.warning(message)
+                            avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
+                            if inf_bar is not None:
+                                inf_bar.update(len(chunk))
+                                inf_bar.set_postfix(
+                                    ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}"
+                                )
+                        else:
+                            for q_index, query in chunk:
+                                start = time.perf_counter()
+                                response = {}
+                                try:
+                                    response = model.answer_inference_query(query)
+                                    response = dict(response or {})
+                                    ok = bool(response.get("ok"))
+                                    error_msg = response.get("error")
+                                    error_type = None if not error_msg else "ModelError"
+                                    output = self._normalize_output(
+                                        response.get("result")
+                                    )
+                                except Exception as exc:
+                                    if inf_err_logged < max_logged_query_errors:
+                                        self.logger.exception(
+                                            "[%s] Inference query error problem=%s idx=%s target=%s evidence_vars=%s",
+                                            model_name,
+                                            problem,
+                                            q_index,
+                                            query.get("target"),
+                                            (query.get("evidence") or {}).get("vars")
+                                            or query.get("evidence_vars"),
+                                        )
+                                        inf_err_logged += 1
+                                    ok = False
+                                    error_type = type(exc).__name__
+                                    error_msg = str(exc)
+                                    output = None
+                                if (
+                                    not ok
+                                    and error_msg
+                                    and inf_err_logged < max_logged_query_errors
+                                ):
+                                    debug_payload = None
+                                    if isinstance(response, dict):
+                                        debug_payload = (
+                                            response.get("result", {})
+                                            if response
+                                            else None
+                                        )
+                                    if (
+                                        isinstance(debug_payload, dict)
+                                        and "debug" in debug_payload
+                                    ):
+                                        self.logger.error(
+                                            "[%s] Inference debug payload: %s",
+                                            model_name,
+                                            debug_payload.get("debug"),
+                                        )
+                                        inf_err_logged += 1
+                                elapsed = (time.perf_counter() - start) * 1000.0
+                                inf_timing_sum += elapsed
+                                if ok:
+                                    ok_inf += 1
+                                else:
+                                    err_inf += 1
+                                model_stats[model_name]["_timing"]["inference"].add(
+                                    float(elapsed)
+                                )
+
+                                skeleton_id = (query.get("evidence") or {}).get(
+                                    "skeleton_id"
+                                ) or query.get("skeleton_id")
+                                record = {
+                                    "run": run_meta,
+                                    "model": model_meta,
+                                    "problem": problem_meta,
+                                    "query": self._compact_query(
+                                        query, "inference", q_index, problem
+                                    ),
+                                    "result": {
+                                        "ok": bool(ok),
+                                        "error_type": error_type,
+                                        "error_msg": error_msg,
+                                        "timing_ms": float(elapsed),
+                                        "output": output,
+                                    },
+                                    "batching": {
+                                        "enabled": False,
+                                        "batch_size": 1,
+                                        "skeleton_id": skeleton_id,
+                                    },
+                                }
+                                model_files[model_name]["inf"].write(
+                                    json.dumps(record, sort_keys=True) + "\n"
+                                )
+                                model_files[model_name]["inf"].flush()
+
+                                avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
+                                if inf_bar is not None:
+                                    inf_bar.update(1)
+                                    inf_bar.set_postfix(
+                                        ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}"
+                                    )
+                                if not ok and error_msg:
+                                    message = (
+                                        f"{self.generator}/{problem} [{model_name}] Inference query "
+                                        f"{q_index} error: {error_type}: {error_msg}"
+                                    )
+                                    if inf_bar is not None:
+                                        tqdm.write(message)
+                                    else:
+                                        self.logger.warning(message)
                     if inf_bar is not None:
                         inf_bar.close()
                     self.logger.info(

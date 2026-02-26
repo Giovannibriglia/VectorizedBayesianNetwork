@@ -74,6 +74,8 @@ RECORD_COLUMNS = [
     "kl",
     "wass",
     "time",
+    "batch_enabled",
+    "batch_size",
 ]
 
 
@@ -391,6 +393,55 @@ def aggregate_time_table(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
+def aggregate_batching_table(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    columns = list(group_cols) + [
+        "n_queries",
+        "fraction_batched",
+        "avg_batch_size",
+        "time_sum_ms",
+        "time_per_query_ms",
+        "throughput_qps",
+    ]
+    if df.empty or "batch_enabled" not in df.columns:
+        return pd.DataFrame(columns=columns)
+    if df["batch_enabled"].dropna().empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    grouped = df.groupby(group_cols, dropna=False)
+    for keys, group in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {col: val for col, val in zip(group_cols, keys)}
+        n_queries = int(len(group))
+        batch_flags = group["batch_enabled"].fillna(False).astype(bool)
+        n_batched = int(batch_flags.sum())
+        row["n_queries"] = n_queries
+        row["fraction_batched"] = (
+            float(n_batched / n_queries) if n_queries > 0 else None
+        )
+        batch_sizes = [
+            float(v)
+            for v in group["batch_size"].tolist()
+            if v is not None and math.isfinite(float(v))
+        ]
+        row["avg_batch_size"] = float(np.mean(batch_sizes)) if batch_sizes else None
+        times = [
+            float(v)
+            for v in group["time"].tolist()
+            if v is not None and math.isfinite(float(v))
+        ]
+        time_sum_ms = float(sum(times)) if times else 0.0
+        row["time_sum_ms"] = time_sum_ms
+        row["time_per_query_ms"] = (
+            float(time_sum_ms / n_queries) if n_queries > 0 else None
+        )
+        row["throughput_qps"] = (
+            float(n_queries / (time_sum_ms / 1000.0)) if time_sum_ms > 0 else None
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _safe_tag(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
 
@@ -654,6 +705,17 @@ def _build_records(
                 evidence_size = len(ev_vars)
                 task = query.get("task")
                 skeleton_id = evidence.get("skeleton_id") or query.get("skeleton_id")
+                batching = (
+                    record.get("batching")
+                    if isinstance(record.get("batching"), dict)
+                    else {}
+                )
+                batch_enabled = None
+                batch_size = None
+                if isinstance(batching, dict) and batching:
+                    if "enabled" in batching:
+                        batch_enabled = bool(batching.get("enabled"))
+                    batch_size = _coerce_int(batching.get("batch_size"))
 
                 problem_meta = (
                     record.get("problem")
@@ -714,6 +776,8 @@ def _build_records(
                         "kl": kl,
                         "wass": wass,
                         "time": time_ms,
+                        "batch_enabled": batch_enabled,
+                        "batch_size": batch_size,
                     }
                 )
     df = pd.DataFrame(rows)
@@ -1190,6 +1254,8 @@ def main() -> None:
         "kl",
         "wass",
         "time",
+        "batch_enabled",
+        "batch_size",
         "target",
         "target_category",
         "evidence_strategy",
@@ -1261,6 +1327,15 @@ def main() -> None:
     path = tables_dir / "inference_by_evidence_mode.csv"
     _write_table(inf_by_mode, path)
     tables.append(path)
+
+    batching_metrics = aggregate_batching_table(
+        inference,
+        ["method_id", "model_name", "config_id", "config_hash"],
+    )
+    if not batching_metrics.empty:
+        path = tables_dir / "inference_batching_metrics.csv"
+        _write_table(batching_metrics, path)
+        tables.append(path)
 
     cpd_mb = _two_stage_aggregate(cpd, "mb_size", metric_cols)
     path = tables_dir / "cpd_by_mb_size.csv"

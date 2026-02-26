@@ -1,2 +1,2 @@
 name: monte_carlo_marginalization
-n_samples: 200
+n_samples: 512

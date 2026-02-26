@@ -134,6 +134,12 @@ def main() -> None:
     )
     parser.add_argument("--max_problems", type=int, default=None)
     parser.add_argument(
+        "--batch_size_queries",
+        type=int,
+        default=1,
+        help="Max number of inference queries to batch together (default: 1 = no batching)",
+    )
+    parser.add_argument(
         "--store_full_query",
         action="store_true",
         help="Store full query payloads in JSONL outputs",
@@ -200,6 +206,7 @@ def main() -> None:
         max_problems=args.max_problems,
         store_full_query=args.store_full_query,
         progress=args.progress,
+        batch_size_queries=args.batch_size_queries,
     )
 
     out_dir = runner.run_all()
