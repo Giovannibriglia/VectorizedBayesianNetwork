@@ -24,6 +24,7 @@ class BaseQueryGenerator(ABC):
         self,
         root_path: Path,
         seed: int,
+        mode: str | None = None,
         n_queries: int | dict | None = None,
         n_queries_cpds: int | None = None,
         n_queries_inference: int | None = None,
@@ -34,6 +35,7 @@ class BaseQueryGenerator(ABC):
     ) -> None:
         self.root_path = Path(root_path).resolve()
         self.seed = int(seed)
+        self.mode = self._normalize_mode(mode)
         if not getattr(self, "name", None):
             raise ValueError("Query generator class must define a non-empty 'name'.")
 
@@ -45,6 +47,14 @@ class BaseQueryGenerator(ABC):
         )
         self.n_queries_cpds = cpds
         self.n_queries_inference = inference
+        if self.mode == "cpds" and self.n_queries_inference != 0:
+            raise ValueError(
+                "mode=cpds requires n_queries_inference=0 (set --n_queries_inference 0)."
+            )
+        if self.mode == "inference" and self.n_queries_cpds != 0:
+            raise ValueError(
+                "mode=inference requires n_queries_cpds=0 (set --n_queries_cpds 0)."
+            )
 
         self.generator_kwargs: dict = dict(generator_kwargs or {})
         for key, value in kwargs.items():
@@ -66,6 +76,17 @@ class BaseQueryGenerator(ABC):
         self.generator_log_dir = ensure_dir(
             get_generator_queries_log_dir(self.root_path, self.name)
         )
+
+    @staticmethod
+    def _normalize_mode(mode: str | None) -> str:
+        if mode is None:
+            return "both"
+        value = str(mode).strip().lower()
+        if value not in {"cpds", "inference", "both"}:
+            raise ValueError(
+                "mode must be one of {'cpds','inference','both'} " f"(got '{mode}')"
+            )
+        return value
 
     @staticmethod
     def _resolve_query_counts(
@@ -147,7 +168,17 @@ class BaseQueryGenerator(ABC):
         logger.addHandler(handler)
         return logger
 
-    def _output_path(self, dataset_id: str) -> Path:
+    def _queries_path(self, dataset_id: str, mode: str) -> Path:
+        dataset_dir = ensure_dir(self.queries_dir / dataset_id)
+        if mode == "cpds":
+            name = "cpds.jsonl"
+        elif mode == "inference":
+            name = "inference.jsonl"
+        else:
+            raise ValueError(f"Unsupported mode for queries path: {mode}")
+        return dataset_dir / name
+
+    def _metadata_path(self, dataset_id: str) -> Path:
         dataset_dir = ensure_dir(self.queries_dir / dataset_id)
         return dataset_dir / "queries.json"
 
@@ -206,11 +237,41 @@ class BaseQueryGenerator(ABC):
                     payload["ground_truth"]["status"] = str(gt_status)
                 if gt_reason:
                     payload["ground_truth"]["reason"] = str(gt_reason)
-            out_path = self._output_path(dataset_id)
-            write_json(out_path, payload)
-            logger.info("Wrote query payload to %s", out_path)
-            root_logger.info("Wrote query payload to %s", out_path)
-            outputs.append(out_path)
+            cpd_queries = list(payload.pop("cpd_queries", []) or [])
+            inf_queries = list(payload.pop("inference_queries", []) or [])
+
+            def _rel_path(path: Path) -> str:
+                try:
+                    return str(path.resolve().relative_to(self.root_path))
+                except Exception:
+                    return str(path)
+
+            queries_meta: dict[str, dict[str, object]] = {}
+            if self.mode in {"cpds", "both"}:
+                cpd_path = self._queries_path(dataset_id, "cpds")
+                self._write_jsonl(cpd_path, cpd_queries)
+                queries_meta["cpds"] = {
+                    "path": _rel_path(cpd_path),
+                    "count": len(cpd_queries),
+                }
+                logger.info("Wrote CPD queries to %s", cpd_path)
+                outputs.append(cpd_path)
+            if self.mode in {"inference", "both"}:
+                inf_path = self._queries_path(dataset_id, "inference")
+                self._write_jsonl(inf_path, inf_queries)
+                queries_meta["inference"] = {
+                    "path": _rel_path(inf_path),
+                    "count": len(inf_queries),
+                }
+                logger.info("Wrote inference queries to %s", inf_path)
+                outputs.append(inf_path)
+            if queries_meta:
+                payload["queries"] = queries_meta
+            meta_path = self._metadata_path(dataset_id)
+            write_json(meta_path, payload)
+            logger.info("Wrote query metadata to %s", meta_path)
+            root_logger.info("Wrote query metadata to %s", meta_path)
+            outputs.append(meta_path)
         return outputs
 
     @abstractmethod

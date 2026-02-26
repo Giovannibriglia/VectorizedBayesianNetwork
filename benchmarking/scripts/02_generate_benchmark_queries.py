@@ -42,6 +42,13 @@ def _parse_kv_pairs(pairs: list[str] | None) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--generator", type=str, required=True)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["cpds", "inference"],
+        help="Query generation mode: cpds or inference.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_queries_cpds", type=int)
     parser.add_argument("--n_queries_inference", type=int)
@@ -72,8 +79,18 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if args.n_queries_cpds is None or args.n_queries_inference is None:
-        parser.error("Provide both --n_queries_cpds and --n_queries_inference.")
+    if args.mode == "cpds":
+        if args.n_queries_cpds is None:
+            parser.error("--mode cpds requires --n_queries_cpds.")
+        if args.n_queries_inference not in (None, 0):
+            parser.error("--mode cpds requires --n_queries_inference=0 or unset.")
+        args.n_queries_inference = 0
+    elif args.mode == "inference":
+        if args.n_queries_inference is None:
+            parser.error("--mode inference requires --n_queries_inference.")
+        if args.n_queries_cpds not in (None, 0):
+            parser.error("--mode inference requires --n_queries_cpds=0 or unset.")
+        args.n_queries_cpds = 0
 
     project_root = get_project_root()
     logging.info("Benchmark root: %s", project_root)
@@ -91,6 +108,7 @@ def main() -> None:
     generator = generator_cls(
         root_path=project_root,
         seed=args.seed,
+        mode=args.mode,
         n_queries_cpds=args.n_queries_cpds,
         n_queries_inference=args.n_queries_inference,
         generator_kwargs=generator_kwargs,

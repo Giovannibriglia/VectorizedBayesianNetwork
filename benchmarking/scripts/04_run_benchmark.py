@@ -102,6 +102,13 @@ def main() -> None:
     parser.add_argument("--generator", type=str, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["cpds", "inference"],
+        help="Benchmark mode: cpds or inference.",
+    )
+    parser.add_argument(
         "--models",
         action="append",
         required=True,
@@ -184,6 +191,7 @@ def main() -> None:
     runner = runner_cls(
         root=project_root,
         seed=args.seed,
+        mode=args.mode,
         models=models,
         model_kwargs=model_kwargs,
         model_configs=model_configs,

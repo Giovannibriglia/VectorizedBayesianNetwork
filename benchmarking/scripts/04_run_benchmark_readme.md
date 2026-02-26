@@ -3,7 +3,7 @@
 This step executes the benchmark by fitting registered models on the learning datasets and running the query workloads. It connects the earlier pipeline stages:
 
 - `01_download_data`: downloads model artifacts (e.g., BIF) into `benchmarking/data/datasets/<generator>/<problem>/`.
-- `02_generate_benchmark_queries`: creates CPD and inference query payloads under `benchmarking/data/queries/<generator>/<problem>/queries.json`.
+- `02_generate_benchmark_queries`: creates CPD/inference query JSONL under `benchmarking/data/queries/<generator>/<problem>/cpds.jsonl` and `inference.jsonl` (metadata in `queries.json`).
 - `03_generate_data`: generates training datasets under `benchmarking/data/datasets/<generator>/<problem>/data_*.{parquet,csv,pkl}`.
 
 Step 04 orchestrates the full execution by combining data + queries + model implementations, producing benchmark outputs under `benchmarking/out/`.
@@ -30,7 +30,7 @@ This folder defines a minimal model API for benchmarking:
 - `registry.py`: model registry (`register_benchmark_model`, `get_benchmark_model`, `list_benchmark_models`).
 - `vbn.py`: VBN implementation of the base interface.
 - `config.py`: model benchmark config dataclasses (`ModelBenchmarkConfig`, `ComponentSpec`).
-- `presets.py`: default config presets per model (VBN presets included).
+- `presets.py`: YAML-backed preset loader and adapter layer.
 
 **Per-query timing** is mandatory. Each query result must include:
 
@@ -56,7 +56,7 @@ Runner layer loads assets and executes models:
 
 Responsibilities include:
 
-- Locating assets (DAG/BIF, `domain.json`, datasets, `queries.json`).
+- Locating assets (DAG/BIF, `domain.json`, datasets, `cpds.jsonl` / `inference.jsonl`).
 - Deterministic ordering of problems, models, and queries.
 - Recording per-query results and timings.
 - Writing outputs under `benchmarking/out/`.
@@ -70,6 +70,7 @@ Responsibilities include:
 python -m benchmarking.scripts.04_run_benchmark \
   --generator bnlearn \
   --seed 0 \
+  --mode cpds \
   --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
 ```
 
@@ -77,6 +78,7 @@ python -m benchmarking.scripts.04_run_benchmark \
 
 - `--generator` (required): dataset generator name (e.g., `bnlearn`).
 - `--seed` (required): seed used for deterministic dataset selection and model init.
+- `--mode` (required): `cpds` or `inference`.
 - `--models` (required): comma-separated or repeatable list of models.
   - Example: `--models vbn,pgmpy` or `--models vbn --models pgmpy`.
   - To run multiple configs for the same model in one run, use aliases:
@@ -95,6 +97,7 @@ python -m benchmarking.scripts.04_run_benchmark \
 python -m benchmarking.scripts.04_run_benchmark \
     --generator bnlearn \
     --seed 0 \
+    --mode inference \
     --models vbn \
     --config vbn_softmax_is \
     --config-overrides '{"vbn":{"inference":{"kwargs":{"n_particles":512}}}}'
@@ -106,6 +109,7 @@ python -m benchmarking.scripts.04_run_benchmark \
 python -m benchmarking.scripts.04_run_benchmark \
     --generator bnlearn \
     --seed 0 \
+    --mode cpds \
     --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
 ```
 
@@ -133,9 +137,10 @@ Override rules:
 ## Output Structure
 
 ```
-benchmarking/out/<generator>/benchmark_<timestamp>/
+benchmarking/out/<generator>/benchmark_<mode>_<timestamp>/
   cpds/<model>.jsonl
   inference/<model>.jsonl
+  run_metadata.json
   configs/<model>.json
   ground_truth_sources.json
   summary.json

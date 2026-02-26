@@ -54,7 +54,7 @@ benchmarking/data/datasets/bnlearn/asia/
 Dataset IDs are the problem/network name (for bnlearn: `<network>`). The generator name is stored separately.
 
 Developer guide for adding new downloaders: `benchmarking/scripts/01_download_data_readme.md`.
-Query generation guide: `benchmarking/02_generate_benchmark_queries_readme.md`.
+Query generation guide: `benchmarking/scripts/02_generate_benchmark_queries_readme.md`.
 If you have legacy data folders named `<generator>__<problem>`, run `python -m benchmarking.migrate_data_layout`.
 
 **Currently supported datasets (bnlearn).**
@@ -76,24 +76,29 @@ If you have legacy data folders named `<generator>__<problem>`, run `python -m b
 ```bash
 python -m benchmarking.scripts.02_generate_benchmark_queries \
     --generator bnlearn \
+    --mode cpds \
     --seed 42 \
     --n_queries_cpds 64 \
-    --n_queries_inference 128 \
-    --generator-kwargs '{"n_mc": 32}'
+    --generator-kwargs '{"n_mc": 1}'
 ```
+
+For inference queries, switch to `--mode inference` and provide `--n_queries_inference`.
 
 **Where queries are stored.**
 
 ```
+benchmarking/data/queries/<generator>/<problem>/cpds.jsonl
+benchmarking/data/queries/<generator>/<problem>/inference.jsonl
 benchmarking/data/queries/<generator>/<problem>/queries.json
 benchmarking/data/queries/<generator>/<problem>/ground_truth.jsonl
 benchmarking/data/queries/log/<generator>/<problem>_seed<seed>.log
 benchmarking/data/metadata/<generator>/<problem>/domain.json
 ```
 
-Ground truth distributions are computed during query generation (pgmpy exact inference) and stored once per dataset in `ground_truth.jsonl`. The `queries.json` payload records a pointer under `ground_truth.path` along with a status/reason if GT could not be computed.
+Ground truth distributions are computed during query generation (pgmpy exact inference) and stored once per dataset in `ground_truth.jsonl`. The `queries.json` metadata records a pointer under `ground_truth.path` along with a status/reason if GT could not be computed.
+The full query sets are stored in `cpds.jsonl` / `inference.jsonl`.
 
-**Query JSON schema (stable).**
+**Query metadata JSON schema.**
 
 ```
 {
@@ -104,21 +109,19 @@ Ground truth distributions are computed during query generation (pgmpy exact inf
   "generator_kwargs": {"n_mc": 32},
   "n_queries": {"cpds": 64, "inference": 128},
   "n_skeletons": {"inference": 4},
-  "cpd_queries": [
-    {"query_type": "cpd", "target": "X", "evidence_vars": ["A", "B"]}
-  ],
-  "inference_queries": [
-    {
-      "query_type": "inference",
-      "task": "prediction",
-      "target": "Y",
-      "evidence": {"mode": "on_manifold", "vars": ["A"], "values": {"A": 0}},
-      "skeleton_id": "<sha256>",
-      "mc_id": 0
-    }
-  ],
+  "queries": {
+    "cpds": {"path": ".../cpds.jsonl", "count": 64},
+    "inference": {"path": ".../inference.jsonl", "count": 128}
+  },
   "coverage": {"cpds": {}, "inference": {}}
 }
+```
+
+**Query JSONL schema (per line).**
+
+```
+{"query_type": "cpd", "target": "X", "evidence_vars": ["A", "B"], "...": "..."}
+{"query_type": "inference", "task": "prediction", "target": "Y", "evidence": {"mode": "on_manifold", "vars": ["A"], "values": {"A": 0}}, "...": "..."}
 ```
 
 ---
@@ -132,9 +135,8 @@ Ground truth distributions are computed during query generation (pgmpy exact inf
 ```bash
 python -m benchmarking.scripts.03_generate_data \
     --generator bnlearn \
-    --n_samples 100000 \
+    --n_samples 10240 \
     --seed 0 \
-    --generation_strategy default
 ```
 
 **Where data is stored.**
@@ -162,13 +164,15 @@ Discrete variables are stored as integer codes. The mapping from state label to 
 python -m benchmarking.scripts.04_run_benchmark \
     --generator bnlearn \
     --seed 0 \
-    --models vbn
+    --mode cpds \
+    --models vbn:vbn_linear_gauss_is,pgmpy:pgmpy_mle_ei
 ```
 
 ### Parameters
 
 - `--generator` (required): dataset generator name (e.g., `bnlearn`).
 - `--seed` (required): seed used for dataset selection and model init.
+- `--mode` (required): `cpds` or `inference`.
 - `--models` (required): comma-separated or repeatable list of models.
   - Example: `--models vbn,pgmpy` or `--models vbn --models pgmpy`.
   - To run multiple configs for the same model in one run, use aliases:
@@ -182,12 +186,72 @@ python -m benchmarking.scripts.04_run_benchmark \
 - `--max_problems` (optional): limit number of problems (debugging).
 - `--store_full_query` (optional): store full query payloads in each JSONL record.
 
+**Preset YAMLs**
+
+Presets are defined in backend-specific YAML files:
+
+- `benchmarking/models/presets_vbn.yaml`
+- `benchmarking/models/presets_pgmpy.yaml`
+
+Minimal schemas:
+
+```yaml
+# pgmpy.yaml
+cpds:
+  <preset_name>:
+    cpds:
+      estimator: <string>
+      kwargs: {}
+inference:
+  <preset_name>:
+    cpds:
+      estimator: <string>
+      kwargs: {}
+    inference:
+      method: <string>
+      kwargs: {}
+```
+
+```yaml
+# vbn.yaml
+cpds:
+  <preset_name>:
+    learning:
+      method: <string>
+      kwargs: {}
+    cpds:
+      default:
+        method: <string>
+        kwargs: {}
+      per_node:
+        <node_name>:
+          method: <string>
+          kwargs: {}
+inference:
+  <preset_name>:
+    learning:
+      method: <string>
+      kwargs: {}
+    cpds:
+      default:
+        method: <string>
+        kwargs: {}
+      per_node:
+        <node_name>:
+          method: <string>
+          kwargs: {}
+    inference:
+      method: <string>
+      kwargs: {}
+```
+
 **Config example**
 
 ```bash
 python -m benchmarking.scripts.04_run_benchmark \
     --generator bnlearn \
     --seed 0 \
+    --mode inference \
     --models vbn \
     --config vbn_softmax_is \
     --config-overrides '{"vbn":{"inference":{"kwargs":{"n_particles":512}}}}'
@@ -199,15 +263,17 @@ python -m benchmarking.scripts.04_run_benchmark \
 python -m benchmarking.scripts.04_run_benchmark \
     --generator bnlearn \
     --seed 0 \
+    --mode cpds \
     --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
 ```
 
 **Where outputs are stored.**
 
 ```
-benchmarking/out/<generator>/benchmark_<timestamp>/
+benchmarking/out/<generator>/benchmark_<mode>_<timestamp>/
   cpds/<model>.jsonl
   inference/<model>.jsonl
+  run_metadata.json
   ground_truth_sources.json
   configs/<model>.json
   summary.json
@@ -324,6 +390,8 @@ benchmarking/data/
     <generator>/<problem>/...
     log/<generator>/<problem>_seed<seed>.log
   queries/
+    <generator>/<problem>/cpds.jsonl
+    <generator>/<problem>/inference.jsonl
     <generator>/<problem>/queries.json
     log/<generator>/<problem>_seed<seed>.log
   metadata/
@@ -331,7 +399,7 @@ benchmarking/data/
     <generator>/<problem>/domain.json
     <generator>/<problem>/data_generation.json
 benchmarking/out/
-  <generator>/benchmark_<timestamp>/...
+  <generator>/benchmark_<mode>_<timestamp>/...
 ```
 
 ---
@@ -345,7 +413,7 @@ Both query and data generation accept generator-specific keyword arguments:
 ```bash
 python -m benchmarking.scripts.02_generate_benchmark_queries \
     --generator bnlearn \
-    --n_queries_cpds 64 \
+    --mode inference \
     --n_queries_inference 128 \
     --seed 42 \
     --generator-kwargs '{"n_mc": 32}'

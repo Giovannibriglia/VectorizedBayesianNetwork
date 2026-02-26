@@ -153,6 +153,7 @@ class BaseBenchmarkRunner(ABC):
         *,
         root: Path,
         seed: int,
+        mode: str,
         models: list[str],
         model_kwargs: dict | None = None,
         model_configs: dict[str, str] | None = None,
@@ -166,6 +167,12 @@ class BaseBenchmarkRunner(ABC):
             raise ValueError("Benchmark runner must define 'generator'.")
         self.root = Path(root).resolve()
         self.seed = int(seed)
+        resolved_mode = str(mode).strip().lower()
+        if resolved_mode not in {"cpds", "inference"}:
+            raise ValueError(
+                "mode must be one of {'cpds','inference'} " f"(got '{mode}')"
+            )
+        self.mode = resolved_mode
         self.models = list(models)
         self.model_kwargs = dict(model_kwargs or {})
         self.model_configs = dict(model_configs or {})
@@ -184,20 +191,61 @@ class BaseBenchmarkRunner(ABC):
     def load_problem_assets(self, dataset_dir: Path) -> ProblemLoadResult:
         raise NotImplementedError
 
-    def _init_output_dir(self) -> Path:
+    def _init_output_dir(self) -> tuple[Path, str]:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_root = ensure_dir(get_generator_out_dir(self.root, self.generator))
-        run_dir = ensure_dir(out_root / f"benchmark_{timestamp}")
+        run_dir = ensure_dir(out_root / f"benchmark_{self.mode}_{timestamp}")
         ensure_dir(run_dir / "cpds")
         ensure_dir(run_dir / "inference")
         ensure_dir(run_dir / "logs")
         ensure_dir(run_dir / "configs")
-        return run_dir
+        return run_dir, timestamp
 
     def _hash_kwargs(self) -> str:
         payload = json.dumps(self.model_kwargs, sort_keys=True, default=str)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return f"sha256:{digest}"
+
+    def _write_run_metadata(
+        self,
+        run_dir: Path,
+        *,
+        timestamp: str,
+        datasets_run: list[str],
+    ) -> None:
+        backends: list[str] = []
+        preset_names: list[str] = []
+        model_entries: list[dict] = []
+        for model_name in self.models:
+            base_model = self._base_model_name(model_name)
+            config_id = self.model_configs.get(model_name, "default")
+            backends.append(base_model)
+            preset_names.append(config_id)
+            model_entries.append(
+                {
+                    "alias": model_name,
+                    "backend": base_model,
+                    "preset": config_id,
+                }
+            )
+
+        unique_backends = sorted(set(backends))
+        unique_presets = sorted(set(preset_names))
+        payload = {
+            "mode": self.mode,
+            "timestamp": timestamp,
+            "generator": self.generator,
+            "seed": int(self.seed),
+            "preset_backend": unique_backends[0] if unique_backends else None,
+            "preset_name": unique_presets[0] if unique_presets else None,
+            "datasets_run": list(datasets_run),
+            "models": model_entries,
+        }
+        if len(unique_backends) > 1:
+            payload["preset_backends"] = unique_backends
+        if len(unique_presets) > 1:
+            payload["preset_names"] = unique_presets
+        write_json(run_dir / "run_metadata.json", payload)
 
     def _safe_model_tag(self, name: str) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
@@ -246,7 +294,7 @@ class BaseBenchmarkRunner(ABC):
         for model_name in self.models:
             config_id = self.model_configs.get(model_name, "default")
             base_model = self._base_model_name(model_name)
-            base_config = get_preset_config(base_model, config_id)
+            base_config = get_preset_config(base_model, self.mode, config_id)
             base_overrides = self.config_overrides.get(base_model)
             alias_overrides = self.config_overrides.get(model_name)
             for label, overrides in (
@@ -338,7 +386,7 @@ class BaseBenchmarkRunner(ABC):
         return result
 
     def run_all(self) -> Path:
-        run_dir = self._init_output_dir()
+        run_dir, run_timestamp = self._init_output_dir()
         model_configs, model_config_hashes = self._resolve_model_configs()
         configs_dir = run_dir / "configs"
         for model_name, config in model_configs.items():
@@ -378,10 +426,16 @@ class BaseBenchmarkRunner(ABC):
         _flush_logs()
 
         self.logger.info("Benchmark output: %s", run_dir)
+        self.logger.info("Benchmark mode: %s", self.mode)
         problem_dirs = self.list_problem_dirs()
         if self.max_problems is not None:
             problem_dirs = problem_dirs[: int(self.max_problems)]
         total_problems = len(problem_dirs)
+        self._write_run_metadata(
+            run_dir,
+            timestamp=run_timestamp,
+            datasets_run=[p.name for p in problem_dirs],
+        )
         self.logger.info(
             "Run config: generator=%s seed=%s models=%s problems=%s",
             self.generator,
@@ -396,11 +450,14 @@ class BaseBenchmarkRunner(ABC):
             "seed": int(self.seed),
             "timestamp": timestamp_utc,
             "run_id": run_id,
+            "mode": self.mode,
             "progress": bool(self.progress),
             "models": {},
             "run": {"progress": bool(self.progress)},
         }
         ground_truth_sources: dict[str, dict] = {}
+        run_cpds = self.mode == "cpds"
+        run_inference = self.mode == "inference"
 
         for model_name in self.models:
             model_tag = self._safe_model_tag(model_name)
@@ -444,8 +501,10 @@ class BaseBenchmarkRunner(ABC):
                 dag = assets.dag
                 n_nodes = int(dag.number_of_nodes())
                 n_edges = int(dag.number_of_edges())
-                cpd_queries = assets.queries.get("cpd_queries", [])
-                inf_queries = assets.queries.get("inference_queries", [])
+                cpd_queries = assets.queries.get("cpd_queries", []) if run_cpds else []
+                inf_queries = (
+                    assets.queries.get("inference_queries", []) if run_inference else []
+                )
                 gt_meta = assets.queries.get("ground_truth")
                 if isinstance(gt_meta, dict):
                     ground_truth_sources[problem] = dict(gt_meta)

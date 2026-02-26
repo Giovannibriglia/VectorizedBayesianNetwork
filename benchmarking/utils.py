@@ -152,6 +152,24 @@ def write_json(path: Path, obj: Any, *, indent: int = 2) -> None:
     path.write_text(json.dumps(obj, indent=indent, sort_keys=True))
 
 
+def read_jsonl(path: Path) -> list[dict]:
+    records: list[dict] = []
+    if not path.exists():
+        return records
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
+
+
 # ----------------------------
 # DataFrame helpers
 # ----------------------------

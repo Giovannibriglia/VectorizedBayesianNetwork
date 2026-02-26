@@ -8,7 +8,7 @@ This step summarizes a completed benchmark run by joining predictions with groun
 
 ```bash
 python -m benchmarking.scripts.05_report_results \
-    --run_dir benchmarking/out/<generator>/benchmark_<timestamp>
+    --run_dir benchmarking/out/<generator>/benchmark_<mode>_<timestamp>
 ```
 
 ### Flags
@@ -37,6 +37,9 @@ python -m benchmarking.scripts.05_report_results \
   figures/
   report.md
 ```
+
+The reporter auto-detects the run mode (`cpds` or `inference`) from `run_metadata.json`
+or the run directory name, and will still emit placeholder tables for missing categories.
 
 ### Tables
 

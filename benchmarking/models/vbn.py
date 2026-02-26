@@ -79,17 +79,32 @@ def _normalize_probs(probs: Iterable[float]) -> list[float]:
     return (arr / total).tolist()
 
 
-def _build_nodes_cpds(domain: dict, cpd_name: str, cpd_kwargs: dict) -> dict:
+def _build_nodes_cpds(
+    domain: dict,
+    cpd_name: str,
+    cpd_kwargs: dict,
+    *,
+    per_node: dict | None = None,
+) -> dict:
     nodes_cpds: dict[str, dict] = {}
     nodes = domain.get("nodes", {}) if isinstance(domain, dict) else {}
+    per_node = per_node or {}
     for node, meta in nodes.items():
         node_type = meta.get("type")
         if node_type not in {"discrete", "continuous"}:
             continue
-        conf = {"cpd": cpd_name}
-        if cpd_kwargs:
-            conf.update(dict(cpd_kwargs))
-        if node_type == "discrete" and cpd_name == "softmax_nn":
+        node_override = per_node.get(node) if isinstance(per_node, dict) else None
+        if isinstance(node_override, dict):
+            method = node_override.get("method", cpd_name)
+            override_kwargs = dict(node_override.get("kwargs") or {})
+            kwargs = {**dict(cpd_kwargs or {}), **override_kwargs}
+        else:
+            method = cpd_name
+            kwargs = dict(cpd_kwargs or {})
+        conf = {"cpd": method}
+        if kwargs:
+            conf.update(kwargs)
+        if node_type == "discrete" and method == "softmax_nn":
             k = len(meta.get("states") or [])
             if k > 0:
                 conf["n_classes"] = k
@@ -151,10 +166,13 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             inference_kwargs = dict(benchmark_config.inference.kwargs)
             nodes_cpds = kwargs.get("nodes_cpds")
             if nodes_cpds is None:
+                cpd_kwargs = dict(benchmark_config.cpd.kwargs)
+                per_node = cpd_kwargs.pop("per_node", None)
                 nodes_cpds = _build_nodes_cpds(
                     domain,
                     benchmark_config.cpd.name,
-                    benchmark_config.cpd.kwargs,
+                    cpd_kwargs,
+                    per_node=per_node,
                 )
             self._vbn.set_learning_method(
                 learning_method, nodes_cpds=nodes_cpds, **learning_kwargs

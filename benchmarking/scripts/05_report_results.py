@@ -38,6 +38,43 @@ INF_TARGET_CATEGORIES = [
 ]
 INF_TASKS = ["prediction", "diagnosis"]
 INF_EVIDENCE_MODES = ["empty", "on_manifold", "off_manifold"]
+SUMMARY_KEYS = [
+    "n",
+    "iqm",
+    "iqr_std",
+    "q1",
+    "median",
+    "q3",
+    "iqm_pm_iqrstd",
+]
+RECORD_COLUMNS = [
+    "model_name",
+    "config_id",
+    "config_hash",
+    "cpd_name",
+    "inference_name",
+    "learning_name",
+    "problem_id",
+    "n_nodes",
+    "n_edges",
+    "query_type",
+    "target",
+    "target_category",
+    "evidence_strategy",
+    "evidence_mode",
+    "evidence_size",
+    "task",
+    "skeleton_id",
+    "mb_size",
+    "parent_size",
+    "run_id",
+    "seed",
+    "generator",
+    "timestamp_utc",
+    "kl",
+    "wass",
+    "time",
+]
 
 
 class GTComputer:
@@ -308,7 +345,11 @@ def aggregate_table(
 ) -> pd.DataFrame:
     rows = []
     if df.empty:
-        return pd.DataFrame()
+        columns: list[str] = list(group_cols)
+        for metric in metric_cols:
+            for key in SUMMARY_KEYS:
+                columns.append(f"{metric}_{key}")
+        return pd.DataFrame(columns=columns)
     grouped = df.groupby(group_cols, dropna=False)
     for keys, group in grouped:
         if not isinstance(keys, tuple):
@@ -325,7 +366,11 @@ def aggregate_table(
 
 def aggregate_time_table(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame()
+        columns: list[str] = list(group_cols)
+        for key in SUMMARY_KEYS:
+            columns.append(f"time_{key}")
+        columns.extend(["time_sum_ms", "time_sum_s"])
+        return pd.DataFrame(columns=columns)
     rows = []
     grouped = df.groupby(group_cols, dropna=False)
     for keys, group in grouped:
@@ -673,6 +718,7 @@ def _build_records(
                 )
     df = pd.DataFrame(rows)
     if df.empty:
+        df = pd.DataFrame(columns=[*RECORD_COLUMNS, "config_key", "method_id"])
         return df, errors
     df["config_key"] = df["config_id"].fillna(
         df["config_hash"].fillna("unknown").astype(str).str[:8]
@@ -683,7 +729,10 @@ def _build_records(
 
 def _write_table(df: pd.DataFrame, path: Path) -> None:
     if df.empty:
-        path.write_text("")
+        if list(df.columns):
+            df.to_csv(path, index=False)
+        else:
+            path.write_text("")
         return
     df = df.sort_values(list(df.columns))
     df.to_csv(path, index=False)
@@ -696,7 +745,20 @@ def _two_stage_aggregate(
     extra_group_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame()
+        stage2_group = [
+            "method_id",
+            "model_name",
+            "config_id",
+            "config_hash",
+            *(extra_group_cols or []),
+            x_col,
+        ]
+        columns: list[str] = list(stage2_group)
+        for metric in metric_cols:
+            for key in SUMMARY_KEYS:
+                columns.append(f"{metric}_{key}")
+        columns.append("dataset_n")
+        return pd.DataFrame(columns=columns)
     stage1_rows = []
     extra_group_cols = list(extra_group_cols or [])
     group_cols = [
@@ -718,7 +780,20 @@ def _two_stage_aggregate(
         stage1_rows.append(row)
     stage1 = pd.DataFrame(stage1_rows)
     if stage1.empty:
-        return pd.DataFrame()
+        stage2_group = [
+            "method_id",
+            "model_name",
+            "config_id",
+            "config_hash",
+            *extra_group_cols,
+            x_col,
+        ]
+        columns: list[str] = list(stage2_group)
+        for metric in metric_cols:
+            for key in SUMMARY_KEYS:
+                columns.append(f"{metric}_{key}")
+        columns.append("dataset_n")
+        return pd.DataFrame(columns=columns)
     stage2_group = [
         "method_id",
         "model_name",
@@ -979,6 +1054,25 @@ def _write_report_md(
     (out_dir / "report.md").write_text("\n".join(lines))
 
 
+def _detect_run_mode(run_dir: Path) -> str | None:
+    meta_path = run_dir / "run_metadata.json"
+    if meta_path.exists():
+        try:
+            payload = read_json(meta_path)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            mode = payload.get("mode")
+            if mode in {"cpds", "inference"}:
+                return mode
+    name = run_dir.name
+    if name.startswith("benchmark_cpds_"):
+        return "cpds"
+    if name.startswith("benchmark_inference_"):
+        return "inference"
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_dir", type=str, required=True)
@@ -1050,6 +1144,10 @@ def main() -> None:
     if args.models:
         model_filter = {m.strip() for m in args.models.split(",") if m.strip()}
 
+    run_mode = _detect_run_mode(run_dir)
+    if run_mode:
+        logging.info("Detected run mode: %s", run_mode)
+
     df, errors = _build_records(
         run_dir=run_dir,
         gt_source=args.gt_source,
@@ -1061,7 +1159,6 @@ def main() -> None:
 
     if df.empty:
         logging.warning("No records to report. Check GT source and inputs.")
-        return
 
     metric_cols = ["kl", "wass"]
 
@@ -1313,22 +1410,21 @@ def main() -> None:
         tables.append(path)
         time_tables["inf_edges"] = inf_time_edges
 
-    if not inference.empty:
-        skeleton = aggregate_table(
-            inference[inference["skeleton_id"].notna()],
-            [
-                "method_id",
-                "model_name",
-                "config_id",
-                "config_hash",
-                "problem_id",
-                "skeleton_id",
-            ],
-            metric_cols,
-        )
-        path = tables_dir / "inference_by_skeleton.csv"
-        _write_table(skeleton, path)
-        tables.append(path)
+    skeleton = aggregate_table(
+        inference[inference["skeleton_id"].notna()],
+        [
+            "method_id",
+            "model_name",
+            "config_id",
+            "config_hash",
+            "problem_id",
+            "skeleton_id",
+        ],
+        metric_cols,
+    )
+    path = tables_dir / "inference_by_skeleton.csv"
+    _write_table(skeleton, path)
+    tables.append(path)
 
     # Plots
     fig = _plot_error_vs_size(

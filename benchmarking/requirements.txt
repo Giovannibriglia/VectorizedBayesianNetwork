@@ -5,3 +5,4 @@ fastparquet
 pyarrow
 scipy
 pgmpy
+pyyaml

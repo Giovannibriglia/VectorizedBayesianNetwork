@@ -1,0 +1,42 @@
+cpds:
+  default:
+    cpds:
+      estimator: mle
+      kwargs: {}
+
+  pgmpy_mle:
+    cpds:
+      estimator: mle
+      kwargs: {}
+
+  pgmpy_bdeu:
+    cpds:
+      estimator: bdeu
+      kwargs:
+        equivalent_sample_size: 10
+
+inference:
+  default:
+    cpds:
+      estimator: mle
+      kwargs: {}
+    inference:
+      method: exact_variable_elimination
+      kwargs: {}
+
+  pgmpy_mle_ei:
+    cpds:
+      estimator: mle
+      kwargs: {}
+    inference:
+      method: exact_variable_elimination
+      kwargs: {}
+
+  pgmpy_bdeu_ei:
+    cpds:
+      estimator: bdeu
+      kwargs:
+        equivalent_sample_size: 10
+    inference:
+      method: exact_variable_elimination
+      kwargs: {}

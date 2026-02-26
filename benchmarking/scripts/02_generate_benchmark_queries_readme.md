@@ -22,6 +22,7 @@ Notes:
 
 - `benchmarking/data/` is generated locally and should not be committed.
 - Static metadata shipped with the repo lives under `benchmarking/metadata/`.
+- Query payloads are stored in `cpds.jsonl` / `inference.jsonl`; `queries.json` is metadata.
 
 ## 2) Query Generation Script and CLI
 
@@ -30,9 +31,9 @@ Entry point:
 ```bash
 python -m benchmarking.scripts.02_generate_benchmark_queries \
   --generator bnlearn \
+  --mode cpds \
   --seed 42 \
   --n_queries_cpds 64 \
-  --n_queries_inference 128 \
   --generator-kwargs '{"n_mc": 32}'
 ```
 
@@ -40,8 +41,9 @@ Required flags:
 
 - `--generator`
 - `--seed`
-- `--n_queries_cpds`
-- `--n_queries_inference`
+- `--mode` (`cpds` or `inference`)
+- `--n_queries_cpds` (required for `--mode cpds`)
+- `--n_queries_inference` (required for `--mode inference`)
 
 Generator kwargs:
 
@@ -108,7 +110,7 @@ During query generation, exact ground truth distributions are computed (pgmpy ex
 benchmarking/data/queries/<generator>/<problem>/ground_truth.jsonl
 ```
 
-The `queries.json` payload records a pointer under `ground_truth.path` so later stages can reuse the GT without copying.
+The `queries.json` metadata records a pointer under `ground_truth.path` so later stages can reuse the GT without copying.
 If pgmpy is unavailable, the ground-truth file is still created but may be empty and annotated with a status/reason in `queries.json`.
 
 ### bnlearn metadata
@@ -142,6 +144,8 @@ Generation is deterministic and reproducible given the same seed and downloaded 
 benchmarking/data/
   datasets/bnlearn/asia/model.bif
   metadata/bnlearn/asia/domain.json
+  queries/bnlearn/asia/cpds.jsonl
+  queries/bnlearn/asia/inference.jsonl
   queries/bnlearn/asia/queries.json
   queries/log/bnlearn/asia_seed0.log
 ```

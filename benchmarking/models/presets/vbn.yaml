@@ -1,0 +1,121 @@
+cpds:
+  default:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: softmax_nn
+        kwargs: {}
+
+  vbn_softmax:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: softmax_nn
+        kwargs: {}
+
+  vbn_gauss:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: gaussian_nn
+        kwargs: {}
+
+  vbn_linear_gauss:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: linear_gaussian
+        kwargs: {}
+
+inference:
+  default:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: softmax_nn
+        kwargs: {}
+    inference:
+      method: importance_sampling
+      kwargs: {}
+
+  vbn_softmax_is:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: softmax_nn
+        kwargs: {}
+    inference:
+      method: importance_sampling
+      kwargs: {}
+
+  vbn_softmax_mcm:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: softmax_nn
+        kwargs: {}
+    inference:
+      method: monte_carlo_marginalization
+      kwargs: {}
+
+  vbn_gauss_is:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: gaussian_nn
+        kwargs: {}
+    inference:
+      method: importance_sampling
+      kwargs: {}
+
+  vbn_gauss_mcm:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: gaussian_nn
+        kwargs: {}
+    inference:
+      method: monte_carlo_marginalization
+      kwargs: {}
+
+  vbn_linear_gauss_is:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: linear_gaussian
+        kwargs: {}
+    inference:
+      method: importance_sampling
+      kwargs: {}
+
+  vbn_linear_gauss_mcm:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: linear_gaussian
+        kwargs: {}
+    inference:
+      method: monte_carlo_marginalization
+      kwargs: {}

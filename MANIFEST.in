@@ -1,1 +1,2 @@
 recursive-include vbn/configs *.yaml
+recursive-include benchmarking/models *.yaml
