@@ -5,7 +5,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import matplotlib
 import numpy as np
@@ -14,6 +14,7 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from benchmarking.metrics.divergences import _compute_discrete_metrics
 from benchmarking.utils import (
     ensure_dir,
     get_generator_datasets_dir,
@@ -21,12 +22,6 @@ from benchmarking.utils import (
     parse_bif_structure,
     read_json,
 )
-
-try:  # optional
-    from scipy.stats import wasserstein_distance as _scipy_wasserstein
-except Exception:  # pragma: no cover
-    _scipy_wasserstein = None
-
 
 CPD_TARGET_CATEGORIES = ["markov_blanket", "parent_set", "random_pac"]
 CPD_EVIDENCE_STRATEGIES = ["paths", "markov_blanket", "random"]
@@ -73,10 +68,21 @@ RECORD_COLUMNS = [
     "timestamp_utc",
     "kl",
     "wass",
+    "jsd",
+    "jsd_norm",
     "time",
     "batch_enabled",
     "batch_size",
 ]
+
+METRIC_LABELS = {
+    "kl": "KL",
+    "wass": "Wasserstein",
+    "jsd": "JSD",
+    "jsd_norm": "JSD (norm)",
+    "time": "Time",
+}
+PLOT_METRICS = ["kl", "wass", "jsd_norm"]
 
 
 class GTComputer:
@@ -218,6 +224,14 @@ def _coerce_int(value: Any) -> int | None:
         return None
 
 
+def _is_int_like(value: Any) -> bool:
+    if isinstance(value, (int, bool, np.integer)):
+        return True
+    if isinstance(value, float) and math.isfinite(value):
+        return value.is_integer()
+    return False
+
+
 def _get_by_path(obj: Any, path: str) -> Any:
     current = obj
     for part in path.split("."):
@@ -280,33 +294,6 @@ def _join_key(record: dict) -> tuple:
         skeleton_id,
         ev_vars,
     )
-
-
-def _normalize_probs(probs: Iterable[float], eps: float) -> np.ndarray:
-    arr = np.asarray(list(probs), dtype=float)
-    arr = np.clip(arr, eps, 1.0)
-    total = float(arr.sum())
-    if not math.isfinite(total) or total <= 0:
-        return np.full_like(arr, 1.0 / len(arr))
-    return arr / total
-
-
-def kl_divergence(p: Iterable[float], q: Iterable[float], eps: float) -> float:
-    p_arr = _normalize_probs(p, eps)
-    q_arr = _normalize_probs(q, eps)
-    return float(np.sum(p_arr * np.log(p_arr / q_arr)))
-
-
-def wasserstein_distance(p: Iterable[float], q: Iterable[float], eps: float) -> float:
-    p_arr = _normalize_probs(p, eps)
-    q_arr = _normalize_probs(q, eps)
-    k = len(p_arr)
-    xs = np.arange(k, dtype=float)
-    if _scipy_wasserstein is not None:
-        return float(_scipy_wasserstein(xs, xs, p_arr, q_arr))
-    cdf_p = np.cumsum(p_arr)
-    cdf_q = np.cumsum(q_arr)
-    return float(np.sum(np.abs(cdf_p - cdf_q)))
 
 
 def robust_summary(values: list[float]) -> dict:
@@ -446,16 +433,29 @@ def _safe_tag(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
 
 
-def _extract_pred_probs(record: dict) -> list[float] | None:
+def _metric_label(metric: str) -> str:
+    return METRIC_LABELS.get(metric, metric.upper())
+
+
+def _is_discrete_output(output: dict | None) -> bool:
+    if not isinstance(output, dict):
+        return False
+    if output.get("format") != "categorical_probs":
+        return False
+    support = output.get("support")
+    if isinstance(support, list) and support:
+        return all(_is_int_like(v) for v in support)
+    return True
+
+
+def _extract_pred_probs(record: dict) -> tuple[list[float] | None, dict | None]:
     output = record.get("result", {}).get("output")
     if not isinstance(output, dict):
-        return None
-    if output.get("format") != "categorical_probs":
-        return None
+        return None, None
     probs = output.get("probs")
     if not isinstance(probs, list) or not probs:
-        return None
-    return probs
+        return None, output
+    return probs, output
 
 
 def _extract_gt_probs(record: dict, gt_key: str) -> list[float] | None:
@@ -640,7 +640,7 @@ def _build_records(
                 query = (
                     record.get("query") if isinstance(record.get("query"), dict) else {}
                 )
-                pred_probs = _extract_pred_probs(record)
+                pred_probs, pred_output = _extract_pred_probs(record)
                 if pred_probs is None:
                     continue
                 gt_probs: list[float] | None = None
@@ -665,8 +665,12 @@ def _build_records(
                     continue
 
                 try:
-                    kl = kl_divergence(gt_probs, pred_probs, eps)
-                    wass = wasserstein_distance(gt_probs, pred_probs, eps)
+                    kl, wass, jsd, jsd_norm = _compute_discrete_metrics(
+                        gt_probs,
+                        pred_probs,
+                        eps,
+                        compute_jsd=_is_discrete_output(pred_output),
+                    )
                 except Exception as exc:
                     errors.append(str(exc))
                     continue
@@ -775,6 +779,8 @@ def _build_records(
                         "timestamp_utc": run_timestamp,
                         "kl": kl,
                         "wass": wass,
+                        "jsd": jsd,
+                        "jsd_norm": jsd_norm,
                         "time": time_ms,
                         "batch_enabled": batch_enabled,
                         "batch_size": batch_size,
@@ -896,6 +902,7 @@ def _plot_error_vs_size(
     for method_id in method_ids:
         group = df[df["method_id"] == method_id]
         group = group[group[size_col].notna()]
+        group = group[group[f"{metric}_iqm"].notna()]
         if group.empty:
             continue
         group = group.sort_values(size_col)
@@ -905,7 +912,7 @@ def _plot_error_vs_size(
         plt.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
     plt.title(title_prefix)
     plt.xlabel(size_col)
-    plt.ylabel(metric.upper())
+    plt.ylabel(_metric_label(metric))
     plt.legend()
     plt.grid(True, alpha=0.3)
     out_path = out_dir / f"{filename_prefix}.png"
@@ -929,6 +936,7 @@ def _plot_error_vs_evidence_size(
     if mode is not None:
         data = data[data["evidence_mode"] == mode]
     data = data[data["evidence_size"].notna()]
+    data = data[data[f"{metric}_iqm"].notna()]
     if data.empty:
         return None
     plt.figure(figsize=(8, 4.5))
@@ -941,12 +949,12 @@ def _plot_error_vs_evidence_size(
         y = sub[f"{metric}_iqm"].tolist()
         yerr = sub[f"{metric}_iqr_std"].tolist()
         plt.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
-    title = f"Inference {metric.upper()} vs Evidence Size"
+    title = f"Inference {_metric_label(metric)} vs Evidence Size"
     if mode is not None:
         title = f"{title} ({mode})"
     plt.title(title)
     plt.xlabel("evidence_size")
-    plt.ylabel(metric.upper())
+    plt.ylabel(_metric_label(metric))
     plt.legend()
     plt.grid(True, alpha=0.3)
     suffix = f"__mode_{mode}" if mode else ""
@@ -970,6 +978,7 @@ def _plot_category_bars(
     if df.empty:
         return None
     data = df[df[category_col].notna()]
+    data = data[data[f"{metric}_iqm"].notna()]
     if data.empty:
         return None
     ordered = [c for c in category_order if c in set(data[category_col])]
@@ -999,7 +1008,7 @@ def _plot_category_bars(
         plt.bar(x + offset, y, width=width, yerr=yerr, capsize=3, label=method_id)
     plt.xticks(x, ordered, rotation=30, ha="right")
     plt.title(title_prefix)
-    plt.ylabel(metric.upper())
+    plt.ylabel(_metric_label(metric))
     plt.legend()
     plt.grid(axis="y", alpha=0.3)
     out_path = out_dir / f"{filename_prefix}.png"
@@ -1091,7 +1100,7 @@ def _plot_pareto(
             alpha=0.5,
         )
     plt.xlabel("IQM time (ms)")
-    plt.ylabel(f"IQM {metric.upper()}")
+    plt.ylabel(f"IQM {_metric_label(metric)}")
     plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -1224,7 +1233,7 @@ def main() -> None:
     if df.empty:
         logging.warning("No records to report. Check GT source and inputs.")
 
-    metric_cols = ["kl", "wass"]
+    metric_cols = ["kl", "wass", "jsd", "jsd_norm"]
 
     tables: list[Path] = []
     figures: list[Path] = []
@@ -1253,6 +1262,8 @@ def main() -> None:
         "timestamp_utc",
         "kl",
         "wass",
+        "jsd",
+        "jsd_norm",
         "time",
         "batch_enabled",
         "batch_size",
@@ -1502,127 +1513,41 @@ def main() -> None:
     tables.append(path)
 
     # Plots
-    fig = _plot_error_vs_size(
-        cpd_mb,
-        size_col="mb_size",
-        metric="kl",
-        out_dir=figures_dir,
-        title_prefix="CPD KL vs Markov Blanket Size",
-        filename_prefix="cpd_kl_vs_mb_size",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_mb,
-        size_col="mb_size",
-        metric="wass",
-        out_dir=figures_dir,
-        title_prefix="CPD Wasserstein vs Markov Blanket Size",
-        filename_prefix="cpd_wass_vs_mb_size",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_parent,
-        size_col="parent_size",
-        metric="kl",
-        out_dir=figures_dir,
-        title_prefix="CPD KL vs Parent Set Size",
-        filename_prefix="cpd_kl_vs_parent_size",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_parent,
-        size_col="parent_size",
-        metric="wass",
-        out_dir=figures_dir,
-        title_prefix="CPD Wasserstein vs Parent Set Size",
-        filename_prefix="cpd_wass_vs_parent_size",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_nodes,
-        size_col="n_nodes",
-        metric="kl",
-        out_dir=figures_dir,
-        title_prefix="CPD KL vs #Nodes",
-        filename_prefix="cpd_kl_vs_n_nodes",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_nodes,
-        size_col="n_nodes",
-        metric="wass",
-        out_dir=figures_dir,
-        title_prefix="CPD Wasserstein vs #Nodes",
-        filename_prefix="cpd_wass_vs_n_nodes",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_edges,
-        size_col="n_edges",
-        metric="kl",
-        out_dir=figures_dir,
-        title_prefix="CPD KL vs #Edges",
-        filename_prefix="cpd_kl_vs_n_edges",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        cpd_edges,
-        size_col="n_edges",
-        metric="wass",
-        out_dir=figures_dir,
-        title_prefix="CPD Wasserstein vs #Edges",
-        filename_prefix="cpd_wass_vs_n_edges",
-    )
-    if fig:
-        figures.append(fig)
+    cpd_size_specs = [
+        (cpd_mb, "mb_size", "Markov Blanket Size", "mb_size"),
+        (cpd_parent, "parent_size", "Parent Set Size", "parent_size"),
+        (cpd_nodes, "n_nodes", "#Nodes", "n_nodes"),
+        (cpd_edges, "n_edges", "#Edges", "n_edges"),
+    ]
+    for data, size_col, size_label, tag in cpd_size_specs:
+        for metric in PLOT_METRICS:
+            fig = _plot_error_vs_size(
+                data,
+                size_col=size_col,
+                metric=metric,
+                out_dir=figures_dir,
+                title_prefix=f"CPD {_metric_label(metric)} vs {size_label}",
+                filename_prefix=f"cpd_{metric}_vs_{tag}",
+            )
+            if fig:
+                figures.append(fig)
 
-    fig = _plot_error_vs_size(
-        inf_nodes,
-        size_col="n_nodes",
-        metric="kl",
-        out_dir=figures_dir,
-        title_prefix="Inference KL vs #Nodes",
-        filename_prefix="inference_kl_vs_n_nodes",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        inf_nodes,
-        size_col="n_nodes",
-        metric="wass",
-        out_dir=figures_dir,
-        title_prefix="Inference Wasserstein vs #Nodes",
-        filename_prefix="inference_wass_vs_n_nodes",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        inf_edges,
-        size_col="n_edges",
-        metric="kl",
-        out_dir=figures_dir,
-        title_prefix="Inference KL vs #Edges",
-        filename_prefix="inference_kl_vs_n_edges",
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_error_vs_size(
-        inf_edges,
-        size_col="n_edges",
-        metric="wass",
-        out_dir=figures_dir,
-        title_prefix="Inference Wasserstein vs #Edges",
-        filename_prefix="inference_wass_vs_n_edges",
-    )
-    if fig:
-        figures.append(fig)
+    inf_size_specs = [
+        (inf_nodes, "n_nodes", "#Nodes", "n_nodes"),
+        (inf_edges, "n_edges", "#Edges", "n_edges"),
+    ]
+    for data, size_col, size_label, tag in inf_size_specs:
+        for metric in PLOT_METRICS:
+            fig = _plot_error_vs_size(
+                data,
+                size_col=size_col,
+                metric=metric,
+                out_dir=figures_dir,
+                title_prefix=f"Inference {_metric_label(metric)} vs {size_label}",
+                filename_prefix=f"inference_{metric}_vs_{tag}",
+            )
+            if fig:
+                figures.append(fig)
 
     modes = [
         m for m in INF_EVIDENCE_MODES if m in set(inf_ev_size_mode["evidence_mode"])
@@ -1633,39 +1558,32 @@ def main() -> None:
         if m not in modes
     ]
     for mode in modes:
-        fig = _plot_error_vs_evidence_size(
-            inf_ev_size_mode,
-            metric="kl",
-            out_dir=figures_dir,
-            filename_prefix="inference_kl_vs_evidence_size",
-            mode=mode,
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_evidence_size(
-            inf_ev_size_mode,
-            metric="wass",
-            out_dir=figures_dir,
-            filename_prefix="inference_wass_vs_evidence_size",
-            mode=mode,
-        )
-        if fig:
-            figures.append(fig)
+        for metric in PLOT_METRICS:
+            fig = _plot_error_vs_evidence_size(
+                inf_ev_size_mode,
+                metric=metric,
+                out_dir=figures_dir,
+                filename_prefix=f"inference_{metric}_vs_evidence_size",
+                mode=mode,
+            )
+            if fig:
+                figures.append(fig)
 
     if args.include_pareto:
+        pareto_metrics = ["kl", "wass", "jsd_norm"]
         pareto_summary = aggregate_table(
             df,
             ["method_id", "model_name", "config_id", "config_hash", "query_type"],
-            ["kl", "wass", "time"],
+            [*pareto_metrics, "time"],
         )
-        for metric in ("kl", "wass"):
+        for metric in pareto_metrics:
             sub = pareto_summary[pareto_summary["query_type"] == "cpd"]
             fig = _plot_pareto(
                 sub,
                 metric=metric,
                 out_dir=figures_dir,
                 filename=f"pareto_cpd_{metric}_vs_time.png",
-                title=f"CPD {metric.upper()} vs Time",
+                title=f"CPD {_metric_label(metric)} vs Time",
             )
             if fig:
                 figures.append(fig)
@@ -1675,7 +1593,7 @@ def main() -> None:
                 metric=metric,
                 out_dir=figures_dir,
                 filename=f"pareto_inference_{metric}_vs_time.png",
-                title=f"Inference {metric.upper()} vs Time",
+                title=f"Inference {_metric_label(metric)} vs Time",
             )
             if fig:
                 figures.append(fig)
@@ -1698,19 +1616,19 @@ def main() -> None:
                         "query_type",
                         split_col,
                     ],
-                    ["kl", "wass", "time"],
+                    [*pareto_metrics, "time"],
                 )
                 for (qtype, split_val), group in split_summary.groupby(
                     ["query_type", split_col], dropna=False
                 ):
                     tag = _safe_tag(f"{split_col}_{split_val}")
-                    for metric in ("kl", "wass"):
+                    for metric in pareto_metrics:
                         fig = _plot_pareto(
                             group,
                             metric=metric,
                             out_dir=figures_dir,
                             filename=f"pareto_{qtype}_{metric}_vs_time__{tag}.png",
-                            title=f"{qtype.capitalize()} {metric.upper()} vs Time ({split_col}={split_val})",
+                            title=f"{qtype.capitalize()} {_metric_label(metric)} vs Time ({split_col}={split_val})",
                         )
                         if fig:
                             figures.append(fig)
@@ -1796,94 +1714,65 @@ def main() -> None:
         if fig:
             figures.append(fig)
 
-    fig = _plot_category_bars(
-        cpd_by_target,
-        category_col="target_category",
-        metric="kl",
-        out_dir=figures_dir,
-        filename_prefix="cpd_kl_by_target_category",
-        title_prefix="CPD KL by Target Category",
-        category_order=CPD_TARGET_CATEGORIES,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        cpd_by_target,
-        category_col="target_category",
-        metric="wass",
-        out_dir=figures_dir,
-        filename_prefix="cpd_wass_by_target_category",
-        title_prefix="CPD Wasserstein by Target Category",
-        category_order=CPD_TARGET_CATEGORIES,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        inf_by_target,
-        category_col="target_category",
-        metric="kl",
-        out_dir=figures_dir,
-        filename_prefix="inference_kl_by_target_category",
-        title_prefix="Inference KL by Target Category",
-        category_order=INF_TARGET_CATEGORIES,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        inf_by_target,
-        category_col="target_category",
-        metric="wass",
-        out_dir=figures_dir,
-        filename_prefix="inference_wass_by_target_category",
-        title_prefix="Inference Wasserstein by Target Category",
-        category_order=INF_TARGET_CATEGORIES,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        inf_by_task,
-        category_col="task",
-        metric="kl",
-        out_dir=figures_dir,
-        filename_prefix="inference_kl_by_task",
-        title_prefix="Inference KL by Task",
-        category_order=INF_TASKS,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        inf_by_task,
-        category_col="task",
-        metric="wass",
-        out_dir=figures_dir,
-        filename_prefix="inference_wass_by_task",
-        title_prefix="Inference Wasserstein by Task",
-        category_order=INF_TASKS,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        inf_by_mode,
-        category_col="evidence_mode",
-        metric="kl",
-        out_dir=figures_dir,
-        filename_prefix="inference_kl_by_evidence_mode",
-        title_prefix="Inference KL by Evidence Mode",
-        category_order=INF_EVIDENCE_MODES,
-    )
-    if fig:
-        figures.append(fig)
-    fig = _plot_category_bars(
-        inf_by_mode,
-        category_col="evidence_mode",
-        metric="wass",
-        out_dir=figures_dir,
-        filename_prefix="inference_wass_by_evidence_mode",
-        title_prefix="Inference Wasserstein by Evidence Mode",
-        category_order=INF_EVIDENCE_MODES,
-    )
-    if fig:
-        figures.append(fig)
+    category_specs = [
+        (
+            cpd_by_target,
+            "target_category",
+            "CPD",
+            "cpd",
+            "target_category",
+            "Target Category",
+            CPD_TARGET_CATEGORIES,
+        ),
+        (
+            inf_by_target,
+            "target_category",
+            "Inference",
+            "inference",
+            "target_category",
+            "Target Category",
+            INF_TARGET_CATEGORIES,
+        ),
+        (
+            inf_by_task,
+            "task",
+            "Inference",
+            "inference",
+            "task",
+            "Task",
+            INF_TASKS,
+        ),
+        (
+            inf_by_mode,
+            "evidence_mode",
+            "Inference",
+            "inference",
+            "evidence_mode",
+            "Evidence Mode",
+            INF_EVIDENCE_MODES,
+        ),
+    ]
+    for (
+        data,
+        category_col,
+        title_prefix,
+        file_prefix,
+        file_suffix,
+        title_suffix,
+        category_order,
+    ) in category_specs:
+        for metric in PLOT_METRICS:
+            fig = _plot_category_bars(
+                data,
+                category_col=category_col,
+                metric=metric,
+                out_dir=figures_dir,
+                filename_prefix=f"{file_prefix}_{metric}_by_{file_suffix}",
+                title_prefix=f"{title_prefix} {_metric_label(metric)} by {title_suffix}",
+                category_order=category_order,
+            )
+            if fig:
+                figures.append(fig)
 
     if args.include_time:
         fig = _plot_category_bars(
