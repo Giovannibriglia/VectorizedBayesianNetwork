@@ -19,6 +19,11 @@ from benchmarking.models import get_benchmark_model
 from benchmarking.models.config import apply_overrides, config_hash
 from benchmarking.models.presets import get_preset_config
 from benchmarking.utils import ensure_dir, get_generator_out_dir, timed_call, write_json
+from benchmarking.utils_errors import (
+    classify_error,
+    ErrorSummary,
+    render_error_summary_md,
+)
 
 
 @dataclass(frozen=True)
@@ -276,6 +281,7 @@ class BaseBenchmarkRunner(ABC):
         ensure_dir(run_dir / "inference")
         ensure_dir(run_dir / "logs")
         ensure_dir(run_dir / "configs")
+        ensure_dir(run_dir / "errors")
         return run_dir, timestamp
 
     def _hash_kwargs(self) -> str:
@@ -330,8 +336,18 @@ class BaseBenchmarkRunner(ABC):
     def _base_model_name(self, alias: str) -> str:
         return self.model_aliases.get(alias, alias)
 
-    def _model_info(self, model, *, config, config_hash_value: str) -> dict:
+    def _model_info(
+        self,
+        model,
+        *,
+        config,
+        config_hash_value: str,
+        alias: str,
+        backend: str,
+    ) -> dict:
         return {
+            "alias": alias,
+            "backend": backend,
             "name": getattr(model, "name", "unknown"),
             "version": getattr(model, "version", None),
             "family": getattr(model, "family", "unknown"),
@@ -403,6 +419,11 @@ class BaseBenchmarkRunner(ABC):
             query.get("evidence") if isinstance(query.get("evidence"), dict) else {}
         )
         vars_list = evidence.get("vars") or query.get("evidence_vars") or []
+        evidence_strategy = query.get("evidence_strategy")
+        if evidence_strategy is None and isinstance(evidence, dict):
+            evidence_strategy = evidence.get("strategy") or evidence.get(
+                "evidence_strategy"
+            )
         evidence_mode = evidence.get("mode") or query.get("evidence_mode")
         values = evidence.get("values") if evidence else query.get("evidence_values")
         if values is None:
@@ -421,9 +442,13 @@ class BaseBenchmarkRunner(ABC):
             "id": f"{problem}::{qtype}::{index}",
             "target": query.get("target"),
             "target_category": query.get("target_category"),
+            "evidence_strategy": evidence_strategy,
+            "evidence_vars": list(vars_list),
+            "evidence_mode": evidence_mode,
             "task": query.get("task") if qtype == "inference" else None,
             "evidence": {
                 "vars": list(vars_list),
+                "strategy": evidence_strategy,
                 "mode": evidence_mode,
                 "values_kind": values_kind,
                 "n_instantiations": int(n_instantiations),
@@ -461,6 +486,17 @@ class BaseBenchmarkRunner(ABC):
                 output["support"] = list(range(int(k)))
             return output
         return result
+
+    def _stage_for_mode(self) -> dict[str, str]:
+        if self.mode == "cpds":
+            return {
+                "query": "cpd_query",
+                "batch": "cpd_query",
+            }
+        return {
+            "query": "inference_query",
+            "batch": "inference_batch",
+        }
 
     def run_all(self) -> Path:
         run_dir, run_timestamp = self._init_output_dir()
@@ -522,6 +558,7 @@ class BaseBenchmarkRunner(ABC):
         )
         model_files: Dict[str, dict] = {}
         model_stats: Dict[str, dict] = {}
+        error_summary = ErrorSummary()
         summary: dict = {
             "generator": self.generator,
             "seed": int(self.seed),
@@ -535,6 +572,7 @@ class BaseBenchmarkRunner(ABC):
         ground_truth_sources: dict[str, dict] = {}
         run_cpds = self.mode == "cpds"
         run_inference = self.mode == "inference"
+        stage_map = self._stage_for_mode()
 
         for model_name in self.models:
             model_tag = self._safe_model_tag(model_name)
@@ -634,6 +672,16 @@ class BaseBenchmarkRunner(ABC):
                     except Exception as exc:
                         reason = f"Model init failed: {type(exc).__name__}: {exc}"
                         self.logger.info("[%s] %s", model_name, reason)
+                        info = classify_error(type(exc).__name__, str(exc))
+                        error_summary.add(
+                            model=model_name,
+                            problem=problem,
+                            error_type=type(exc).__name__,
+                            error_signature=info["error_signature"],
+                            error_stage="model_init",
+                            error_msg=str(exc),
+                            is_oom=info["is_oom"],
+                        )
                         model_stats[model_name]["problems"]["error"] += 1
                         _flush_logs()
                         continue
@@ -654,6 +702,16 @@ class BaseBenchmarkRunner(ABC):
                         )
                         reason = f"Fit failed: {type(exc).__name__}: {exc}"
                         self.logger.info("[%s] %s", model_name, reason)
+                        info = classify_error(type(exc).__name__, str(exc))
+                        error_summary.add(
+                            model=model_name,
+                            problem=problem,
+                            error_type=type(exc).__name__,
+                            error_signature=info["error_signature"],
+                            error_stage="fit",
+                            error_msg=str(exc),
+                            is_oom=info["is_oom"],
+                        )
                         model_stats[model_name]["problems"]["error"] += 1
                         model_files[model_name]["cpd"].flush()
                         model_files[model_name]["inf"].flush()
@@ -665,10 +723,15 @@ class BaseBenchmarkRunner(ABC):
                         "seed": int(self.seed),
                         "timestamp_utc": timestamp_utc,
                         "run_id": run_id,
+                        "mode": self.mode,
                         "progress": bool(self.progress),
                     }
                     model_meta = self._model_info(
-                        model, config=model_config, config_hash_value=model_config_hash
+                        model,
+                        config=model_config,
+                        config_hash_value=model_config_hash,
+                        alias=model_name,
+                        backend=base_model,
                     )
                     problem_meta = self._problem_info(problem, assets.dag)
 
@@ -709,6 +772,26 @@ class BaseBenchmarkRunner(ABC):
                             error_type = type(exc).__name__
                             error_msg = str(exc)
                             output = None
+                        if error_msg is not None and not isinstance(error_msg, str):
+                            error_msg = str(error_msg)
+                        if not ok and not error_type:
+                            error_type = "ModelError"
+                        error_stage = stage_map["query"]
+                        is_oom = None
+                        error_signature = None
+                        if not ok and (error_msg or error_type):
+                            info = classify_error(error_type, error_msg)
+                            is_oom = info["is_oom"]
+                            error_signature = info["error_signature"]
+                            error_summary.add(
+                                model=model_name,
+                                problem=problem,
+                                error_type=error_type,
+                                error_signature=error_signature,
+                                error_stage=error_stage,
+                                error_msg=error_msg,
+                                is_oom=is_oom,
+                            )
                         if (
                             not ok
                             and error_msg
@@ -738,6 +821,7 @@ class BaseBenchmarkRunner(ABC):
                         model_stats[model_name]["_timing"]["cpd"].add(float(elapsed))
 
                         record = {
+                            "mode": self.mode,
                             "run": run_meta,
                             "model": model_meta,
                             "problem": problem_meta,
@@ -748,6 +832,9 @@ class BaseBenchmarkRunner(ABC):
                                 "ok": bool(ok),
                                 "error_type": error_type,
                                 "error_msg": error_msg,
+                                "error_stage": error_stage if not ok else None,
+                                "is_oom": is_oom if not ok else None,
+                                "error_signature": error_signature if not ok else None,
                                 "timing_ms": float(elapsed),
                                 "output": output,
                             },
@@ -852,8 +939,25 @@ class BaseBenchmarkRunner(ABC):
                                 for q_index, query in chunk:
                                     error_type = type(batch_error).__name__
                                     error_msg = str(batch_error)
+                                    if error_msg is not None and not isinstance(
+                                        error_msg, str
+                                    ):
+                                        error_msg = str(error_msg)
                                     ok = False
                                     output = None
+                                    error_stage = stage_map["batch"]
+                                    info = classify_error(error_type, error_msg)
+                                    is_oom = info["is_oom"]
+                                    error_signature = info["error_signature"]
+                                    error_summary.add(
+                                        model=model_name,
+                                        problem=problem,
+                                        error_type=error_type,
+                                        error_signature=error_signature,
+                                        error_stage=error_stage,
+                                        error_msg=error_msg,
+                                        is_oom=is_oom,
+                                    )
                                     inf_timing_sum += per_query_ms
                                     err_inf += 1
                                     model_stats[model_name]["_timing"]["inference"].add(
@@ -863,6 +967,7 @@ class BaseBenchmarkRunner(ABC):
                                         "skeleton_id"
                                     ) or query.get("skeleton_id")
                                     record = {
+                                        "mode": self.mode,
                                         "run": run_meta,
                                         "model": model_meta,
                                         "problem": problem_meta,
@@ -873,6 +978,9 @@ class BaseBenchmarkRunner(ABC):
                                             "ok": bool(ok),
                                             "error_type": error_type,
                                             "error_msg": error_msg,
+                                            "error_stage": error_stage,
+                                            "is_oom": is_oom,
+                                            "error_signature": error_signature,
                                             "timing_ms": float(per_query_ms),
                                             "output": output,
                                         },
@@ -909,6 +1017,28 @@ class BaseBenchmarkRunner(ABC):
                                     output = self._normalize_output(
                                         response.get("result")
                                     )
+                                    if error_msg is not None and not isinstance(
+                                        error_msg, str
+                                    ):
+                                        error_msg = str(error_msg)
+                                    if not ok and not error_type:
+                                        error_type = "ModelError"
+                                    error_stage = stage_map["query"]
+                                    is_oom = None
+                                    error_signature = None
+                                    if not ok and (error_msg or error_type):
+                                        info = classify_error(error_type, error_msg)
+                                        is_oom = info["is_oom"]
+                                        error_signature = info["error_signature"]
+                                        error_summary.add(
+                                            model=model_name,
+                                            problem=problem,
+                                            error_type=error_type,
+                                            error_signature=error_signature,
+                                            error_stage=error_stage,
+                                            error_msg=error_msg,
+                                            is_oom=is_oom,
+                                        )
                                     if (
                                         not ok
                                         and error_msg
@@ -944,6 +1074,7 @@ class BaseBenchmarkRunner(ABC):
                                         "skeleton_id"
                                     ) or query.get("skeleton_id")
                                     record = {
+                                        "mode": self.mode,
                                         "run": run_meta,
                                         "model": model_meta,
                                         "problem": problem_meta,
@@ -954,6 +1085,13 @@ class BaseBenchmarkRunner(ABC):
                                             "ok": bool(ok),
                                             "error_type": error_type,
                                             "error_msg": error_msg,
+                                            "error_stage": (
+                                                error_stage if not ok else None
+                                            ),
+                                            "is_oom": is_oom if not ok else None,
+                                            "error_signature": (
+                                                error_signature if not ok else None
+                                            ),
                                             "timing_ms": float(per_query_ms),
                                             "output": output,
                                         },
@@ -1011,6 +1149,28 @@ class BaseBenchmarkRunner(ABC):
                                     error_type = type(exc).__name__
                                     error_msg = str(exc)
                                     output = None
+                                if error_msg is not None and not isinstance(
+                                    error_msg, str
+                                ):
+                                    error_msg = str(error_msg)
+                                if not ok and not error_type:
+                                    error_type = "ModelError"
+                                error_stage = stage_map["query"]
+                                is_oom = None
+                                error_signature = None
+                                if not ok and (error_msg or error_type):
+                                    info = classify_error(error_type, error_msg)
+                                    is_oom = info["is_oom"]
+                                    error_signature = info["error_signature"]
+                                    error_summary.add(
+                                        model=model_name,
+                                        problem=problem,
+                                        error_type=error_type,
+                                        error_signature=error_signature,
+                                        error_stage=error_stage,
+                                        error_msg=error_msg,
+                                        is_oom=is_oom,
+                                    )
                                 if (
                                     not ok
                                     and error_msg
@@ -1047,6 +1207,7 @@ class BaseBenchmarkRunner(ABC):
                                     "skeleton_id"
                                 ) or query.get("skeleton_id")
                                 record = {
+                                    "mode": self.mode,
                                     "run": run_meta,
                                     "model": model_meta,
                                     "problem": problem_meta,
@@ -1057,6 +1218,11 @@ class BaseBenchmarkRunner(ABC):
                                         "ok": bool(ok),
                                         "error_type": error_type,
                                         "error_msg": error_msg,
+                                        "error_stage": error_stage if not ok else None,
+                                        "is_oom": is_oom if not ok else None,
+                                        "error_signature": (
+                                            error_signature if not ok else None
+                                        ),
                                         "timing_ms": float(elapsed),
                                         "output": output,
                                     },
@@ -1145,6 +1311,12 @@ class BaseBenchmarkRunner(ABC):
 
             summary_path = run_dir / "summary.json"
             write_json(summary_path, summary)
+
+            errors_payload = error_summary.to_dict()
+            write_json(run_dir / "errors" / "errors_summary.json", errors_payload)
+            (run_dir / "errors" / "errors_summary.md").write_text(
+                render_error_summary_md(errors_payload)
+            )
             return run_dir
         finally:
             for model_name, files in model_files.items():

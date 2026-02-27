@@ -22,6 +22,7 @@ from benchmarking.utils import (
     parse_bif_structure,
     read_json,
 )
+from benchmarking.utils_errors import classify_error
 
 CPD_TARGET_CATEGORIES = ["markov_blanket", "parent_set", "random_pac"]
 CPD_EVIDENCE_STRATEGIES = ["paths", "markov_blanket", "random"]
@@ -230,6 +231,207 @@ def _is_int_like(value: Any) -> bool:
     if isinstance(value, float) and math.isfinite(value):
         return value.is_integer()
     return False
+
+
+def _format_number(value: Any) -> str:
+    if value is None:
+        return "NaN"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "NaN"
+        if abs(value - round(value)) < 1e-6:
+            return str(int(round(value)))
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _write_md_table(df: pd.DataFrame, path: Path) -> None:
+    if df.empty or not list(df.columns):
+        path.write_text("")
+        return
+    headers = [str(col) for col in df.columns]
+    lines = ["| " + " | ".join(headers) + " |"]
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    for _, row in df.iterrows():
+        values = [_format_number(row[col]) for col in df.columns]
+        lines.append("| " + " | ".join(values) + " |")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _format_bin_edge(value: float) -> str:
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _compute_bin_edges(values: pd.Series, n_bins: int = 4) -> list[float] | None:
+    cleaned = pd.to_numeric(values, errors="coerce").dropna().astype(float)
+    if cleaned.empty:
+        return None
+    uniq = np.unique(cleaned)
+    if len(uniq) < 2:
+        return None
+    quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+    edges = np.quantile(cleaned, quantiles)
+    edges = np.unique(edges)
+    if len(edges) < 2:
+        return None
+    return list(edges)
+
+
+def _apply_bins(
+    df: pd.DataFrame, *, col: str, n_bins: int = 4
+) -> tuple[pd.DataFrame, list[str] | None]:
+    edges = _compute_bin_edges(df[col], n_bins=n_bins)
+    bin_col = f"{col}_bin"
+    if not edges or len(edges) < 2:
+        df[bin_col] = np.nan
+        return df, None
+    labels: list[str] = []
+    for idx in range(len(edges) - 1):
+        left = _format_bin_edge(edges[idx])
+        right = _format_bin_edge(edges[idx + 1])
+        left_bracket = "[" if idx == 0 else "("
+        labels.append(f"{left_bracket}{left},{right}]")
+    df[bin_col] = pd.cut(
+        df[col],
+        bins=edges,
+        labels=labels,
+        include_lowest=True,
+        right=True,
+    )
+    return df, labels
+
+
+def _aggregate_success(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    columns = list(group_cols) + ["n_total", "n_ok", "n_error", "success_rate"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict] = []
+    grouped = df.groupby(group_cols, dropna=False)
+    for keys, group in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {col: val for col, val in zip(group_cols, keys)}
+        ok_vals = group["ok"].dropna()
+        if ok_vals.empty:
+            row.update({"n_total": 0, "n_ok": 0, "n_error": 0, "success_rate": np.nan})
+            rows.append(row)
+            continue
+        ok_bool = ok_vals.astype(bool)
+        n_total = int(len(ok_bool))
+        n_ok = int(ok_bool.sum())
+        n_error = int(n_total - n_ok)
+        success_rate = float(n_ok / n_total) if n_total > 0 else np.nan
+        row.update(
+            {
+                "n_total": n_total,
+                "n_ok": n_ok,
+                "n_error": n_error,
+                "success_rate": success_rate,
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _build_success_rate_line_table(
+    df: pd.DataFrame,
+    *,
+    x_col: str,
+    n_bins: int = 4,
+    discrete_max: int = 20,
+) -> pd.DataFrame:
+    columns = [
+        "model",
+        "mode",
+        "x_bin_left",
+        "x_bin_right",
+        "x_mid",
+        "success_rate",
+        "n_attempts",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    data = df[df["ok"].notna() & df[x_col].notna()].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    series = pd.to_numeric(data[x_col], errors="coerce")
+    data = data[series.notna()].copy()
+    data[x_col] = series.dropna().astype(float)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    use_discrete = False
+    if x_col == "evidence_size":
+        unique_vals = sorted(data[x_col].unique())
+        if (
+            unique_vals
+            and len(unique_vals) <= discrete_max
+            and all(_is_int_like(v) for v in unique_vals)
+        ):
+            use_discrete = True
+
+    mode_col = "mode" if "mode" in data.columns else "query_type"
+    rows: list[dict] = []
+    if use_discrete:
+        grouped = data.groupby(["method_id", mode_col, x_col], dropna=False)
+        for (method_id, mode, x_val), group in grouped:
+            ok_vals = group["ok"].astype(bool)
+            n_attempts = int(len(ok_vals))
+            if n_attempts == 0:
+                success_rate = np.nan
+            else:
+                success_rate = float(ok_vals.mean())
+            rows.append(
+                {
+                    "model": method_id,
+                    "mode": mode,
+                    "x_bin_left": float(x_val),
+                    "x_bin_right": float(x_val),
+                    "x_mid": float(x_val),
+                    "success_rate": success_rate,
+                    "n_attempts": n_attempts,
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
+
+    edges = _compute_bin_edges(data[x_col], n_bins=n_bins)
+    if not edges or len(edges) < 2:
+        return pd.DataFrame(columns=columns)
+
+    data["_bin_index"] = pd.cut(
+        data[x_col],
+        bins=edges,
+        labels=False,
+        include_lowest=True,
+        right=True,
+    )
+    grouped = data.groupby(["method_id", mode_col, "_bin_index"], dropna=False)
+    for (method_id, mode, bin_idx), group in grouped:
+        if bin_idx is None or (isinstance(bin_idx, float) and math.isnan(bin_idx)):
+            continue
+        bin_idx = int(bin_idx)
+        if bin_idx < 0 or bin_idx >= len(edges) - 1:
+            continue
+        ok_vals = group["ok"].astype(bool)
+        n_attempts = int(len(ok_vals))
+        success_rate = float(ok_vals.mean()) if n_attempts > 0 else np.nan
+        left = float(edges[bin_idx])
+        right = float(edges[bin_idx + 1])
+        rows.append(
+            {
+                "model": method_id,
+                "mode": mode,
+                "x_bin_left": left,
+                "x_bin_right": right,
+                "x_mid": float((left + right) / 2.0),
+                "success_rate": success_rate,
+                "n_attempts": n_attempts,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def _get_by_path(obj: Any, path: str) -> Any:
@@ -797,6 +999,200 @@ def _build_records(
     return df, errors
 
 
+def _build_attempts(
+    *,
+    run_dir: Path,
+    max_records: int | None,
+    model_filter: set[str] | None,
+) -> pd.DataFrame:
+    graph_stats = _compute_graph_stats(run_dir)
+    rows: list[dict] = []
+    for subdir in ("cpds", "inference"):
+        base_dir = run_dir / subdir
+        if not base_dir.exists():
+            continue
+        for path in sorted(base_dir.glob("*.jsonl")):
+            for record in _read_jsonl(path, max_records=max_records):
+                model_meta = (
+                    record.get("model") if isinstance(record.get("model"), dict) else {}
+                )
+                model_name = (
+                    model_meta.get("name")
+                    or model_meta.get("alias")
+                    or model_meta.get("backend")
+                    or "unknown"
+                )
+                model_alias = model_meta.get("alias")
+                model_backend = model_meta.get("backend")
+                config_id = model_meta.get("config_id")
+                config_hash = model_meta.get("config_hash")
+                if model_filter:
+                    key = f"{model_name}/{config_id or config_hash or 'unknown'}"
+                    if (
+                        model_name not in model_filter
+                        and (config_id or "") not in model_filter
+                        and key not in model_filter
+                    ):
+                        continue
+
+                query = (
+                    record.get("query") if isinstance(record.get("query"), dict) else {}
+                )
+                query_type = query.get("type")
+                if not query_type:
+                    query_type = "cpd" if subdir == "cpds" else "inference"
+                target = query.get("target")
+                target_category = query.get("target_category")
+                evidence_strategy = query.get("evidence_strategy")
+                evidence = (
+                    query.get("evidence")
+                    if isinstance(query.get("evidence"), dict)
+                    else {}
+                )
+                if evidence_strategy is None and isinstance(evidence, dict):
+                    evidence_strategy = evidence.get("strategy") or evidence.get(
+                        "evidence_strategy"
+                    )
+                evidence_mode = evidence.get("mode") or query.get("evidence_mode")
+                ev_vars = evidence.get("vars") or query.get("evidence_vars") or []
+                if not isinstance(ev_vars, list):
+                    ev_vars = list(ev_vars) if ev_vars is not None else []
+                evidence_size = len(ev_vars)
+                task = query.get("task")
+                skeleton_id = evidence.get("skeleton_id") or query.get("skeleton_id")
+
+                problem_meta = (
+                    record.get("problem")
+                    if isinstance(record.get("problem"), dict)
+                    else {}
+                )
+                problem_id = problem_meta.get("id")
+                n_nodes = _coerce_int(problem_meta.get("n_nodes"))
+                n_edges = _coerce_int(problem_meta.get("n_edges"))
+                if problem_id and (n_nodes is None or n_edges is None):
+                    node_stats = graph_stats.get(problem_id)
+                    if node_stats:
+                        if n_nodes is None:
+                            n_nodes = node_stats.get("n_nodes")
+                        if n_edges is None:
+                            n_edges = node_stats.get("n_edges")
+
+                run_meta = (
+                    record.get("run") if isinstance(record.get("run"), dict) else {}
+                )
+                run_id = run_meta.get("run_id")
+                run_seed = _coerce_int(run_meta.get("seed"))
+                run_generator = run_meta.get("generator")
+                run_timestamp = run_meta.get("timestamp_utc")
+                mode = record.get("mode") or run_meta.get("mode") or query_type
+
+                result = (
+                    record.get("result")
+                    if isinstance(record.get("result"), dict)
+                    else {}
+                )
+                ok_val = result.get("ok")
+                ok: bool | None
+                if ok_val is None:
+                    if result.get("output") is not None:
+                        ok = True
+                    elif result.get("error_type") or result.get("error_msg"):
+                        ok = False
+                    else:
+                        ok = None
+                else:
+                    ok = bool(ok_val)
+                error_type = result.get("error_type")
+                error_msg = result.get("error_msg")
+                error_stage = result.get("error_stage")
+                is_oom = result.get("is_oom")
+                error_signature = result.get("error_signature")
+                if ok is False:
+                    if error_msg is not None and not isinstance(error_msg, str):
+                        error_msg = str(error_msg)
+                    if not error_type:
+                        error_type = "ModelError" if error_msg else "UnknownError"
+                    if error_signature is None or is_oom is None:
+                        info = classify_error(error_type, error_msg)
+                        error_signature = error_signature or info["error_signature"]
+                        if is_oom is None:
+                            is_oom = info["is_oom"]
+                if error_signature is None and ok is False:
+                    error_signature = "unknown"
+
+                rows.append(
+                    {
+                        "model_name": model_name,
+                        "model_alias": model_alias,
+                        "model_backend": model_backend,
+                        "config_id": config_id,
+                        "config_hash": config_hash,
+                        "problem_id": problem_id,
+                        "n_nodes": n_nodes,
+                        "n_edges": n_edges,
+                        "query_type": query_type,
+                        "mode": mode,
+                        "target": target,
+                        "target_category": target_category,
+                        "evidence_strategy": evidence_strategy,
+                        "evidence_mode": evidence_mode,
+                        "evidence_size": evidence_size,
+                        "task": task,
+                        "skeleton_id": skeleton_id,
+                        "run_id": run_id,
+                        "seed": run_seed,
+                        "generator": run_generator,
+                        "timestamp_utc": run_timestamp,
+                        "ok": ok,
+                        "error_type": error_type,
+                        "error_msg": error_msg,
+                        "error_stage": error_stage,
+                        "is_oom": is_oom,
+                        "error_signature": error_signature,
+                    }
+                )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "model_name",
+                "model_alias",
+                "model_backend",
+                "config_id",
+                "config_hash",
+                "problem_id",
+                "n_nodes",
+                "n_edges",
+                "query_type",
+                "mode",
+                "target",
+                "target_category",
+                "evidence_strategy",
+                "evidence_mode",
+                "evidence_size",
+                "task",
+                "skeleton_id",
+                "run_id",
+                "seed",
+                "generator",
+                "timestamp_utc",
+                "ok",
+                "error_type",
+                "error_msg",
+                "error_stage",
+                "is_oom",
+                "error_signature",
+                "config_key",
+                "method_id",
+            ]
+        )
+    df["config_key"] = df["config_id"].fillna(
+        df["config_hash"].fillna("unknown").astype(str).str[:8]
+    )
+    df["method_id"] = df["model_name"].astype(str) + "/" + df["config_key"].astype(str)
+    return df
+
+
 def _write_table(df: pd.DataFrame, path: Path) -> None:
     if df.empty:
         if list(df.columns):
@@ -806,6 +1202,11 @@ def _write_table(df: pd.DataFrame, path: Path) -> None:
         return
     df = df.sort_values(list(df.columns))
     df.to_csv(path, index=False)
+
+
+def _write_table_with_md(df: pd.DataFrame, path: Path) -> None:
+    _write_table(df, path)
+    _write_md_table(df, path.with_suffix(".md"))
 
 
 def _two_stage_aggregate(
@@ -1012,6 +1413,139 @@ def _plot_category_bars(
     plt.legend()
     plt.grid(axis="y", alpha=0.3)
     out_path = out_dir / f"{filename_prefix}.png"
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+
+
+def plot_success_rate_bar(
+    df: pd.DataFrame,
+    *,
+    category_col: str,
+    out_dir: Path,
+    filename_prefix: str,
+    title_prefix: str,
+    category_order: list[str] | None = None,
+) -> Path | None:
+    if df.empty:
+        return None
+    data = df[df[category_col].notna()]
+    data = data[data["success_rate"].notna()]
+    if data.empty:
+        return None
+    ordered: list[str]
+    if category_order:
+        ordered = [c for c in category_order if c in set(data[category_col])]
+        ordered += [
+            c for c in sorted(data[category_col].dropna().unique()) if c not in ordered
+        ]
+    else:
+        ordered = sorted(data[category_col].dropna().unique())
+    method_ids = sorted(data["method_id"].dropna().unique())
+    if not method_ids:
+        return None
+    x = np.arange(len(ordered))
+    width = 0.8 / max(1, len(method_ids))
+    plt.figure(figsize=(10, 4.5))
+    for idx, method_id in enumerate(method_ids):
+        sub = data[data["method_id"] == method_id]
+        sub = sub[sub[category_col].isin(ordered)].copy()
+        if sub.empty:
+            continue
+        sub[category_col] = pd.Categorical(
+            sub[category_col], categories=ordered, ordered=True
+        )
+        sub = sub.sort_values(category_col)
+        y_map = dict(zip(sub[category_col], sub["success_rate"]))
+        y = [y_map.get(cat, np.nan) for cat in ordered]
+        offset = (idx - (len(method_ids) - 1) / 2) * width
+        plt.bar(x + offset, y, width=width, label=method_id)
+    plt.xticks(x, ordered, rotation=30, ha="right")
+    plt.title(title_prefix)
+    plt.ylabel("Success Rate")
+    plt.ylim(0.0, 1.0)
+    plt.legend()
+    plt.grid(axis="y", alpha=0.3)
+    out_path = out_dir / f"{filename_prefix}.png"
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+
+
+def plot_success_rate_line(
+    df: pd.DataFrame,
+    *,
+    x_label: str,
+    out_dir: Path,
+    filename: str,
+    title: str,
+) -> Path | None:
+    if df.empty:
+        return None
+    data = df[df["success_rate"].notna()]
+    if data.empty:
+        return None
+    plt.figure(figsize=(8, 4.5))
+    for model in sorted(data["model"].dropna().unique()):
+        sub = data[data["model"] == model].sort_values("x_mid")
+        if sub.empty:
+            continue
+        plt.errorbar(
+            sub["x_mid"].astype(float),
+            sub["success_rate"],
+            fmt="-o",
+            capsize=3,
+            label=model,
+        )
+    plt.title(title)
+    plt.xlabel(x_label)
+    plt.ylabel("Success Rate")
+    plt.ylim(0.0, 1.0)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    out_path = out_dir / filename
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+
+
+def _plot_error_type_distribution(
+    df: pd.DataFrame,
+    *,
+    out_dir: Path,
+    filename: str,
+    title: str,
+    top_k: int = 6,
+) -> Path | None:
+    if df.empty:
+        return None
+    data = df[df["error_type"].notna()]
+    if data.empty:
+        return None
+    top_types = data["error_type"].value_counts().head(top_k).index.tolist()
+    data = data.copy()
+    data["error_type_plot"] = data["error_type"].where(
+        data["error_type"].isin(top_types), "Other"
+    )
+    pivot = data.groupby(["method_id", "error_type_plot"]).size().unstack(fill_value=0)
+    if pivot.empty:
+        return None
+    pivot = pivot.sort_index()
+    plt.figure(figsize=(10, 4.5))
+    bottoms = np.zeros(len(pivot))
+    for col in pivot.columns:
+        values = pivot[col].values
+        plt.bar(pivot.index, values, bottom=bottoms, label=str(col))
+        bottoms = bottoms + values
+    plt.title(title)
+    plt.ylabel("Error Count")
+    plt.xticks(rotation=30, ha="right")
+    plt.legend()
+    plt.grid(axis="y", alpha=0.3)
+    out_path = out_dir / filename
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
@@ -1229,9 +1763,16 @@ def main() -> None:
         eps=float(args.eps),
         model_filter=model_filter,
     )
+    attempts_df = _build_attempts(
+        run_dir=run_dir,
+        max_records=args.max_records,
+        model_filter=model_filter,
+    )
 
     if df.empty:
         logging.warning("No records to report. Check GT source and inputs.")
+    if attempts_df.empty:
+        logging.warning("No attempt records found for success/error reporting.")
 
     metric_cols = ["kl", "wass", "jsd", "jsd_norm"]
 
@@ -1511,6 +2052,173 @@ def main() -> None:
     path = tables_dir / "inference_by_skeleton.csv"
     _write_table(skeleton, path)
     tables.append(path)
+
+    # Success rates + errors
+    success_target = pd.DataFrame()
+    success_strategy = pd.DataFrame()
+    success_task = pd.DataFrame()
+    success_mode = pd.DataFrame()
+    success_ev_size = pd.DataFrame()
+    success_line_nodes = pd.DataFrame()
+    success_line_edges = pd.DataFrame()
+    success_line_ev_size = pd.DataFrame()
+    success_line_ev_size_by_mode: dict[str, pd.DataFrame] = {}
+    error_df = pd.DataFrame()
+    if not attempts_df.empty:
+        base_group = [
+            "method_id",
+            "model_name",
+            "config_id",
+            "config_hash",
+            "query_type",
+        ]
+        success_by_model = _aggregate_success(attempts_df, base_group)
+        path = tables_dir / "success_rate_by_model.csv"
+        _write_table_with_md(success_by_model, path)
+        tables.append(path)
+
+        success_line_nodes = _build_success_rate_line_table(
+            attempts_df, x_col="n_nodes", n_bins=4
+        )
+        path = tables_dir / "success_rate_vs_nodes.csv"
+        _write_table_with_md(success_line_nodes, path)
+        tables.append(path)
+
+        success_line_edges = _build_success_rate_line_table(
+            attempts_df, x_col="n_edges", n_bins=4
+        )
+        path = tables_dir / "success_rate_vs_edges.csv"
+        _write_table_with_md(success_line_edges, path)
+        tables.append(path)
+
+        success_target = _aggregate_success(
+            attempts_df[attempts_df["target_category"].notna()],
+            base_group + ["target_category"],
+        )
+        path = tables_dir / "success_rate_by_category.csv"
+        _write_table_with_md(success_target, path)
+        tables.append(path)
+
+        success_strategy = _aggregate_success(
+            attempts_df[attempts_df["evidence_strategy"].notna()],
+            base_group + ["evidence_strategy"],
+        )
+        path = tables_dir / "success_rate_by_evidence_strategy.csv"
+        _write_table_with_md(success_strategy, path)
+        tables.append(path)
+
+        success_task = _aggregate_success(
+            attempts_df[attempts_df["task"].notna()],
+            base_group + ["task"],
+        )
+        path = tables_dir / "success_rate_by_task.csv"
+        _write_table_with_md(success_task, path)
+        tables.append(path)
+
+        success_mode = _aggregate_success(
+            attempts_df[attempts_df["evidence_mode"].notna()],
+            base_group + ["evidence_mode"],
+        )
+        path = tables_dir / "success_rate_by_evidence_mode.csv"
+        _write_table_with_md(success_mode, path)
+        tables.append(path)
+
+        success_ev_size = _aggregate_success(
+            attempts_df[attempts_df["evidence_size"].notna()],
+            base_group + ["evidence_size"],
+        )
+        path = tables_dir / "success_rate_by_evidence_size.csv"
+        _write_table_with_md(success_ev_size, path)
+        tables.append(path)
+
+        mode_series = attempts_df["mode"]
+        if mode_series.isna().all():
+            mode_series = attempts_df["query_type"]
+        inference_mask = mode_series == "inference"
+        success_line_ev_size = _build_success_rate_line_table(
+            attempts_df[inference_mask],
+            x_col="evidence_size",
+            n_bins=4,
+        )
+        path = tables_dir / "success_rate_vs_evidence_size.csv"
+        _write_table_with_md(success_line_ev_size, path)
+        tables.append(path)
+
+        evidence_modes = [
+            m
+            for m in INF_EVIDENCE_MODES
+            if m in set(attempts_df["evidence_mode"].dropna().unique())
+        ]
+        evidence_modes += [
+            m
+            for m in sorted(attempts_df["evidence_mode"].dropna().unique())
+            if m not in evidence_modes
+        ]
+        for mode in evidence_modes:
+            mode_mask = inference_mask & (attempts_df["evidence_mode"] == mode)
+            table = _build_success_rate_line_table(
+                attempts_df[mode_mask],
+                x_col="evidence_size",
+                n_bins=4,
+            )
+            success_line_ev_size_by_mode[str(mode)] = table
+            tag = _safe_tag(str(mode))
+            path = tables_dir / f"success_rate_vs_evidence_size__mode_{tag}.csv"
+            _write_table_with_md(table, path)
+            tables.append(path)
+
+        error_df = attempts_df[~attempts_df["ok"]].copy()
+        if not error_df.empty:
+            error_df["error_type"] = error_df["error_type"].fillna("UnknownError")
+            error_df["error_signature"] = error_df["error_signature"].fillna("unknown")
+            counts = (
+                error_df.groupby(["method_id", "query_type", "error_type"])
+                .size()
+                .reset_index(name="count")
+            )
+            totals = counts.groupby(["method_id", "query_type"])["count"].transform(
+                "sum"
+            )
+            counts["share"] = counts["count"] / totals
+            top_errors = counts.rename(
+                columns={
+                    "method_id": "model",
+                    "query_type": "mode",
+                }
+            )[["model", "mode", "error_type", "count", "share"]]
+            path = tables_dir / "top_errors_by_model.csv"
+            _write_table_with_md(top_errors, path)
+            tables.append(path)
+
+            sig_counts = (
+                error_df.groupby(["method_id", "query_type", "error_signature"])
+                .size()
+                .reset_index(name="count")
+            )
+            sig_totals = sig_counts.groupby(["method_id", "query_type"])[
+                "count"
+            ].transform("sum")
+            sig_counts["share"] = sig_counts["count"] / sig_totals
+            examples = (
+                error_df.groupby(["method_id", "query_type", "error_signature"])[
+                    "error_msg"
+                ]
+                .apply(lambda s: next((str(v) for v in s if pd.notna(v)), None))
+                .reset_index(name="example")
+            )
+            sig_counts = sig_counts.merge(
+                examples, on=["method_id", "query_type", "error_signature"], how="left"
+            )
+            sig_counts["example"] = sig_counts["example"].fillna("")
+            top_sigs = sig_counts.rename(
+                columns={
+                    "method_id": "model",
+                    "query_type": "mode",
+                }
+            )[["model", "mode", "error_signature", "count", "share", "example"]]
+            path = tables_dir / "top_error_signatures.csv"
+            _write_table_with_md(top_sigs, path)
+            tables.append(path)
 
     # Plots
     cpd_size_specs = [
@@ -1830,6 +2538,131 @@ def main() -> None:
         )
         if fig:
             figures.append(fig)
+
+    # Success rate line plots for numeric axes
+    if not success_line_nodes.empty:
+        for mode in sorted(success_line_nodes["mode"].dropna().unique()):
+            sub = success_line_nodes[success_line_nodes["mode"] == mode]
+            tag = "cpd" if mode == "cpds" else str(mode)
+            title_label = "CPD" if mode == "cpds" else str(mode).capitalize()
+            fig = plot_success_rate_line(
+                sub,
+                x_label="n_nodes",
+                out_dir=figures_dir,
+                filename=f"{tag}_success_rate_vs_n_nodes.png",
+                title=f"{title_label} Success Rate vs #Nodes",
+            )
+            if fig:
+                figures.append(fig)
+
+    if not success_line_edges.empty:
+        for mode in sorted(success_line_edges["mode"].dropna().unique()):
+            sub = success_line_edges[success_line_edges["mode"] == mode]
+            tag = "cpd" if mode == "cpds" else str(mode)
+            title_label = "CPD" if mode == "cpds" else str(mode).capitalize()
+            fig = plot_success_rate_line(
+                sub,
+                x_label="n_edges",
+                out_dir=figures_dir,
+                filename=f"{tag}_success_rate_vs_n_edges.png",
+                title=f"{title_label} Success Rate vs #Edges",
+            )
+            if fig:
+                figures.append(fig)
+
+    if not success_line_ev_size.empty:
+        fig = plot_success_rate_line(
+            success_line_ev_size,
+            x_label="evidence_size",
+            out_dir=figures_dir,
+            filename="inference_success_rate_vs_evidence_size.png",
+            title="Inference Success Rate vs Evidence Size",
+        )
+        if fig:
+            figures.append(fig)
+    if success_line_ev_size_by_mode:
+        for mode, table in success_line_ev_size_by_mode.items():
+            if table.empty:
+                continue
+            tag = _safe_tag(str(mode))
+            fig = plot_success_rate_line(
+                table,
+                x_label="evidence_size",
+                out_dir=figures_dir,
+                filename=f"inference_success_rate_vs_evidence_size__mode_{tag}.png",
+                title=f"Inference Success Rate vs Evidence Size (mode={mode})",
+            )
+            if fig:
+                figures.append(fig)
+
+    if not success_target.empty:
+        for qtype in sorted(success_target["query_type"].dropna().unique()):
+            sub = success_target[success_target["query_type"] == qtype]
+            order = CPD_TARGET_CATEGORIES if qtype == "cpd" else INF_TARGET_CATEGORIES
+            fig = plot_success_rate_bar(
+                sub,
+                category_col="target_category",
+                out_dir=figures_dir,
+                filename_prefix=f"{qtype}_success_rate_by_target_category",
+                title_prefix=f"{qtype.capitalize()} Success Rate by Target Category",
+                category_order=order,
+            )
+            if fig:
+                figures.append(fig)
+
+    if not success_strategy.empty:
+        for qtype in sorted(success_strategy["query_type"].dropna().unique()):
+            sub = success_strategy[success_strategy["query_type"] == qtype]
+            order = CPD_EVIDENCE_STRATEGIES if qtype == "cpd" else None
+            fig = plot_success_rate_bar(
+                sub,
+                category_col="evidence_strategy",
+                out_dir=figures_dir,
+                filename_prefix=f"{qtype}_success_rate_by_evidence_strategy",
+                title_prefix=f"{qtype.capitalize()} Success Rate by Evidence Strategy",
+                category_order=order,
+            )
+            if fig:
+                figures.append(fig)
+
+    if not success_task.empty:
+        sub = success_task[success_task["query_type"] == "inference"]
+        fig = plot_success_rate_bar(
+            sub,
+            category_col="task",
+            out_dir=figures_dir,
+            filename_prefix="inference_success_rate_by_task",
+            title_prefix="Inference Success Rate by Task",
+            category_order=INF_TASKS,
+        )
+        if fig:
+            figures.append(fig)
+
+    if not success_mode.empty:
+        sub = success_mode[success_mode["query_type"] == "inference"]
+        fig = plot_success_rate_bar(
+            sub,
+            category_col="evidence_mode",
+            out_dir=figures_dir,
+            filename_prefix="inference_success_rate_by_evidence_mode",
+            title_prefix="Inference Success Rate by Evidence Mode",
+            category_order=INF_EVIDENCE_MODES,
+        )
+        if fig:
+            figures.append(fig)
+
+    # Error plots
+    if not error_df.empty:
+        for qtype in sorted(error_df["query_type"].dropna().unique()):
+            sub = error_df[error_df["query_type"] == qtype]
+            fig = _plot_error_type_distribution(
+                sub,
+                out_dir=figures_dir,
+                filename=f"errors_by_type_{qtype}.png",
+                title=f"{qtype.capitalize()} Error Type Distribution",
+            )
+            if fig:
+                figures.append(fig)
 
     if not figures:
         figures = sorted(figures_dir.glob("*.png"))
