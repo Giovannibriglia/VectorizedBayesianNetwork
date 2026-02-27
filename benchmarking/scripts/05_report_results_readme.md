@@ -2,6 +2,7 @@
 
 This step summarizes a completed benchmark run by joining predictions with ground truth, computing metrics (KL/Wasserstein/JSD), and producing tables and plots sliced by query categories.
 It also reports success rates and error breakdowns using the per-query `ok` fields written during benchmarking.
+It can additionally report metrics over **solvability partitions** that separate queries by which methods solved them.
 
 ---
 
@@ -27,6 +28,9 @@ python -m benchmarking.scripts.05_report_results \
 - `--include_time` / `--no-include_time`: include time tables and plots (default: enabled).
 - `--include_pareto` / `--no-include_pareto`: include Pareto plots (default: enabled).
 - `--pareto_split` (optional): `none|mode|task|target_category` (default: `none`).
+- `--min_partition_queries` (optional): minimum queries required to emit a subset partition (default: `1`).
+- `--max_subsets` (optional): limit subset partitions to top-K by size (default: all).
+- `--include_all_methods_in_subsets` (optional): include all methods in subset reports (default: false).
 
 ---
 
@@ -34,9 +38,20 @@ python -m benchmarking.scripts.05_report_results \
 
 ```
 <run_dir>/report/
-  tables/
-  figures/
-  report.md
+  index.md
+  all/
+    tables/
+    figures/
+  common/
+    tables/
+    figures/
+  subset_<ensemble_slug>/
+    tables/
+    figures/
+    subset_meta.json
+  ...
+  partition_inventory.csv
+  partition_inventory.md
 ```
 
 The reporter auto-detects the run mode (`cpds` or `inference`) from `run_metadata.json`
@@ -90,6 +105,11 @@ Error breakdown tables (CSV + Markdown):
 
 - `top_errors_by_model.csv` (model x mode x error_type)
 - `top_error_signatures.csv` (model x mode x error_signature + example)
+
+Partition inventory tables (CSV + Markdown):
+
+- `partition_inventory.csv`
+- `partition_inventory.md`
 
 ### Figures
 
@@ -151,4 +171,55 @@ Predictions are joined to GT using:
 - Run-level error summaries are written during benchmarking to `<run_dir>/errors/errors_summary.json` and `.md`.
 
 Line-plot success-rate tables (`success_rate_vs_*.csv`) include:
-`model`, `mode`, `x_bin_left`, `x_bin_right`, `x_mid`, `success_rate`, `n_attempts`.
+`model`, `mode`, `x_bin_left`, `x_bin_right`, `x_mid`, `success_rate`, `n_attempts`, `n_ok`.
+
+## Solvability Partitions
+
+Partitions are computed per run mode (`cpds` or `inference`) using per-query
+`ok` values across all methods in the run:
+
+- **all**: all queries.
+- **common**: queries solved by every method.
+- **subset_<ensemble_slug>**: queries in ALL but not in COMMON, grouped by the
+  exact solver ensemble.
+- **unsolved**: no method solved (counts only; no reports).
+
+Subsets are defined **only on non-common queries**: each query in `ALL \ COMMON`
+is assigned to a subset by its exact solver ensemble (empty ensembles are ignored).
+The solver-set label (sorted `method_id`s joined by `|`, e.g., `m1|m3`) is recorded
+in `partition_inventory.csv` and `subset_meta.json`.
+
+`partition_inventory.csv` includes `partition_type`, `solver_set`, `n_queries`,
+`share_of_total`, and `share_of_non_common` (for subset partitions).
+
+Folder naming uses a stable ensemble slug:
+
+- sort method IDs in the ensemble
+- slugify each (lowercase, non-alnum → `_`, collapse repeats)
+- join with `__`
+- if the slug exceeds 120 chars, shorten to `subset_<first_two>__<hash8>`
+
+Query identity (`query_key`) is computed to match “the same query” across methods:
+it always includes `query_type` and `problem_id`, prefers `skeleton_id` when present,
+falls back to `query_id` when available, and otherwise uses a composite of stable
+query fields (`target`, `task`, `evidence_mode`, `evidence_strategy`, `evidence_size`,
+`target_set`, `evidence_vars`, etc.).
+
+Partitions are output under `report/<partition_name>/` and include the same
+tables/figures as the main report. Subset partitions are only emitted when
+they contain at least `--min_partition_queries` queries, and `--max_subsets`
+can cap the number of subsets.
+
+By default, subset reports only include methods that are part of the ensemble.
+Use `--include_all_methods_in_subsets` to include all methods in subset reports.
+
+`report/index.md` is a landing page that links to each partition’s tables,
+figures, and subset metadata.
+
+For **common** and **subset** partitions, success-rate tables still reflect
+per-method `mean(ok)` (1.0 for solvers, 0.0 for non-solvers by construction).
+Partition reports also include coverage tables/plots (`coverage_vs_nodes.csv`,
+`coverage_vs_edges.csv`, `coverage_vs_evidence_size.csv`) to make the slice sizes explicit.
+
+Each `subset_<ensemble_slug>/subset_meta.json` includes the solver set, query counts,
+share of total, share of non-common, and a short note describing the partition definition.

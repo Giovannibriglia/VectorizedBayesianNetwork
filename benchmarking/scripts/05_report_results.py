@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -59,10 +61,15 @@ RECORD_COLUMNS = [
     "evidence_strategy",
     "evidence_mode",
     "evidence_size",
+    "evidence_vars",
     "task",
+    "target_set",
     "skeleton_id",
     "mb_size",
     "parent_size",
+    "mc_id",
+    "query_id",
+    "query_index",
     "run_id",
     "seed",
     "generator",
@@ -245,16 +252,23 @@ def _format_number(value: Any) -> str:
     return str(value)
 
 
-def _write_md_table(df: pd.DataFrame, path: Path) -> None:
+def _df_to_md_table(df: pd.DataFrame) -> list[str]:
     if df.empty or not list(df.columns):
-        path.write_text("")
-        return
+        return []
     headers = [str(col) for col in df.columns]
     lines = ["| " + " | ".join(headers) + " |"]
     lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
     for _, row in df.iterrows():
         values = [_format_number(row[col]) for col in df.columns]
         lines.append("| " + " | ".join(values) + " |")
+    return lines
+
+
+def _write_md_table(df: pd.DataFrame, path: Path) -> None:
+    lines = _df_to_md_table(df)
+    if not lines:
+        path.write_text("")
+        return
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -335,6 +349,343 @@ def _aggregate_success(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_query_key(row: pd.Series | dict) -> tuple | None:
+    payload = row if isinstance(row, dict) else row.to_dict()
+    query_type = payload.get("query_type") or payload.get("type")
+    problem_id = payload.get("problem_id") or payload.get("problem")
+    if not query_type or not problem_id:
+        return None
+    skeleton_id = payload.get("skeleton_id")
+    target = payload.get("target")
+    task = payload.get("task") if query_type == "inference" else None
+    if skeleton_id:
+        return ("skeleton", query_type, problem_id, skeleton_id, target, task)
+    query_id = payload.get("query_id") or payload.get("id")
+    if query_id:
+        return ("id", query_type, problem_id, query_id)
+    evidence_vars = payload.get("evidence_vars")
+    if isinstance(evidence_vars, list):
+        evidence_vars = tuple(evidence_vars)
+    target_set = payload.get("target_set")
+    if isinstance(target_set, list):
+        target_set = tuple(target_set)
+    return (
+        "fields",
+        query_type,
+        problem_id,
+        target,
+        payload.get("target_category"),
+        task,
+        payload.get("evidence_mode"),
+        payload.get("evidence_strategy"),
+        payload.get("evidence_size"),
+        payload.get("mc_id"),
+        payload.get("query_index"),
+        evidence_vars,
+        target_set,
+    )
+
+
+def _solver_set_str(solver_set: frozenset[str]) -> str:
+    if not solver_set:
+        return ""
+    return "|".join(sorted(solver_set))
+
+
+def _slugify_method_id(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value).lower())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or "method"
+
+
+def _ensemble_slug(methods: list[str], used: set[str] | None = None) -> str:
+    slugs = [_slugify_method_id(method) for method in methods]
+    base = "__".join(slugs)
+    slug = base
+    if len(slug) > 120:
+        hash8 = hashlib.md5("|".join(methods).encode("utf-8")).hexdigest()[:8]
+        head = "__".join(slugs[:2]) if slugs else "ensemble"
+        slug = f"{head}__{hash8}"
+    if used is None:
+        return slug
+    candidate = slug
+    if candidate in used:
+        hash8 = hashlib.md5("|".join(methods).encode("utf-8")).hexdigest()[:8]
+        if not candidate.endswith(hash8):
+            candidate = f"{candidate}__{hash8}"
+    used.add(candidate)
+    return candidate
+
+
+def compute_partitions(
+    attempts_df: pd.DataFrame,
+    *,
+    min_partition_queries: int,
+    max_subsets: int | None,
+) -> tuple[dict[str, set], pd.DataFrame]:
+    partition_sets: dict[str, set] = {"all": set(), "common": set()}
+    subset_df = attempts_df[attempts_df["query_key"].notna()].copy()
+    methods = sorted(subset_df["method_id"].dropna().unique())
+    if subset_df.empty or not methods:
+        inventory_rows = [
+            {
+                "partition_name": "all",
+                "partition_type": "all",
+                "solver_set": "",
+                "n_queries": 0,
+                "share_of_total": 0.0,
+                "share_of_non_common": np.nan,
+            },
+            {
+                "partition_name": "common",
+                "partition_type": "common",
+                "solver_set": "",
+                "n_queries": 0,
+                "share_of_total": 0.0,
+                "share_of_non_common": np.nan,
+            },
+        ]
+        return partition_sets, pd.DataFrame(inventory_rows)
+
+    ok_series = subset_df[["query_key", "method_id", "ok"]].copy()
+    ok_series["ok"] = ok_series["ok"].fillna(False).astype(bool)
+    ok_matrix = (
+        ok_series.groupby(["query_key", "method_id"])["ok"]
+        .max()
+        .unstack(fill_value=False)
+    )
+    for method in methods:
+        if method not in ok_matrix.columns:
+            ok_matrix[method] = False
+    ok_matrix = ok_matrix[methods]
+
+    solver_sets: dict[tuple, frozenset[str]] = {}
+    for query_key, row in ok_matrix.iterrows():
+        solved = frozenset(method for method in methods if bool(row.get(method, False)))
+        solver_sets[query_key] = solved
+
+    all_keys = set(ok_matrix.index)
+    common_set = frozenset(methods)
+    common_keys = {
+        key for key, solver_set in solver_sets.items() if solver_set == common_set
+    }
+    non_common_keys = all_keys - common_keys
+    total_queries = len(all_keys)
+    non_common_total = len(non_common_keys)
+
+    partition_sets["all"] = all_keys
+    partition_sets["common"] = common_keys
+
+    counts: dict[frozenset[str], int] = {}
+    for query_key in non_common_keys:
+        solver_set = solver_sets.get(query_key, frozenset())
+        if not solver_set:
+            continue
+        counts[solver_set] = counts.get(solver_set, 0) + 1
+
+    subset_items = [
+        (solver_set, count)
+        for solver_set, count in counts.items()
+        if count >= int(min_partition_queries)
+    ]
+    subset_items.sort(key=lambda item: (-item[1], _solver_set_str(item[0])))
+    if max_subsets is not None:
+        subset_items = subset_items[: int(max_subsets)]
+
+    used_slugs: set[str] = set()
+    inventory_rows = [
+        {
+            "partition_name": "all",
+            "partition_type": "all",
+            "solver_set": "",
+            "n_queries": len(all_keys),
+            "share_of_total": (
+                float(len(all_keys) / total_queries) if total_queries else 0.0
+            ),
+            "share_of_non_common": np.nan,
+        },
+        {
+            "partition_name": "common",
+            "partition_type": "common",
+            "solver_set": "",
+            "n_queries": len(common_keys),
+            "share_of_total": (
+                float(len(common_keys) / total_queries) if total_queries else 0.0
+            ),
+            "share_of_non_common": np.nan,
+        },
+    ]
+
+    for solver_set, count in subset_items:
+        label = _solver_set_str(solver_set)
+        ensemble_slug = _ensemble_slug(sorted(solver_set), used_slugs)
+        name = f"subset_{ensemble_slug}"
+        keys = {key for key in non_common_keys if solver_sets.get(key) == solver_set}
+        partition_sets[name] = keys
+        share_total = float(count / total_queries) if total_queries else 0.0
+        share_non_common = float(count / non_common_total) if non_common_total else 0.0
+        inventory_rows.append(
+            {
+                "partition_name": name,
+                "partition_type": "subset",
+                "solver_set": label,
+                "n_queries": int(len(keys)),
+                "share_of_total": share_total,
+                "share_of_non_common": share_non_common,
+            }
+        )
+
+    inventory_df = pd.DataFrame(inventory_rows)
+    return partition_sets, inventory_df
+
+
+def _format_method_list(methods: list[str]) -> str:
+    if not methods:
+        return ""
+    return "|".join(methods)
+
+
+def _write_partition_inventory(
+    out_dir: Path,
+    *,
+    mode_label: str,
+    inventory_df: pd.DataFrame,
+    methods: list[str],
+) -> Path:
+    columns = [
+        "partition_name",
+        "partition_type",
+        "solver_set",
+        "n_queries",
+        "share_of_total",
+        "share_of_non_common",
+    ]
+    inv = inventory_df.copy()
+    if inv.empty:
+        inv = pd.DataFrame(columns=columns)
+    inv = inv[[col for col in columns if col in inv.columns]]
+
+    path = out_dir / "partition_inventory.csv"
+    _write_table(inv, path)
+
+    lines = [f"# Partition inventory ({mode_label})", ""]
+    lines.append("## Methods")
+    lines.append("")
+    lines.append(f"- n_methods: {len(methods)}")
+    lines.append(f"- methods_considered: {', '.join(methods) if methods else ''}")
+    lines.append("")
+    lines.append("## Partitions")
+    lines.append("")
+    table_lines = _df_to_md_table(inv)
+    if table_lines:
+        lines.extend(table_lines)
+    else:
+        lines.append("(no partitions)")
+    path.with_suffix(".md").write_text("\n".join(lines).rstrip() + "\n")
+    return path
+
+
+def _write_report_index(
+    out_dir: Path,
+    *,
+    run_dir: Path,
+    mode_label: str,
+    methods: list[str],
+    inventory_df: pd.DataFrame,
+) -> Path:
+    total_queries = 0
+    common_queries = 0
+    if not inventory_df.empty and "partition_name" in inventory_df.columns:
+        all_row = inventory_df[inventory_df["partition_name"] == "all"]
+        if not all_row.empty:
+            try:
+                total_queries = int(all_row.iloc[0]["n_queries"])
+            except Exception:
+                total_queries = 0
+        common_row = inventory_df[inventory_df["partition_name"] == "common"]
+        if not common_row.empty:
+            try:
+                common_queries = int(common_row.iloc[0]["n_queries"])
+            except Exception:
+                common_queries = 0
+    non_common_queries = max(total_queries - common_queries, 0)
+
+    lines = [f"# Report: {run_dir.name}", ""]
+    lines.append(f"- mode: {mode_label}")
+    lines.append(f"- methods considered: {', '.join(methods) if methods else '(none)'}")
+    lines.append(f"- n_total_queries: {total_queries}")
+    lines.append(f"- n_common_queries: {common_queries}")
+    lines.append(f"- n_non_common_queries: {non_common_queries}")
+    lines.append("")
+    lines.append("## Partitions")
+    lines.append("")
+
+    if inventory_df.empty:
+        lines.append("(no partitions)")
+    else:
+        display_df = inventory_df.copy()
+        if "partition_name" in display_df.columns:
+            display_df["partition"] = display_df["partition_name"].apply(
+                lambda name: f"[{name}]({name}/)" if name else ""
+            )
+        display_cols = [
+            col
+            for col in [
+                "partition",
+                "partition_type",
+                "solver_set",
+                "n_queries",
+                "share_of_total",
+                "share_of_non_common",
+            ]
+            if col in display_df.columns
+        ]
+        table_lines = _df_to_md_table(display_df[display_cols])
+        if table_lines:
+            lines.extend(table_lines)
+        else:
+            lines.append("(no partitions)")
+
+    if not inventory_df.empty:
+        lines.append("")
+        lines.append("## Partition Links")
+        lines.append("")
+        for _, row in inventory_df.iterrows():
+            name = row.get("partition_name", "")
+            if not name:
+                continue
+            links = [
+                f"[tables]({name}/tables/)",
+                f"[figures]({name}/figures/)",
+            ]
+            if isinstance(name, str) and name.startswith("subset_"):
+                links.append(f"[subset_meta.json]({name}/subset_meta.json)")
+            lines.append(f"- `{name}`: " + " | ".join(links))
+
+        subset_rows = inventory_df[
+            inventory_df["partition_name"].astype(str).str.startswith("subset_")
+        ]
+        if not subset_rows.empty:
+            subset_rows = subset_rows.sort_values(
+                ["n_queries", "partition_name"], ascending=[False, True]
+            )
+            top_k = subset_rows.head(10)
+            lines.append("")
+            lines.append("## Top subsets")
+            lines.append("")
+            for _, row in top_k.iterrows():
+                name = row.get("partition_name", "")
+                solver_set = row.get("solver_set", "")
+                n_queries = row.get("n_queries", "")
+                lines.append(
+                    f"- `{name}` ({n_queries} queries, solver_set={solver_set})"
+                )
+
+    path = out_dir / "index.md"
+    path.write_text("\n".join(lines).rstrip() + "\n")
+    return path
+
+
 def _build_success_rate_line_table(
     df: pd.DataFrame,
     *,
@@ -350,6 +701,7 @@ def _build_success_rate_line_table(
         "x_mid",
         "success_rate",
         "n_attempts",
+        "n_ok",
     ]
     if df.empty:
         return pd.DataFrame(columns=columns)
@@ -393,6 +745,7 @@ def _build_success_rate_line_table(
                     "x_mid": float(x_val),
                     "success_rate": success_rate,
                     "n_attempts": n_attempts,
+                    "n_ok": int(ok_vals.sum()),
                 }
             )
         return pd.DataFrame(rows, columns=columns)
@@ -429,6 +782,86 @@ def _build_success_rate_line_table(
                 "x_mid": float((left + right) / 2.0),
                 "success_rate": success_rate,
                 "n_attempts": n_attempts,
+                "n_ok": int(ok_vals.sum()),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _build_coverage_line_table(
+    df: pd.DataFrame,
+    *,
+    x_col: str,
+    n_bins: int = 4,
+    discrete_max: int = 20,
+) -> pd.DataFrame:
+    columns = ["model", "mode", "x_bin_left", "x_bin_right", "x_mid", "n_attempts"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    data = df[df[x_col].notna()].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    series = pd.to_numeric(data[x_col], errors="coerce")
+    data = data[series.notna()].copy()
+    data[x_col] = series.dropna().astype(float)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    use_discrete = False
+    if x_col == "evidence_size":
+        unique_vals = sorted(data[x_col].unique())
+        if (
+            unique_vals
+            and len(unique_vals) <= discrete_max
+            and all(_is_int_like(v) for v in unique_vals)
+        ):
+            use_discrete = True
+
+    mode_col = "mode" if "mode" in data.columns else "query_type"
+    rows: list[dict] = []
+    if use_discrete:
+        grouped = data.groupby(["method_id", mode_col, x_col], dropna=False)
+        for (method_id, mode, x_val), group in grouped:
+            n_attempts = int(len(group))
+            rows.append(
+                {
+                    "model": method_id,
+                    "mode": mode,
+                    "x_bin_left": float(x_val),
+                    "x_bin_right": float(x_val),
+                    "x_mid": float(x_val),
+                    "n_attempts": n_attempts,
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
+
+    edges = _compute_bin_edges(data[x_col], n_bins=n_bins)
+    if not edges or len(edges) < 2:
+        return pd.DataFrame(columns=columns)
+    data["_bin_index"] = pd.cut(
+        data[x_col],
+        bins=edges,
+        labels=False,
+        include_lowest=True,
+        right=True,
+    )
+    grouped = data.groupby(["method_id", mode_col, "_bin_index"], dropna=False)
+    for (method_id, mode, bin_idx), group in grouped:
+        if bin_idx is None or (isinstance(bin_idx, float) and math.isnan(bin_idx)):
+            continue
+        bin_idx = int(bin_idx)
+        if bin_idx < 0 or bin_idx >= len(edges) - 1:
+            continue
+        left = float(edges[bin_idx])
+        right = float(edges[bin_idx + 1])
+        rows.append(
+            {
+                "model": method_id,
+                "mode": mode,
+                "x_bin_left": left,
+                "x_bin_right": right,
+                "x_mid": float((left + right) / 2.0),
+                "n_attempts": int(len(group)),
             }
         )
     return pd.DataFrame(rows, columns=columns)
@@ -894,6 +1327,7 @@ def _build_records(
                 query_type = query.get("type")
                 target = query.get("target")
                 target_category = query.get("target_category")
+                target_set = query.get("target_set")
                 evidence_strategy = query.get("evidence_strategy")
                 evidence = (
                     query.get("evidence")
@@ -909,6 +1343,9 @@ def _build_records(
                 if not isinstance(ev_vars, list):
                     ev_vars = list(ev_vars) if ev_vars is not None else []
                 evidence_size = len(ev_vars)
+                query_id = query.get("id")
+                query_index = query.get("index")
+                mc_id = evidence.get("mc_id") or query.get("mc_id")
                 task = query.get("task")
                 skeleton_id = evidence.get("skeleton_id") or query.get("skeleton_id")
                 batching = (
@@ -972,9 +1409,14 @@ def _build_records(
                         "evidence_mode": evidence_mode,
                         "evidence_size": evidence_size,
                         "task": task,
+                        "target_set": target_set,
                         "skeleton_id": skeleton_id,
                         "mb_size": mb_size,
                         "parent_size": parent_size,
+                        "mc_id": mc_id,
+                        "query_id": query_id,
+                        "query_index": query_index,
+                        "evidence_vars": ev_vars,
                         "run_id": run_id,
                         "seed": run_seed,
                         "generator": run_generator,
@@ -1043,6 +1485,7 @@ def _build_attempts(
                     query_type = "cpd" if subdir == "cpds" else "inference"
                 target = query.get("target")
                 target_category = query.get("target_category")
+                target_set = query.get("target_set")
                 evidence_strategy = query.get("evidence_strategy")
                 evidence = (
                     query.get("evidence")
@@ -1058,6 +1501,9 @@ def _build_attempts(
                 if not isinstance(ev_vars, list):
                     ev_vars = list(ev_vars) if ev_vars is not None else []
                 evidence_size = len(ev_vars)
+                query_id = query.get("id")
+                query_index = query.get("index")
+                mc_id = evidence.get("mc_id") or query.get("mc_id")
                 task = query.get("task")
                 skeleton_id = evidence.get("skeleton_id") or query.get("skeleton_id")
 
@@ -1138,7 +1584,12 @@ def _build_attempts(
                         "evidence_mode": evidence_mode,
                         "evidence_size": evidence_size,
                         "task": task,
+                        "target_set": target_set,
                         "skeleton_id": skeleton_id,
+                        "mc_id": mc_id,
+                        "query_id": query_id,
+                        "query_index": query_index,
+                        "evidence_vars": ev_vars,
                         "run_id": run_id,
                         "seed": run_seed,
                         "generator": run_generator,
@@ -1170,8 +1621,13 @@ def _build_attempts(
                 "evidence_strategy",
                 "evidence_mode",
                 "evidence_size",
+                "evidence_vars",
                 "task",
+                "target_set",
                 "skeleton_id",
+                "mc_id",
+                "query_id",
+                "query_index",
                 "run_id",
                 "seed",
                 "generator",
@@ -1512,6 +1968,43 @@ def plot_success_rate_line(
     return out_path
 
 
+def plot_coverage_line(
+    df: pd.DataFrame,
+    *,
+    x_label: str,
+    out_dir: Path,
+    filename: str,
+    title: str,
+) -> Path | None:
+    if df.empty:
+        return None
+    data = df[df["n_attempts"].notna()]
+    if data.empty:
+        return None
+    plt.figure(figsize=(8, 4.5))
+    for model in sorted(data["model"].dropna().unique()):
+        sub = data[data["model"] == model].sort_values("x_mid")
+        if sub.empty:
+            continue
+        plt.errorbar(
+            sub["x_mid"].astype(float),
+            sub["n_attempts"].astype(float),
+            fmt="-o",
+            capsize=3,
+            label=model,
+        )
+    plt.title(title)
+    plt.xlabel(x_label)
+    plt.ylabel("n_queries")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    out_path = out_dir / filename
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+
+
 def _plot_error_type_distribution(
     df: pd.DataFrame,
     *,
@@ -1680,94 +2173,70 @@ def _detect_run_mode(run_dir: Path) -> str | None:
     return None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run_dir", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, default=None)
-    parser.add_argument(
-        "--gt_source",
-        type=str,
-        default="folder",
-        choices=["embedded", "folder", "compute"],
-    )
-    parser.add_argument(
-        "--gt_key",
-        type=str,
-        default="result.ground_truth.output.probs",
-    )
-    parser.add_argument("--models", type=str, default=None)
-    parser.add_argument("--max_records", type=int, default=None)
-    parser.add_argument("--eps", type=float, default=1e-12)
-    parser.add_argument(
-        "--include_time",
-        action="store_true",
-        default=True,
-        help="Include time tables and plots (default: true)",
-    )
-    parser.add_argument(
-        "--no-include_time",
-        dest="include_time",
-        action="store_false",
-        help="Disable time tables and plots",
-    )
-    parser.add_argument(
-        "--include_pareto",
-        action="store_true",
-        default=True,
-        help="Include Pareto plots (default: true)",
-    )
-    parser.add_argument(
-        "--no-include_pareto",
-        dest="include_pareto",
-        action="store_false",
-        help="Disable Pareto plots",
-    )
-    parser.add_argument(
-        "--pareto_split",
-        type=str,
-        default="none",
-        choices=["none", "mode", "task", "target_category"],
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
+def _normalize_query_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value == "cpds":
+        return "cpd"
+    return value
 
-    args = parser.parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    run_dir = Path(args.run_dir).resolve()
-    if not run_dir.exists():
-        raise SystemExit(f"Run dir not found: {run_dir}")
-    out_dir = Path(args.out_dir).resolve() if args.out_dir else run_dir / "report"
+
+def _infer_query_type(
+    run_mode: str | None, df: pd.DataFrame, attempts_df: pd.DataFrame
+) -> tuple[str | None, str]:
+    if run_mode == "cpds":
+        return "cpd", "cpds"
+    if run_mode == "inference":
+        return "inference", "inference"
+
+    qtypes: set[str] = set()
+    for frame in (df, attempts_df):
+        if frame is not None and not frame.empty and "query_type" in frame.columns:
+            qtypes.update(
+                _normalize_query_type(qt)
+                for qt in frame["query_type"].dropna().unique()
+            )
+    qtypes.discard(None)
+    if len(qtypes) == 1:
+        qt = next(iter(qtypes))
+        label = "cpds" if qt == "cpd" else str(qt)
+        return qt, label
+    if not qtypes:
+        return None, "unknown"
+    qt = sorted(qtypes)[0]
+    label = "cpds" if qt == "cpd" else str(qt)
+    logging.warning("Multiple query types detected; defaulting partitions to %s", qt)
+    return qt, label
+
+
+def generate_report_for_partition(
+    *,
+    df: pd.DataFrame,
+    attempts_df: pd.DataFrame,
+    out_dir: Path,
+    include_time: bool,
+    include_pareto: bool,
+    pareto_split: str,
+    include_coverage: bool,
+    allowed_query_types: set[str] | None = None,
+    methods_to_show: list[str] | None = None,
+) -> tuple[list[Path], list[Path]]:
+    if allowed_query_types:
+        if not df.empty:
+            df = df[df["query_type"].isin(allowed_query_types)]
+        if not attempts_df.empty:
+            attempts_df = attempts_df[
+                attempts_df["query_type"].isin(allowed_query_types)
+            ]
+    if methods_to_show:
+        methods_set = set(methods_to_show)
+        if not df.empty:
+            df = df[df["method_id"].isin(methods_set)]
+        if not attempts_df.empty:
+            attempts_df = attempts_df[attempts_df["method_id"].isin(methods_set)]
+
     tables_dir = ensure_dir(out_dir / "tables")
     figures_dir = ensure_dir(out_dir / "figures")
-
-    model_filter = None
-    if args.models:
-        model_filter = {m.strip() for m in args.models.split(",") if m.strip()}
-
-    run_mode = _detect_run_mode(run_dir)
-    if run_mode:
-        logging.info("Detected run mode: %s", run_mode)
-
-    df, errors = _build_records(
-        run_dir=run_dir,
-        gt_source=args.gt_source,
-        gt_key=args.gt_key,
-        max_records=args.max_records,
-        eps=float(args.eps),
-        model_filter=model_filter,
-    )
-    attempts_df = _build_attempts(
-        run_dir=run_dir,
-        max_records=args.max_records,
-        model_filter=model_filter,
-    )
 
     if df.empty:
         logging.warning("No records to report. Check GT source and inputs.")
@@ -1834,120 +2303,22 @@ def main() -> None:
 
     cpd = df[df["query_type"] == "cpd"]
     inference = df[df["query_type"] == "inference"]
-
-    cpd_by_target = aggregate_table(
-        cpd,
-        ["method_id", "model_name", "config_id", "config_hash", "target_category"],
-        metric_cols,
-    )
-    path = tables_dir / "cpd_by_target_category.csv"
-    _write_table(cpd_by_target, path)
-    tables.append(path)
-
-    cpd_by_strategy = aggregate_table(
-        cpd,
-        ["method_id", "model_name", "config_id", "config_hash", "evidence_strategy"],
-        metric_cols,
-    )
-    path = tables_dir / "cpd_by_evidence_strategy.csv"
-    _write_table(cpd_by_strategy, path)
-    tables.append(path)
-
-    inf_by_target = aggregate_table(
-        inference,
-        ["method_id", "model_name", "config_id", "config_hash", "target_category"],
-        metric_cols,
-    )
-    path = tables_dir / "inference_by_target_category.csv"
-    _write_table(inf_by_target, path)
-    tables.append(path)
-
-    inf_by_task = aggregate_table(
-        inference,
-        ["method_id", "model_name", "config_id", "config_hash", "task"],
-        metric_cols,
-    )
-    path = tables_dir / "inference_by_task.csv"
-    _write_table(inf_by_task, path)
-    tables.append(path)
-
-    inf_by_mode = aggregate_table(
-        inference,
-        ["method_id", "model_name", "config_id", "config_hash", "evidence_mode"],
-        metric_cols,
-    )
-    path = tables_dir / "inference_by_evidence_mode.csv"
-    _write_table(inf_by_mode, path)
-    tables.append(path)
-
-    batching_metrics = aggregate_batching_table(
-        inference,
-        ["method_id", "model_name", "config_id", "config_hash"],
-    )
-    if not batching_metrics.empty:
-        path = tables_dir / "inference_batching_metrics.csv"
-        _write_table(batching_metrics, path)
-        tables.append(path)
-
-    cpd_mb = _two_stage_aggregate(cpd, "mb_size", metric_cols)
-    path = tables_dir / "cpd_by_mb_size.csv"
-    _write_table(cpd_mb, path)
-    tables.append(path)
-
-    cpd_parent = _two_stage_aggregate(cpd, "parent_size", metric_cols)
-    path = tables_dir / "cpd_by_parent_size.csv"
-    _write_table(cpd_parent, path)
-    tables.append(path)
-
-    cpd_nodes = _two_stage_aggregate(cpd, "n_nodes", metric_cols)
-    path = tables_dir / "cpd_by_n_nodes.csv"
-    _write_table(cpd_nodes, path)
-    tables.append(path)
-
-    cpd_edges = _two_stage_aggregate(cpd, "n_edges", metric_cols)
-    path = tables_dir / "cpd_by_n_edges.csv"
-    _write_table(cpd_edges, path)
-    tables.append(path)
-
-    inf_ev_size = _two_stage_aggregate(inference, "evidence_size", metric_cols)
-    path = tables_dir / "inference_by_evidence_size.csv"
-    _write_table(inf_ev_size, path)
-    tables.append(path)
-
-    inf_nodes = _two_stage_aggregate(inference, "n_nodes", metric_cols)
-    path = tables_dir / "inference_by_n_nodes.csv"
-    _write_table(inf_nodes, path)
-    tables.append(path)
-
-    inf_edges = _two_stage_aggregate(inference, "n_edges", metric_cols)
-    path = tables_dir / "inference_by_n_edges.csv"
-    _write_table(inf_edges, path)
-    tables.append(path)
-
-    inf_ev_size_mode = _two_stage_aggregate(
-        inference, "evidence_size", metric_cols, extra_group_cols=["evidence_mode"]
+    include_cpd = allowed_query_types is None or "cpd" in allowed_query_types
+    include_inference = (
+        allowed_query_types is None or "inference" in allowed_query_types
     )
 
-    time_tables: dict[str, pd.DataFrame] = {}
-    if args.include_time:
-        overall_time = aggregate_time_table(
-            df, ["method_id", "model_name", "config_id", "config_hash", "query_type"]
-        )
-        path = tables_dir / "overall_time_by_method.csv"
-        _write_table(overall_time, path)
-        tables.append(path)
-        time_tables["overall"] = overall_time
-
-        cpd_time_by_target = aggregate_time_table(
+    if include_cpd:
+        cpd_by_target = aggregate_table(
             cpd,
             ["method_id", "model_name", "config_id", "config_hash", "target_category"],
+            metric_cols,
         )
-        path = tables_dir / "cpd_time_by_target_category.csv"
-        _write_table(cpd_time_by_target, path)
+        path = tables_dir / "cpd_by_target_category.csv"
+        _write_table(cpd_by_target, path)
         tables.append(path)
-        time_tables["cpd_by_target"] = cpd_time_by_target
 
-        cpd_time_by_strategy = aggregate_time_table(
+        cpd_by_strategy = aggregate_table(
             cpd,
             [
                 "method_id",
@@ -1956,102 +2327,234 @@ def main() -> None:
                 "config_hash",
                 "evidence_strategy",
             ],
+            metric_cols,
         )
-        path = tables_dir / "cpd_time_by_evidence_strategy.csv"
-        _write_table(cpd_time_by_strategy, path)
+        path = tables_dir / "cpd_by_evidence_strategy.csv"
+        _write_table(cpd_by_strategy, path)
         tables.append(path)
-        time_tables["cpd_by_strategy"] = cpd_time_by_strategy
 
-        cpd_time_mb = _two_stage_aggregate(cpd, "mb_size", ["time"])
-        path = tables_dir / "cpd_time_by_mb_size.csv"
-        _write_table(cpd_time_mb, path)
+        cpd_mb = _two_stage_aggregate(cpd, "mb_size", metric_cols)
+        path = tables_dir / "cpd_by_mb_size.csv"
+        _write_table(cpd_mb, path)
         tables.append(path)
-        time_tables["cpd_mb"] = cpd_time_mb
 
-        cpd_time_parent = _two_stage_aggregate(cpd, "parent_size", ["time"])
-        path = tables_dir / "cpd_time_by_parent_size.csv"
-        _write_table(cpd_time_parent, path)
+        cpd_parent = _two_stage_aggregate(cpd, "parent_size", metric_cols)
+        path = tables_dir / "cpd_by_parent_size.csv"
+        _write_table(cpd_parent, path)
         tables.append(path)
-        time_tables["cpd_parent"] = cpd_time_parent
 
-        cpd_time_nodes = _two_stage_aggregate(cpd, "n_nodes", ["time"])
-        path = tables_dir / "cpd_time_by_n_nodes.csv"
-        _write_table(cpd_time_nodes, path)
+        cpd_nodes = _two_stage_aggregate(cpd, "n_nodes", metric_cols)
+        path = tables_dir / "cpd_by_n_nodes.csv"
+        _write_table(cpd_nodes, path)
         tables.append(path)
-        time_tables["cpd_nodes"] = cpd_time_nodes
 
-        cpd_time_edges = _two_stage_aggregate(cpd, "n_edges", ["time"])
-        path = tables_dir / "cpd_time_by_n_edges.csv"
-        _write_table(cpd_time_edges, path)
+        cpd_edges = _two_stage_aggregate(cpd, "n_edges", metric_cols)
+        path = tables_dir / "cpd_by_n_edges.csv"
+        _write_table(cpd_edges, path)
         tables.append(path)
-        time_tables["cpd_edges"] = cpd_time_edges
 
-        cpd_time_ev_size = _two_stage_aggregate(cpd, "evidence_size", ["time"])
-        path = tables_dir / "cpd_time_by_evidence_size.csv"
-        _write_table(cpd_time_ev_size, path)
-        tables.append(path)
-        time_tables["cpd_ev_size"] = cpd_time_ev_size
-
-        inf_time_by_target = aggregate_time_table(
+    if include_inference:
+        inf_by_target = aggregate_table(
             inference,
             ["method_id", "model_name", "config_id", "config_hash", "target_category"],
+            metric_cols,
         )
-        path = tables_dir / "inference_time_by_target_category.csv"
-        _write_table(inf_time_by_target, path)
+        path = tables_dir / "inference_by_target_category.csv"
+        _write_table(inf_by_target, path)
         tables.append(path)
-        time_tables["inf_by_target"] = inf_time_by_target
 
-        inf_time_by_task = aggregate_time_table(
+        inf_by_task = aggregate_table(
             inference,
             ["method_id", "model_name", "config_id", "config_hash", "task"],
+            metric_cols,
         )
-        path = tables_dir / "inference_time_by_task.csv"
-        _write_table(inf_time_by_task, path)
+        path = tables_dir / "inference_by_task.csv"
+        _write_table(inf_by_task, path)
         tables.append(path)
-        time_tables["inf_by_task"] = inf_time_by_task
 
-        inf_time_by_mode = aggregate_time_table(
+        inf_by_mode = aggregate_table(
             inference,
             ["method_id", "model_name", "config_id", "config_hash", "evidence_mode"],
+            metric_cols,
         )
-        path = tables_dir / "inference_time_by_evidence_mode.csv"
-        _write_table(inf_time_by_mode, path)
+        path = tables_dir / "inference_by_evidence_mode.csv"
+        _write_table(inf_by_mode, path)
         tables.append(path)
-        time_tables["inf_by_mode"] = inf_time_by_mode
 
-        inf_time_ev_size = _two_stage_aggregate(inference, "evidence_size", ["time"])
-        path = tables_dir / "inference_time_by_evidence_size.csv"
-        _write_table(inf_time_ev_size, path)
+        batching_metrics = aggregate_batching_table(
+            inference,
+            ["method_id", "model_name", "config_id", "config_hash"],
+        )
+        if not batching_metrics.empty:
+            path = tables_dir / "inference_batching_metrics.csv"
+            _write_table(batching_metrics, path)
+            tables.append(path)
+
+        inf_ev_size = _two_stage_aggregate(inference, "evidence_size", metric_cols)
+        path = tables_dir / "inference_by_evidence_size.csv"
+        _write_table(inf_ev_size, path)
         tables.append(path)
-        time_tables["inf_ev_size"] = inf_time_ev_size
 
-        inf_time_nodes = _two_stage_aggregate(inference, "n_nodes", ["time"])
-        path = tables_dir / "inference_time_by_n_nodes.csv"
-        _write_table(inf_time_nodes, path)
+        inf_nodes = _two_stage_aggregate(inference, "n_nodes", metric_cols)
+        path = tables_dir / "inference_by_n_nodes.csv"
+        _write_table(inf_nodes, path)
         tables.append(path)
-        time_tables["inf_nodes"] = inf_time_nodes
 
-        inf_time_edges = _two_stage_aggregate(inference, "n_edges", ["time"])
-        path = tables_dir / "inference_time_by_n_edges.csv"
-        _write_table(inf_time_edges, path)
+        inf_edges = _two_stage_aggregate(inference, "n_edges", metric_cols)
+        path = tables_dir / "inference_by_n_edges.csv"
+        _write_table(inf_edges, path)
         tables.append(path)
-        time_tables["inf_edges"] = inf_time_edges
 
-    skeleton = aggregate_table(
-        inference[inference["skeleton_id"].notna()],
-        [
-            "method_id",
-            "model_name",
-            "config_id",
-            "config_hash",
-            "problem_id",
-            "skeleton_id",
-        ],
-        metric_cols,
-    )
-    path = tables_dir / "inference_by_skeleton.csv"
-    _write_table(skeleton, path)
-    tables.append(path)
+        inf_ev_size_mode = _two_stage_aggregate(
+            inference, "evidence_size", metric_cols, extra_group_cols=["evidence_mode"]
+        )
+
+        skeleton = aggregate_table(
+            inference[inference["skeleton_id"].notna()],
+            [
+                "method_id",
+                "model_name",
+                "config_id",
+                "config_hash",
+                "problem_id",
+                "skeleton_id",
+            ],
+            metric_cols,
+        )
+        path = tables_dir / "inference_by_skeleton.csv"
+        _write_table(skeleton, path)
+        tables.append(path)
+
+    time_tables: dict[str, pd.DataFrame] = {}
+    if include_time:
+        overall_time = aggregate_time_table(
+            df, ["method_id", "model_name", "config_id", "config_hash", "query_type"]
+        )
+        path = tables_dir / "overall_time_by_method.csv"
+        _write_table(overall_time, path)
+        tables.append(path)
+        time_tables["overall"] = overall_time
+
+        if include_cpd:
+            cpd_time_by_target = aggregate_time_table(
+                cpd,
+                [
+                    "method_id",
+                    "model_name",
+                    "config_id",
+                    "config_hash",
+                    "target_category",
+                ],
+            )
+            path = tables_dir / "cpd_time_by_target_category.csv"
+            _write_table(cpd_time_by_target, path)
+            tables.append(path)
+            time_tables["cpd_by_target"] = cpd_time_by_target
+
+            cpd_time_by_strategy = aggregate_time_table(
+                cpd,
+                [
+                    "method_id",
+                    "model_name",
+                    "config_id",
+                    "config_hash",
+                    "evidence_strategy",
+                ],
+            )
+            path = tables_dir / "cpd_time_by_evidence_strategy.csv"
+            _write_table(cpd_time_by_strategy, path)
+            tables.append(path)
+            time_tables["cpd_by_strategy"] = cpd_time_by_strategy
+
+            cpd_time_mb = _two_stage_aggregate(cpd, "mb_size", ["time"])
+            path = tables_dir / "cpd_time_by_mb_size.csv"
+            _write_table(cpd_time_mb, path)
+            tables.append(path)
+            time_tables["cpd_mb"] = cpd_time_mb
+
+            cpd_time_parent = _two_stage_aggregate(cpd, "parent_size", ["time"])
+            path = tables_dir / "cpd_time_by_parent_size.csv"
+            _write_table(cpd_time_parent, path)
+            tables.append(path)
+            time_tables["cpd_parent"] = cpd_time_parent
+
+            cpd_time_nodes = _two_stage_aggregate(cpd, "n_nodes", ["time"])
+            path = tables_dir / "cpd_time_by_n_nodes.csv"
+            _write_table(cpd_time_nodes, path)
+            tables.append(path)
+            time_tables["cpd_nodes"] = cpd_time_nodes
+
+            cpd_time_edges = _two_stage_aggregate(cpd, "n_edges", ["time"])
+            path = tables_dir / "cpd_time_by_n_edges.csv"
+            _write_table(cpd_time_edges, path)
+            tables.append(path)
+            time_tables["cpd_edges"] = cpd_time_edges
+
+            cpd_time_ev_size = _two_stage_aggregate(cpd, "evidence_size", ["time"])
+            path = tables_dir / "cpd_time_by_evidence_size.csv"
+            _write_table(cpd_time_ev_size, path)
+            tables.append(path)
+            time_tables["cpd_ev_size"] = cpd_time_ev_size
+
+        if include_inference:
+            inf_time_by_target = aggregate_time_table(
+                inference,
+                [
+                    "method_id",
+                    "model_name",
+                    "config_id",
+                    "config_hash",
+                    "target_category",
+                ],
+            )
+            path = tables_dir / "inference_time_by_target_category.csv"
+            _write_table(inf_time_by_target, path)
+            tables.append(path)
+            time_tables["inf_by_target"] = inf_time_by_target
+
+            inf_time_by_task = aggregate_time_table(
+                inference,
+                ["method_id", "model_name", "config_id", "config_hash", "task"],
+            )
+            path = tables_dir / "inference_time_by_task.csv"
+            _write_table(inf_time_by_task, path)
+            tables.append(path)
+            time_tables["inf_by_task"] = inf_time_by_task
+
+            inf_time_by_mode = aggregate_time_table(
+                inference,
+                [
+                    "method_id",
+                    "model_name",
+                    "config_id",
+                    "config_hash",
+                    "evidence_mode",
+                ],
+            )
+            path = tables_dir / "inference_time_by_evidence_mode.csv"
+            _write_table(inf_time_by_mode, path)
+            tables.append(path)
+            time_tables["inf_by_mode"] = inf_time_by_mode
+
+            inf_time_ev_size = _two_stage_aggregate(
+                inference, "evidence_size", ["time"]
+            )
+            path = tables_dir / "inference_time_by_evidence_size.csv"
+            _write_table(inf_time_ev_size, path)
+            tables.append(path)
+            time_tables["inf_ev_size"] = inf_time_ev_size
+
+            inf_time_nodes = _two_stage_aggregate(inference, "n_nodes", ["time"])
+            path = tables_dir / "inference_time_by_n_nodes.csv"
+            _write_table(inf_time_nodes, path)
+            tables.append(path)
+            time_tables["inf_nodes"] = inf_time_nodes
+
+            inf_time_edges = _two_stage_aggregate(inference, "n_edges", ["time"])
+            path = tables_dir / "inference_time_by_n_edges.csv"
+            _write_table(inf_time_edges, path)
+            tables.append(path)
+            time_tables["inf_edges"] = inf_time_edges
 
     # Success rates + errors
     success_target = pd.DataFrame()
@@ -2063,6 +2566,9 @@ def main() -> None:
     success_line_edges = pd.DataFrame()
     success_line_ev_size = pd.DataFrame()
     success_line_ev_size_by_mode: dict[str, pd.DataFrame] = {}
+    coverage_nodes = pd.DataFrame()
+    coverage_edges = pd.DataFrame()
+    coverage_ev_size = pd.DataFrame()
     error_df = pd.DataFrame()
     if not attempts_df.empty:
         base_group = [
@@ -2131,8 +2637,8 @@ def main() -> None:
         _write_table_with_md(success_ev_size, path)
         tables.append(path)
 
-        mode_series = attempts_df["mode"]
-        if mode_series.isna().all():
+        mode_series = attempts_df.get("mode")
+        if mode_series is None or mode_series.isna().all():
             mode_series = attempts_df["query_type"]
         inference_mask = mode_series == "inference"
         success_line_ev_size = _build_success_rate_line_table(
@@ -2165,6 +2671,30 @@ def main() -> None:
             tag = _safe_tag(str(mode))
             path = tables_dir / f"success_rate_vs_evidence_size__mode_{tag}.csv"
             _write_table_with_md(table, path)
+            tables.append(path)
+
+        if include_coverage:
+            coverage_nodes = _build_coverage_line_table(
+                attempts_df, x_col="n_nodes", n_bins=4
+            )
+            path = tables_dir / "coverage_vs_nodes.csv"
+            _write_table_with_md(coverage_nodes, path)
+            tables.append(path)
+
+            coverage_edges = _build_coverage_line_table(
+                attempts_df, x_col="n_edges", n_bins=4
+            )
+            path = tables_dir / "coverage_vs_edges.csv"
+            _write_table_with_md(coverage_edges, path)
+            tables.append(path)
+
+            coverage_ev_size = _build_coverage_line_table(
+                attempts_df[inference_mask],
+                x_col="evidence_size",
+                n_bins=4,
+            )
+            path = tables_dir / "coverage_vs_evidence_size.csv"
+            _write_table_with_md(coverage_ev_size, path)
             tables.append(path)
 
         error_df = attempts_df[~attempts_df["ok"]].copy()
@@ -2221,97 +2751,102 @@ def main() -> None:
             tables.append(path)
 
     # Plots
-    cpd_size_specs = [
-        (cpd_mb, "mb_size", "Markov Blanket Size", "mb_size"),
-        (cpd_parent, "parent_size", "Parent Set Size", "parent_size"),
-        (cpd_nodes, "n_nodes", "#Nodes", "n_nodes"),
-        (cpd_edges, "n_edges", "#Edges", "n_edges"),
-    ]
-    for data, size_col, size_label, tag in cpd_size_specs:
-        for metric in PLOT_METRICS:
-            fig = _plot_error_vs_size(
-                data,
-                size_col=size_col,
-                metric=metric,
-                out_dir=figures_dir,
-                title_prefix=f"CPD {_metric_label(metric)} vs {size_label}",
-                filename_prefix=f"cpd_{metric}_vs_{tag}",
-            )
-            if fig:
-                figures.append(fig)
+    if include_cpd:
+        cpd_size_specs = [
+            (cpd_mb, "mb_size", "Markov Blanket Size", "mb_size"),
+            (cpd_parent, "parent_size", "Parent Set Size", "parent_size"),
+            (cpd_nodes, "n_nodes", "#Nodes", "n_nodes"),
+            (cpd_edges, "n_edges", "#Edges", "n_edges"),
+        ]
+        for data, size_col, size_label, tag in cpd_size_specs:
+            for metric in PLOT_METRICS:
+                fig = _plot_error_vs_size(
+                    data,
+                    size_col=size_col,
+                    metric=metric,
+                    out_dir=figures_dir,
+                    title_prefix=f"CPD {_metric_label(metric)} vs {size_label}",
+                    filename_prefix=f"cpd_{metric}_vs_{tag}",
+                )
+                if fig:
+                    figures.append(fig)
 
-    inf_size_specs = [
-        (inf_nodes, "n_nodes", "#Nodes", "n_nodes"),
-        (inf_edges, "n_edges", "#Edges", "n_edges"),
-    ]
-    for data, size_col, size_label, tag in inf_size_specs:
-        for metric in PLOT_METRICS:
-            fig = _plot_error_vs_size(
-                data,
-                size_col=size_col,
-                metric=metric,
-                out_dir=figures_dir,
-                title_prefix=f"Inference {_metric_label(metric)} vs {size_label}",
-                filename_prefix=f"inference_{metric}_vs_{tag}",
-            )
-            if fig:
-                figures.append(fig)
+    if include_inference:
+        inf_size_specs = [
+            (inf_nodes, "n_nodes", "#Nodes", "n_nodes"),
+            (inf_edges, "n_edges", "#Edges", "n_edges"),
+        ]
+        for data, size_col, size_label, tag in inf_size_specs:
+            for metric in PLOT_METRICS:
+                fig = _plot_error_vs_size(
+                    data,
+                    size_col=size_col,
+                    metric=metric,
+                    out_dir=figures_dir,
+                    title_prefix=f"Inference {_metric_label(metric)} vs {size_label}",
+                    filename_prefix=f"inference_{metric}_vs_{tag}",
+                )
+                if fig:
+                    figures.append(fig)
 
-    modes = [
-        m for m in INF_EVIDENCE_MODES if m in set(inf_ev_size_mode["evidence_mode"])
-    ]
-    modes += [
-        m
-        for m in sorted(inf_ev_size_mode["evidence_mode"].dropna().unique())
-        if m not in modes
-    ]
-    for mode in modes:
-        for metric in PLOT_METRICS:
-            fig = _plot_error_vs_evidence_size(
-                inf_ev_size_mode,
-                metric=metric,
-                out_dir=figures_dir,
-                filename_prefix=f"inference_{metric}_vs_evidence_size",
-                mode=mode,
-            )
-            if fig:
-                figures.append(fig)
+        modes = [
+            m for m in INF_EVIDENCE_MODES if m in set(inf_ev_size_mode["evidence_mode"])
+        ]
+        modes += [
+            m
+            for m in sorted(inf_ev_size_mode["evidence_mode"].dropna().unique())
+            if m not in modes
+        ]
+        for mode in modes:
+            for metric in PLOT_METRICS:
+                fig = _plot_error_vs_evidence_size(
+                    inf_ev_size_mode,
+                    metric=metric,
+                    out_dir=figures_dir,
+                    filename_prefix=f"inference_{metric}_vs_evidence_size",
+                    mode=mode,
+                )
+                if fig:
+                    figures.append(fig)
 
-    if args.include_pareto:
+    if include_pareto:
         pareto_metrics = ["kl", "wass", "jsd_norm"]
         pareto_summary = aggregate_table(
             df,
             ["method_id", "model_name", "config_id", "config_hash", "query_type"],
             [*pareto_metrics, "time"],
         )
-        for metric in pareto_metrics:
-            sub = pareto_summary[pareto_summary["query_type"] == "cpd"]
-            fig = _plot_pareto(
-                sub,
-                metric=metric,
-                out_dir=figures_dir,
-                filename=f"pareto_cpd_{metric}_vs_time.png",
-                title=f"CPD {_metric_label(metric)} vs Time",
-            )
-            if fig:
-                figures.append(fig)
-            sub = pareto_summary[pareto_summary["query_type"] == "inference"]
-            fig = _plot_pareto(
-                sub,
-                metric=metric,
-                out_dir=figures_dir,
-                filename=f"pareto_inference_{metric}_vs_time.png",
-                title=f"Inference {_metric_label(metric)} vs Time",
-            )
-            if fig:
-                figures.append(fig)
+        if include_cpd:
+            for metric in pareto_metrics:
+                sub = pareto_summary[pareto_summary["query_type"] == "cpd"]
+                fig = _plot_pareto(
+                    sub,
+                    metric=metric,
+                    out_dir=figures_dir,
+                    filename=f"pareto_cpd_{metric}_vs_time.png",
+                    title=f"CPD {_metric_label(metric)} vs Time",
+                )
+                if fig:
+                    figures.append(fig)
+        if include_inference:
+            for metric in pareto_metrics:
+                sub = pareto_summary[pareto_summary["query_type"] == "inference"]
+                fig = _plot_pareto(
+                    sub,
+                    metric=metric,
+                    out_dir=figures_dir,
+                    filename=f"pareto_inference_{metric}_vs_time.png",
+                    title=f"Inference {_metric_label(metric)} vs Time",
+                )
+                if fig:
+                    figures.append(fig)
 
-        if args.pareto_split != "none":
+        if pareto_split != "none":
             split_col = {
                 "mode": "evidence_mode",
                 "task": "task",
                 "target_category": "target_category",
-            }[args.pareto_split]
+            }[pareto_split]
             split_df = df[df[split_col].notna()]
             if not split_df.empty:
                 split_summary = aggregate_table(
@@ -2340,126 +2875,136 @@ def main() -> None:
                         )
                         if fig:
                             figures.append(fig)
-    if args.include_time:
-        fig = _plot_error_vs_size(
-            time_tables.get("cpd_mb", pd.DataFrame()),
-            size_col="mb_size",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="CPD Time vs Markov Blanket Size",
-            filename_prefix="cpd_time_vs_mb_size",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("cpd_parent", pd.DataFrame()),
-            size_col="parent_size",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="CPD Time vs Parent Set Size",
-            filename_prefix="cpd_time_vs_parent_size",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("cpd_nodes", pd.DataFrame()),
-            size_col="n_nodes",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="CPD Time vs #Nodes",
-            filename_prefix="cpd_time_vs_n_nodes",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("cpd_edges", pd.DataFrame()),
-            size_col="n_edges",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="CPD Time vs #Edges",
-            filename_prefix="cpd_time_vs_n_edges",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("cpd_ev_size", pd.DataFrame()),
-            size_col="evidence_size",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="CPD Time vs Evidence Size",
-            filename_prefix="cpd_time_vs_evidence_size",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("inf_ev_size", pd.DataFrame()),
-            size_col="evidence_size",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="Inference Time vs Evidence Size",
-            filename_prefix="inference_time_vs_evidence_size",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("inf_nodes", pd.DataFrame()),
-            size_col="n_nodes",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="Inference Time vs #Nodes",
-            filename_prefix="inference_time_vs_n_nodes",
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_error_vs_size(
-            time_tables.get("inf_edges", pd.DataFrame()),
-            size_col="n_edges",
-            metric="time",
-            out_dir=figures_dir,
-            title_prefix="Inference Time vs #Edges",
-            filename_prefix="inference_time_vs_n_edges",
-        )
-        if fig:
-            figures.append(fig)
 
-    category_specs = [
-        (
-            cpd_by_target,
-            "target_category",
-            "CPD",
-            "cpd",
-            "target_category",
-            "Target Category",
-            CPD_TARGET_CATEGORIES,
-        ),
-        (
-            inf_by_target,
-            "target_category",
-            "Inference",
-            "inference",
-            "target_category",
-            "Target Category",
-            INF_TARGET_CATEGORIES,
-        ),
-        (
-            inf_by_task,
-            "task",
-            "Inference",
-            "inference",
-            "task",
-            "Task",
-            INF_TASKS,
-        ),
-        (
-            inf_by_mode,
-            "evidence_mode",
-            "Inference",
-            "inference",
-            "evidence_mode",
-            "Evidence Mode",
-            INF_EVIDENCE_MODES,
-        ),
-    ]
+    if include_time:
+        if include_cpd:
+            fig = _plot_error_vs_size(
+                time_tables.get("cpd_mb", pd.DataFrame()),
+                size_col="mb_size",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="CPD Time vs Markov Blanket Size",
+                filename_prefix="cpd_time_vs_mb_size",
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_error_vs_size(
+                time_tables.get("cpd_parent", pd.DataFrame()),
+                size_col="parent_size",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="CPD Time vs Parent Set Size",
+                filename_prefix="cpd_time_vs_parent_size",
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_error_vs_size(
+                time_tables.get("cpd_nodes", pd.DataFrame()),
+                size_col="n_nodes",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="CPD Time vs #Nodes",
+                filename_prefix="cpd_time_vs_n_nodes",
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_error_vs_size(
+                time_tables.get("cpd_edges", pd.DataFrame()),
+                size_col="n_edges",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="CPD Time vs #Edges",
+                filename_prefix="cpd_time_vs_n_edges",
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_error_vs_size(
+                time_tables.get("cpd_ev_size", pd.DataFrame()),
+                size_col="evidence_size",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="CPD Time vs Evidence Size",
+                filename_prefix="cpd_time_vs_evidence_size",
+            )
+            if fig:
+                figures.append(fig)
+        if include_inference:
+            fig = _plot_error_vs_size(
+                time_tables.get("inf_ev_size", pd.DataFrame()),
+                size_col="evidence_size",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="Inference Time vs Evidence Size",
+                filename_prefix="inference_time_vs_evidence_size",
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_error_vs_size(
+                time_tables.get("inf_nodes", pd.DataFrame()),
+                size_col="n_nodes",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="Inference Time vs #Nodes",
+                filename_prefix="inference_time_vs_n_nodes",
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_error_vs_size(
+                time_tables.get("inf_edges", pd.DataFrame()),
+                size_col="n_edges",
+                metric="time",
+                out_dir=figures_dir,
+                title_prefix="Inference Time vs #Edges",
+                filename_prefix="inference_time_vs_n_edges",
+            )
+            if fig:
+                figures.append(fig)
+
+    category_specs = []
+    if include_cpd:
+        category_specs.append(
+            (
+                cpd_by_target,
+                "target_category",
+                "CPD",
+                "cpd",
+                "target_category",
+                "Target Category",
+                CPD_TARGET_CATEGORIES,
+            )
+        )
+    if include_inference:
+        category_specs.extend(
+            [
+                (
+                    inf_by_target,
+                    "target_category",
+                    "Inference",
+                    "inference",
+                    "target_category",
+                    "Target Category",
+                    INF_TARGET_CATEGORIES,
+                ),
+                (
+                    inf_by_task,
+                    "task",
+                    "Inference",
+                    "inference",
+                    "task",
+                    "Task",
+                    INF_TASKS,
+                ),
+                (
+                    inf_by_mode,
+                    "evidence_mode",
+                    "Inference",
+                    "inference",
+                    "evidence_mode",
+                    "Evidence Mode",
+                    INF_EVIDENCE_MODES,
+                ),
+            ]
+        )
     for (
         data,
         category_col,
@@ -2482,62 +3027,64 @@ def main() -> None:
             if fig:
                 figures.append(fig)
 
-    if args.include_time:
-        fig = _plot_category_bars(
-            time_tables.get("cpd_by_target", pd.DataFrame()),
-            category_col="target_category",
-            metric="time",
-            out_dir=figures_dir,
-            filename_prefix="cpd_time_by_target_category",
-            title_prefix="CPD Time by Target Category",
-            category_order=CPD_TARGET_CATEGORIES,
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_category_bars(
-            time_tables.get("cpd_by_strategy", pd.DataFrame()),
-            category_col="evidence_strategy",
-            metric="time",
-            out_dir=figures_dir,
-            filename_prefix="cpd_time_by_evidence_strategy",
-            title_prefix="CPD Time by Evidence Strategy",
-            category_order=CPD_EVIDENCE_STRATEGIES,
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_category_bars(
-            time_tables.get("inf_by_target", pd.DataFrame()),
-            category_col="target_category",
-            metric="time",
-            out_dir=figures_dir,
-            filename_prefix="inference_time_by_target_category",
-            title_prefix="Inference Time by Target Category",
-            category_order=INF_TARGET_CATEGORIES,
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_category_bars(
-            time_tables.get("inf_by_task", pd.DataFrame()),
-            category_col="task",
-            metric="time",
-            out_dir=figures_dir,
-            filename_prefix="inference_time_by_task",
-            title_prefix="Inference Time by Task",
-            category_order=INF_TASKS,
-        )
-        if fig:
-            figures.append(fig)
-        fig = _plot_category_bars(
-            time_tables.get("inf_by_mode", pd.DataFrame()),
-            category_col="evidence_mode",
-            metric="time",
-            out_dir=figures_dir,
-            filename_prefix="inference_time_by_evidence_mode",
-            title_prefix="Inference Time by Evidence Mode",
-            category_order=INF_EVIDENCE_MODES,
-        )
-        if fig:
-            figures.append(fig)
+    if include_time:
+        if include_cpd:
+            fig = _plot_category_bars(
+                time_tables.get("cpd_by_target", pd.DataFrame()),
+                category_col="target_category",
+                metric="time",
+                out_dir=figures_dir,
+                filename_prefix="cpd_time_by_target_category",
+                title_prefix="CPD Time by Target Category",
+                category_order=CPD_TARGET_CATEGORIES,
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_category_bars(
+                time_tables.get("cpd_by_strategy", pd.DataFrame()),
+                category_col="evidence_strategy",
+                metric="time",
+                out_dir=figures_dir,
+                filename_prefix="cpd_time_by_evidence_strategy",
+                title_prefix="CPD Time by Evidence Strategy",
+                category_order=CPD_EVIDENCE_STRATEGIES,
+            )
+            if fig:
+                figures.append(fig)
+        if include_inference:
+            fig = _plot_category_bars(
+                time_tables.get("inf_by_target", pd.DataFrame()),
+                category_col="target_category",
+                metric="time",
+                out_dir=figures_dir,
+                filename_prefix="inference_time_by_target_category",
+                title_prefix="Inference Time by Target Category",
+                category_order=INF_TARGET_CATEGORIES,
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_category_bars(
+                time_tables.get("inf_by_task", pd.DataFrame()),
+                category_col="task",
+                metric="time",
+                out_dir=figures_dir,
+                filename_prefix="inference_time_by_task",
+                title_prefix="Inference Time by Task",
+                category_order=INF_TASKS,
+            )
+            if fig:
+                figures.append(fig)
+            fig = _plot_category_bars(
+                time_tables.get("inf_by_mode", pd.DataFrame()),
+                category_col="evidence_mode",
+                metric="time",
+                out_dir=figures_dir,
+                filename_prefix="inference_time_by_evidence_mode",
+                title_prefix="Inference Time by Evidence Mode",
+                category_order=INF_EVIDENCE_MODES,
+            )
+            if fig:
+                figures.append(fig)
 
     # Success rate line plots for numeric axes
     if not success_line_nodes.empty:
@@ -2651,6 +3198,46 @@ def main() -> None:
         if fig:
             figures.append(fig)
 
+    if include_coverage:
+        if not coverage_nodes.empty:
+            for mode in sorted(coverage_nodes["mode"].dropna().unique()):
+                sub = coverage_nodes[coverage_nodes["mode"] == mode]
+                tag = "cpd" if mode == "cpds" else str(mode)
+                title_label = "CPD" if mode == "cpds" else str(mode).capitalize()
+                fig = plot_coverage_line(
+                    sub,
+                    x_label="n_nodes",
+                    out_dir=figures_dir,
+                    filename=f"{tag}_coverage_vs_n_nodes.png",
+                    title=f"{title_label} Coverage vs #Nodes",
+                )
+                if fig:
+                    figures.append(fig)
+        if not coverage_edges.empty:
+            for mode in sorted(coverage_edges["mode"].dropna().unique()):
+                sub = coverage_edges[coverage_edges["mode"] == mode]
+                tag = "cpd" if mode == "cpds" else str(mode)
+                title_label = "CPD" if mode == "cpds" else str(mode).capitalize()
+                fig = plot_coverage_line(
+                    sub,
+                    x_label="n_edges",
+                    out_dir=figures_dir,
+                    filename=f"{tag}_coverage_vs_n_edges.png",
+                    title=f"{title_label} Coverage vs #Edges",
+                )
+                if fig:
+                    figures.append(fig)
+        if not coverage_ev_size.empty:
+            fig = plot_coverage_line(
+                coverage_ev_size,
+                x_label="evidence_size",
+                out_dir=figures_dir,
+                filename="inference_coverage_vs_evidence_size.png",
+                title="Inference Coverage vs Evidence Size",
+            )
+            if fig:
+                figures.append(fig)
+
     # Error plots
     if not error_df.empty:
         for qtype in sorted(error_df["query_type"].dropna().unique()):
@@ -2667,9 +3254,255 @@ def main() -> None:
     if not figures:
         figures = sorted(figures_dir.glob("*.png"))
     _write_report_md(out_dir, tables, figures)
+    return tables, figures
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_dir", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument(
+        "--gt_source",
+        type=str,
+        default="folder",
+        choices=["embedded", "folder", "compute"],
+    )
+    parser.add_argument(
+        "--gt_key",
+        type=str,
+        default="result.ground_truth.output.probs",
+    )
+    parser.add_argument("--models", type=str, default=None)
+    parser.add_argument("--max_records", type=int, default=None)
+    parser.add_argument("--eps", type=float, default=1e-12)
+    parser.add_argument(
+        "--include_time",
+        action="store_true",
+        default=True,
+        help="Include time tables and plots (default: true)",
+    )
+    parser.add_argument(
+        "--no-include_time",
+        dest="include_time",
+        action="store_false",
+        help="Disable time tables and plots",
+    )
+    parser.add_argument(
+        "--include_pareto",
+        action="store_true",
+        default=True,
+        help="Include Pareto plots (default: true)",
+    )
+    parser.add_argument(
+        "--no-include_pareto",
+        dest="include_pareto",
+        action="store_false",
+        help="Disable Pareto plots",
+    )
+    parser.add_argument(
+        "--pareto_split",
+        type=str,
+        default="none",
+        choices=["none", "mode", "task", "target_category"],
+    )
+    parser.add_argument(
+        "--min_partition_queries",
+        type=int,
+        default=1,
+        help="Minimum queries required to emit a subset partition (default: 1)",
+    )
+    parser.add_argument(
+        "--max_subsets",
+        type=int,
+        default=None,
+        help="Limit subset partitions to top-K by size (default: all)",
+    )
+    parser.add_argument(
+        "--max_partitions",
+        type=int,
+        default=None,
+        help="Deprecated alias for --max_subsets",
+    )
+    parser.add_argument(
+        "--include_all_methods_in_subsets",
+        action="store_true",
+        default=False,
+        help="Include all methods in subset reports (default: false)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    run_dir = Path(args.run_dir).resolve()
+    if not run_dir.exists():
+        raise SystemExit(f"Run dir not found: {run_dir}")
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else run_dir / "report"
+    ensure_dir(out_dir)
+
+    model_filter = None
+    if args.models:
+        model_filter = {m.strip() for m in args.models.split(",") if m.strip()}
+
+    run_mode = _detect_run_mode(run_dir)
+    if run_mode:
+        logging.info("Detected run mode: %s", run_mode)
+
+    max_subsets = args.max_subsets
+    if max_subsets is None and args.max_partitions is not None:
+        max_subsets = args.max_partitions
+
+    df, errors = _build_records(
+        run_dir=run_dir,
+        gt_source=args.gt_source,
+        gt_key=args.gt_key,
+        max_records=args.max_records,
+        eps=float(args.eps),
+        model_filter=model_filter,
+    )
+    attempts_df = _build_attempts(
+        run_dir=run_dir,
+        max_records=args.max_records,
+        model_filter=model_filter,
+    )
+
+    if not df.empty and "query_type" in df.columns:
+        df["query_type"] = df["query_type"].apply(_normalize_query_type)
+    if not attempts_df.empty and "query_type" in attempts_df.columns:
+        attempts_df["query_type"] = attempts_df["query_type"].apply(
+            _normalize_query_type
+        )
+
+    if not df.empty:
+        df["query_key"] = df.apply(build_query_key, axis=1)
+    if not attempts_df.empty:
+        attempts_df["query_key"] = attempts_df.apply(build_query_key, axis=1)
+
+    query_type_filter, mode_label = _infer_query_type(run_mode, df, attempts_df)
+    if query_type_filter:
+        df_mode = df[df["query_type"] == query_type_filter] if not df.empty else df
+        attempts_mode = (
+            attempts_df[attempts_df["query_type"] == query_type_filter]
+            if not attempts_df.empty
+            else attempts_df
+        )
+    else:
+        df_mode = df
+        attempts_mode = attempts_df
+
+    partition_sets, inventory_df = compute_partitions(
+        attempts_mode,
+        min_partition_queries=int(args.min_partition_queries),
+        max_subsets=max_subsets,
+    )
+
+    all_keys = (
+        set(attempts_mode["query_key"].dropna().unique())
+        if not attempts_mode.empty
+        else set()
+    )
+    if "all" not in partition_sets:
+        partition_sets["all"] = all_keys
+    if "common" not in partition_sets:
+        partition_sets["common"] = set()
+
+    methods = sorted(
+        attempts_mode["method_id"].dropna().unique()
+        if not attempts_mode.empty
+        else df_mode.get("method_id", pd.Series(dtype=object)).dropna().unique()
+    )
+    allowed_query_types = {query_type_filter} if query_type_filter else None
+
+    generate_report_for_partition(
+        df=df_mode,
+        attempts_df=attempts_mode,
+        out_dir=out_dir / "all",
+        include_time=args.include_time,
+        include_pareto=args.include_pareto,
+        pareto_split=args.pareto_split,
+        include_coverage=False,
+        allowed_query_types=allowed_query_types,
+        methods_to_show=methods,
+    )
+
+    _write_partition_inventory(
+        out_dir,
+        mode_label=mode_label,
+        inventory_df=inventory_df,
+        methods=methods,
+    )
+
+    for _, row in inventory_df.iterrows():
+        partition_name = row.get("partition_name")
+        if not partition_name or partition_name == "all":
+            continue
+        keys = partition_sets.get(partition_name, set())
+        partition_out = out_dir / str(partition_name)
+        df_part = (
+            df_mode[df_mode["query_key"].isin(keys)] if not df_mode.empty else df_mode
+        )
+        attempts_part = (
+            attempts_mode[attempts_mode["query_key"].isin(keys)]
+            if not attempts_mode.empty
+            else attempts_mode
+        )
+        partition_type = row.get("partition_type")
+        solver_label = row.get("solver_set") or ""
+        solver_set = [s for s in str(solver_label).split("|") if s]
+        if (
+            partition_type == "subset"
+            and not args.include_all_methods_in_subsets
+            and solver_set
+        ):
+            methods_to_show = solver_set
+        else:
+            methods_to_show = methods
+
+        generate_report_for_partition(
+            df=df_part,
+            attempts_df=attempts_part,
+            out_dir=partition_out,
+            include_time=args.include_time,
+            include_pareto=args.include_pareto,
+            pareto_split=args.pareto_split,
+            include_coverage=True,
+            allowed_query_types=allowed_query_types,
+            methods_to_show=methods_to_show,
+        )
+
+        if partition_type == "subset":
+            n_queries = int(row.get("n_queries", 0))
+            share_of_total = float(row.get("share_of_total", 0.0))
+            share_of_non_common = float(row.get("share_of_non_common", 0.0))
+            meta = {
+                "solver_set": solver_set,
+                "n_queries": n_queries,
+                "share_of_total": share_of_total,
+                "share_of_non_common": share_of_non_common,
+                "notes": "Queries in ALL but not in COMMON with exact solver ensemble",
+            }
+            (partition_out / "subset_meta.json").write_text(
+                json.dumps(meta, indent=2, sort_keys=True)
+            )
+
+    _write_report_index(
+        out_dir,
+        run_dir=run_dir,
+        mode_label=mode_label,
+        methods=methods,
+        inventory_df=inventory_df,
+    )
 
     if errors:
         logging.warning("Encountered %s metric errors", len(errors))
+    return
 
 
 if __name__ == "__main__":
