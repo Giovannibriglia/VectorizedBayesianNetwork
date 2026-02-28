@@ -31,6 +31,18 @@ def gunzip(src_gz: Path, dst_bif: Path, force: bool = False) -> None:
         shutil.copyfileobj(f_in, f_out)
 
 
+def _can_parse_bnfit(path: Path) -> tuple[bool, str | None]:
+    try:
+        from benchmarking.bnlearn_bnfit import load_bnfit
+    except Exception as exc:
+        return False, f"bn.fit parser unavailable: {exc}"
+    try:
+        load_bnfit(path)
+    except Exception as exc:
+        return False, f"bn.fit parse failed: {type(exc).__name__}: {exc}"
+    return True, None
+
+
 @register_downloader
 class BNLearnDownloader(BaseDataDownloader):
     name = "bnlearn"
@@ -62,6 +74,7 @@ class BNLearnDownloader(BaseDataDownloader):
         for network in self.progress(selected, desc="Downloading bnlearn"):
             meta = registry.get(network, {})
             urls = dict(meta.get("urls") or {})
+            dataset_type = meta.get("type")
             generated = meta.get("generated") or {}
             model_json = meta.get("model_json") or generated.get("model_json")
             for key in ("bif", "bif_gz", "net", "dsc", "rds", "rda"):
@@ -71,8 +84,12 @@ class BNLearnDownloader(BaseDataDownloader):
                 model_json
                 and "bif_gz" not in urls
                 and str(model_json).endswith(".bif.gz")
+                and dataset_type not in {"gaussian", "clgaussian"}
             ):
                 urls["bif_gz"] = model_json
+            if dataset_type in {"gaussian", "clgaussian"}:
+                urls.pop("bif_gz", None)
+                urls.pop("bif", None)
 
             artifacts = set(meta.get("artifacts") or [])
             for key in sorted(urls):
@@ -92,15 +109,21 @@ class BNLearnDownloader(BaseDataDownloader):
             dataset_dir = self.dataset_dir(dataset_id)
             downloaded_files: Dict[str, str] = {}
             structure_available = False
+            can_parse_bif = False
+            can_parse_bnfit = False
             reason = None
 
             try:
                 bif_gz_url = urls.get("bif_gz")
                 bif_url = urls.get("bif")
+                if dataset_type in {"gaussian", "clgaussian"}:
+                    bif_gz_url = None
+                    bif_url = None
                 rds_url = urls.get("rds")
                 rda_url = urls.get("rda")
 
                 bif_error = None
+                bnfit_error = None
                 if bif_gz_url or bif_url:
                     try:
                         if bif_gz_url:
@@ -113,55 +136,49 @@ class BNLearnDownloader(BaseDataDownloader):
                             download(bif_url, bif_path, force=force)
                         downloaded_files["bif"] = bif_path.name
                         structure_available = True
+                        can_parse_bif = True
                     except Exception as exc:
                         bif_error = exc
 
-                if not structure_available:
-                    if rds_url or rda_url:
-                        url = rds_url or rda_url
-                        suffix = ".rds" if rds_url else ".rda"
-                        r_path = dataset_dir / f"model{suffix}"
-                        download(url, r_path, force=force)
-                        downloaded_files[suffix.lstrip(".")] = r_path.name
-                        reason = (
-                            "bnlearn CLG networks are distributed as R bn.fit objects "
-                            "(RDS/RDA) and require export to BIF/NET/DSC; "
-                            "currently unsupported without R."
-                        )
+                if rds_url or rda_url:
+                    url = rds_url or rda_url
+                    suffix = ".rds" if rds_url else ".rda"
+                    r_path = dataset_dir / f"model{suffix}"
+                    download(url, r_path, force=force)
+                    downloaded_files[suffix.lstrip(".")] = r_path.name
+                    can_parse_bnfit, bnfit_error = _can_parse_bnfit(r_path)
+
+                needs_bnfit = dataset_type in {"gaussian", "clgaussian"}
+                if needs_bnfit:
+                    structure_available = can_parse_bnfit
+                    if not can_parse_bnfit:
+                        if not (rds_url or rda_url):
+                            reason = "bn.fit artifacts missing from metadata."
+                        else:
+                            reason = bnfit_error or "bn.fit parsing unavailable"
                         if bif_error is not None:
                             reason = (
                                 f"{reason} (BIF download failed: "
                                 f"{type(bif_error).__name__}: {bif_error})"
                             )
                     elif bif_error is not None:
-                        if meta.get("type") in {"gaussian", "clgaussian"}:
-                            reason = (
-                                "bnlearn CLG networks are distributed as R bn.fit objects "
-                                "(RDS/RDA) and require export to BIF/NET/DSC; "
-                                "currently unsupported without R."
-                            )
-                            reason = (
-                                f"{reason} (BIF download failed: "
-                                f"{type(bif_error).__name__}: {bif_error})"
-                            )
-                        else:
+                        reason = f"BIF download failed: {type(bif_error).__name__}: {bif_error}"
+                else:
+                    structure_available = can_parse_bif or can_parse_bnfit
+                    if not structure_available:
+                        if bif_error is not None:
                             reason = f"Download failed: {type(bif_error).__name__}: {bif_error}"
-                    else:
-                        if meta.get("type") in {"gaussian", "clgaussian"}:
-                            reason = (
-                                "bnlearn CLG networks are distributed as R bn.fit objects "
-                                "(RDS/RDA) and require export to BIF/NET/DSC; "
-                                "currently unsupported without R."
-                            )
                         else:
                             reason = "No supported artifact URLs in metadata."
             except Exception as exc:
                 reason = f"Download failed: {type(exc).__name__}: {exc}"
 
             capabilities = {
-                "can_parse_bif": structure_available,
+                "can_parse_bif": can_parse_bif,
+                "can_parse_bnfit": can_parse_bnfit,
                 "can_generate_queries": structure_available,
                 "can_compute_ground_truth": structure_available,
+                "can_generate_data": structure_available,
             }
 
             manifest = {

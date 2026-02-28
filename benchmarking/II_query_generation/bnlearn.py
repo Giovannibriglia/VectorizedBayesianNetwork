@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import random
 import re
 from collections import Counter, defaultdict, deque
@@ -10,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
+import numpy as np
+
+from benchmarking import bnlearn_bnfit
 from benchmarking.utils import (
     ensure_dir,
     get_dataset_domain_metadata_path,
@@ -46,15 +50,18 @@ def _sample_discrete_value(meta: dict, rng: random.Random) -> int | None:
 
 
 def _sample_evidence_values(
-    evidence_vars: List[str], domain_nodes: Dict[str, dict], rng: random.Random
+    evidence_vars: List[str],
+    domain_nodes: Dict[str, dict],
+    rng: random.Random,
+    *,
+    mode: str | None = None,
 ) -> dict:
-    values: dict[str, int] = {}
+    values: dict[str, int | float] = {}
     for var in evidence_vars:
-        meta = domain_nodes.get(var, {}) if isinstance(domain_nodes, dict) else {}
-        value = _sample_discrete_value(meta, rng)
+        value = _sample_value(node=var, domain_nodes=domain_nodes, rng=rng, mode=mode)
         if value is None:
             continue
-        values[var] = int(value)
+        values[var] = value
     return values
 
 
@@ -240,6 +247,32 @@ def _parse_bif(
     return nodes, parents, children, node_states, node_types, node_sources
 
 
+def _structure_from_bnfit(
+    model: bnlearn_bnfit.BNFitModel,
+) -> tuple[
+    List[str],
+    Dict[str, Set[str]],
+    Dict[str, Set[str]],
+    Dict[str, List[str]],
+    Dict[str, str],
+    Dict[str, str],
+]:
+    nodes = sorted(list(model.nodes))
+    parents: Dict[str, Set[str]] = {n: set(model.parents.get(n, [])) for n in nodes}
+    children: Dict[str, Set[str]] = {n: set() for n in nodes}
+    for child, pars in parents.items():
+        for parent in pars:
+            children.setdefault(parent, set()).add(child)
+    node_states = {n: list(model.states.get(n, [])) for n in nodes}
+    node_types = {n: model.node_types.get(n, "discrete") for n in nodes}
+    node_sources = {n: "bnfit" for n in nodes}
+    return nodes, parents, children, node_states, node_types, node_sources
+
+
+def _find_bnfit(dataset_dir: Path, download_meta: dict | None) -> Path | None:
+    return bnlearn_bnfit.find_bnfit_path(dataset_dir, download_meta)
+
+
 def _build_domain(
     *,
     dataset_id: str,
@@ -249,6 +282,7 @@ def _build_domain(
     node_states: Dict[str, List[str]],
     node_types: Dict[str, str],
     node_sources: Dict[str, str],
+    continuous_ranges: Dict[str, dict] | None = None,
 ) -> tuple[dict, bool, str | None]:
     domain_nodes: Dict[str, dict] = {}
     missing_states: List[str] = []
@@ -267,12 +301,24 @@ def _build_domain(
                 "source": node_sources.get(node, "metadata"),
             }
         else:
-            domain_nodes[node] = {
+            entry = {
                 "type": "continuous",
                 "dtype": None,
                 "range": None,
                 "source": node_sources.get(node, "metadata"),
             }
+            if continuous_ranges:
+                info = continuous_ranges.get(node)
+                if isinstance(info, dict):
+                    low = info.get("low")
+                    high = info.get("high")
+                    if low is not None and high is not None:
+                        entry["range"] = {"low": float(low), "high": float(high)}
+                    mean = info.get("mean")
+                    std = info.get("std")
+                    if mean is not None and std is not None:
+                        entry["gt"] = {"mean": float(mean), "std": float(std)}
+            domain_nodes[node] = entry
 
     unsupported = False
     reason = None
@@ -311,6 +357,7 @@ def _sample_value(
     node: str,
     domain_nodes: Dict[str, dict],
     rng: random.Random,
+    mode: str | None = None,
 ) -> int | float:
     meta = domain_nodes.get(node)
     if meta is None:
@@ -320,7 +367,32 @@ def _sample_value(
         if not states:
             raise ValueError(f"Missing states for discrete node '{node}'")
         return int(rng.randrange(len(states)))
-    return float(rng.gauss(0.0, 1.0))
+    range_info = meta.get("range") if isinstance(meta, dict) else None
+    mean = None
+    std = None
+    if isinstance(meta, dict):
+        gt = meta.get("gt")
+        if isinstance(gt, dict):
+            mean = gt.get("mean")
+            std = gt.get("std")
+    if mode == "on_manifold" and mean is not None and std is not None:
+        value = float(rng.gauss(float(mean), float(std)))
+    else:
+        if isinstance(range_info, dict):
+            low = range_info.get("low")
+            high = range_info.get("high")
+            if low is not None and high is not None:
+                value = float(rng.uniform(float(low), float(high)))
+            else:
+                value = float(rng.gauss(0.0, 1.0))
+        else:
+            value = float(rng.gauss(0.0, 1.0))
+    if isinstance(range_info, dict):
+        low = range_info.get("low")
+        high = range_info.get("high")
+        if low is not None and high is not None:
+            value = float(min(max(value, float(low)), float(high)))
+    return value
 
 
 def _markov_blanket(
@@ -1005,7 +1077,9 @@ def _generate_inference_queries(
                 values = {}
             else:
                 values = {
-                    var: _sample_value(node=var, domain_nodes=domain_nodes, rng=rng)
+                    var: _sample_value(
+                        node=var, domain_nodes=domain_nodes, rng=rng, mode=mode
+                    )
                     for var in evidence_vars
                 }
             evidence = EvidenceSpec(
@@ -1102,12 +1176,33 @@ def _build_gt_query_payload(
 def _compute_ground_truth_records(
     *,
     dataset_id: str,
-    bif_path: Path,
+    bif_path: Path | None,
+    bnfit_model: bnlearn_bnfit.BNFitModel | None,
     domain_nodes: Dict[str, dict],
     cpd_queries: List[CPDQuery],
     inference_queries: List[InferenceQuery],
     logger: logging.Logger,
+    gt_config: dict | None = None,
 ) -> tuple[list[dict], str, str | None]:
+    if bnfit_model is not None:
+        try:
+            return _compute_ground_truth_records_bnfit(
+                dataset_id=dataset_id,
+                model=bnfit_model,
+                domain_nodes=domain_nodes,
+                cpd_queries=cpd_queries,
+                inference_queries=inference_queries,
+                gt_config=gt_config or {},
+            )
+        except Exception as exc:
+            reason = f"bn.fit GT failed: {type(exc).__name__}: {exc}"
+            logger.warning("Skipping ground truth for %s: %s", dataset_id, reason)
+            return [], "unavailable", reason
+
+    if bif_path is None:
+        reason = "missing model.bif"
+        logger.warning("Skipping ground truth for %s: %s", dataset_id, reason)
+        return [], "unavailable", reason
     try:
         from pgmpy.inference import VariableElimination
         from pgmpy.readwrite import BIFReader
@@ -1204,6 +1299,204 @@ def _compute_ground_truth_records(
     return records, "ok", None
 
 
+def _compute_ground_truth_records_bnfit(
+    *,
+    dataset_id: str,
+    model: bnlearn_bnfit.BNFitModel,
+    domain_nodes: Dict[str, dict],
+    cpd_queries: List[CPDQuery],
+    inference_queries: List[InferenceQuery],
+    gt_config: dict,
+) -> tuple[list[dict], str, str | None]:
+    seed_base = int(
+        hashlib.sha256(f"{dataset_id}::gt".encode("utf-8")).hexdigest()[:8], 16
+    )
+    rng = np.random.default_rng(seed_base)
+    n_gt_samples = int(gt_config.get("gt_n_samples", 4096))
+    n_lw_samples = int(gt_config.get("gt_lw_samples", max(8192, n_gt_samples * 2)))
+
+    def _evidence_values(query: CPDQuery | InferenceQuery) -> dict:
+        if isinstance(query, CPDQuery):
+            return dict(query.evidence_values or {})
+        if isinstance(query, InferenceQuery):
+            return dict(query.evidence.values or {})
+        return {}
+
+    def _evidence_vars(query: CPDQuery | InferenceQuery) -> list[str]:
+        if isinstance(query, CPDQuery):
+            return list(query.evidence_vars)
+        if isinstance(query, InferenceQuery):
+            return list(query.evidence_vars)
+        return []
+
+    def _gt_discrete_from_cpd(target: str, evidence: dict) -> list[float] | None:
+        cpd = model.discrete_cpds.get(target)
+        if cpd is None:
+            return None
+        if set(cpd.parents) != set(evidence.keys()):
+            return None
+        try:
+            key = tuple(int(evidence[p]) for p in cpd.parents)
+        except Exception:
+            return None
+        probs = cpd.probs.get(key)
+        if probs is None:
+            return None
+        arr = np.asarray(probs, dtype=float).reshape(-1)
+        total = float(arr.sum())
+        if total <= 0 or not math.isfinite(total):
+            return None
+        return (arr / total).tolist()
+
+    def _gt_continuous_from_cpd(
+        target: str, evidence: dict
+    ) -> tuple[list[float], float, float] | None:
+        cpd = model.continuous_cpds.get(target)
+        if cpd is None:
+            return None
+        if set(cpd.parents) != set(evidence.keys()):
+            return None
+        if cpd.discrete_parents:
+            try:
+                key = tuple(int(evidence[p]) for p in cpd.discrete_parents)
+            except Exception:
+                return None
+        else:
+            key = tuple()
+        params = cpd.params.get(key)
+        if params is None:
+            return None
+        mean = float(params.intercept)
+        for parent in cpd.continuous_parents:
+            try:
+                mean += float(params.coeffs.get(parent, 0.0)) * float(evidence[parent])
+            except Exception:
+                return None
+        sigma = float(params.sigma)
+        samples = rng.normal(mean, sigma, size=n_gt_samples).astype(float)
+        return samples.tolist(), mean, sigma
+
+    def _gt_from_lw(
+        target: str, evidence: dict, target_type: str
+    ) -> tuple[list[float] | None, list[float] | None, float | None, float | None]:
+        seed = int(rng.integers(0, 2**32 - 1))
+        samples, weights = bnlearn_bnfit.likelihood_weighted_samples(
+            model, evidence=evidence, n_samples=n_lw_samples, seed=seed
+        )
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 0 or not math.isfinite(weight_sum):
+            return None, None, None, None
+        if target_type == "discrete":
+            target_vals = samples.get(target)
+            if target_vals is None:
+                return None, None, None, None
+            k = len(domain_nodes.get(target, {}).get("states", []))
+            if k <= 0:
+                return None, None, None, None
+            hist = np.bincount(
+                target_vals.astype(int), weights=weights, minlength=int(k)
+            ).astype(float)
+            total = float(hist.sum())
+            if total <= 0 or not math.isfinite(total):
+                return None, None, None, None
+            return (hist / total).tolist(), None, None, None
+
+        target_vals = samples.get(target)
+        if target_vals is None:
+            return None, None, None, None
+        vals = np.asarray(target_vals, dtype=float)
+        w = weights / weight_sum
+        mean = float(np.sum(vals * w))
+        var = float(np.sum(((vals - mean) ** 2) * w))
+        std = float(math.sqrt(max(var, 0.0)))
+        idx = rng.choice(len(vals), size=n_gt_samples, replace=True, p=w)
+        return None, vals[idx].astype(float).tolist(), mean, std
+
+    records: list[dict] = []
+    for idx, query in enumerate(cpd_queries):
+        query_payload = _build_gt_query_payload(
+            query.to_dict(), dataset_id=dataset_id, qtype="cpd", index=idx
+        )
+        evidence = {k: v for k, v in _evidence_values(query).items() if v is not None}
+        target = query.target
+        target_type = model.node_types.get(target, "discrete")
+        if target_type == "discrete":
+            probs = _gt_discrete_from_cpd(target, evidence)
+            if probs is None:
+                probs, _, _, _ = _gt_from_lw(target, evidence, "discrete")
+            if probs is None:
+                continue
+            records.append(
+                {
+                    "problem": {"id": dataset_id},
+                    "query": query_payload,
+                    "gt_probs": probs,
+                }
+            )
+            continue
+
+        gt = _gt_continuous_from_cpd(target, evidence)
+        if gt is None:
+            _, samples, mean, std = _gt_from_lw(target, evidence, "continuous")
+            if samples is None:
+                continue
+            records.append(
+                {
+                    "problem": {"id": dataset_id},
+                    "query": query_payload,
+                    "gt_samples": samples,
+                    "gt_mean": mean,
+                    "gt_std": std,
+                }
+            )
+        else:
+            samples, mean, std = gt
+            records.append(
+                {
+                    "problem": {"id": dataset_id},
+                    "query": query_payload,
+                    "gt_samples": samples,
+                    "gt_mean": mean,
+                    "gt_std": std,
+                }
+            )
+
+    for idx, query in enumerate(inference_queries):
+        query_payload = _build_gt_query_payload(
+            query.to_dict(), dataset_id=dataset_id, qtype="inference", index=idx
+        )
+        evidence = {k: v for k, v in _evidence_values(query).items() if v is not None}
+        target = query.target
+        target_type = model.node_types.get(target, "discrete")
+
+        if target_type == "discrete":
+            probs, _, _, _ = _gt_from_lw(target, evidence, "discrete")
+            if probs is None:
+                continue
+            records.append(
+                {
+                    "problem": {"id": dataset_id},
+                    "query": query_payload,
+                    "gt_probs": probs,
+                }
+            )
+        else:
+            _, samples, mean, std = _gt_from_lw(target, evidence, "continuous")
+            if samples is None:
+                continue
+            records.append(
+                {
+                    "problem": {"id": dataset_id},
+                    "query": query_payload,
+                    "gt_samples": samples,
+                    "gt_mean": mean,
+                    "gt_std": std,
+                }
+            )
+
+    return records, "ok", None
+
+
 @register_query_generator
 class BNLearnQueryGenerator(BaseQueryGenerator):
     name = "bnlearn"
@@ -1257,19 +1550,72 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
                 logger.warning("Skipping %s: %s", dataset_id, reason)
                 return None
 
-        try:
-            bif_path = self._find_bif(dataset_dir)
-        except FileNotFoundError as exc:
-            logger.warning("Skipping %s: %s", dataset_id, exc)
-            return None
-        nodes, parents, children, node_states, node_types, node_sources = _parse_bif(
-            bif_path
-        )
+        dataset_type = self._resolve_dataset_type(dataset_id, download_meta)
+
+        bif_path = None
+        bnfit_model = None
+        bnfit_path = _find_bnfit(dataset_dir, download_meta)
+        needs_bnfit = dataset_type in {"gaussian", "clgaussian"}
+        bnfit_error = None
+        if bnfit_path is not None:
+            try:
+                bnfit_model = bnlearn_bnfit.load_bnfit(bnfit_path)
+            except Exception as exc:
+                bnfit_error = exc
+                bnfit_model = None
+
+        if needs_bnfit:
+            if bnfit_model is None:
+                reason = (
+                    f"bn.fit parsing failed: {type(bnfit_error).__name__}: {bnfit_error}"
+                    if bnfit_error is not None
+                    else "bn.fit model missing"
+                )
+                logger.warning("Skipping %s: %s", dataset_id, reason)
+                return None
+            (
+                nodes,
+                parents,
+                children,
+                node_states,
+                node_types,
+                node_sources,
+            ) = _structure_from_bnfit(bnfit_model)
+        else:
+            try:
+                bif_path = self._find_bif(dataset_dir)
+                nodes, parents, children, node_states, node_types, node_sources = (
+                    _parse_bif(bif_path)
+                )
+            except FileNotFoundError:
+                if bnfit_model is None:
+                    logger.warning("Skipping %s: Missing model.bif", dataset_id)
+                    return None
+                (
+                    nodes,
+                    parents,
+                    children,
+                    node_states,
+                    node_types,
+                    node_sources,
+                ) = _structure_from_bnfit(bnfit_model)
+
+        use_bnfit = bnfit_model is not None and (needs_bnfit or bif_path is None)
+        if not use_bnfit:
+            bnfit_model = None
+
         if not nodes:
-            raise ValueError(f"No variables found in BIF file: {bif_path}")
+            origin = "bn.fit" if bnfit_model is not None else "BIF"
+            raise ValueError(f"No variables found in {origin} for dataset {dataset_id}")
 
         nodes = sorted(nodes)
-        dataset_type = self._resolve_dataset_type(dataset_id, download_meta)
+        continuous_ranges = None
+        if bnfit_model is not None:
+            range_seed = self._stable_seed(f"{dataset_id}::range")
+            continuous_ranges = bnlearn_bnfit.estimate_continuous_ranges(
+                bnfit_model, n_samples=5000, seed=range_seed
+            )
+
         domain, unsupported, reason = _build_domain(
             dataset_id=dataset_id,
             generator=self.name,
@@ -1278,6 +1624,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             node_states=node_states,
             node_types=node_types,
             node_sources=node_sources,
+            continuous_ranges=continuous_ranges,
         )
         domain_path = _write_domain(self.root_path, self.name, dataset_id, domain)
         logger.info("Wrote domain metadata to %s", domain_path)
@@ -1572,10 +1919,12 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
         ground_truth_records, gt_status, gt_reason = _compute_ground_truth_records(
             dataset_id=dataset_id,
             bif_path=bif_path,
+            bnfit_model=bnfit_model,
             domain_nodes=domain.get("nodes", {}),
             cpd_queries=cpd_queries,
             inference_queries=inference_queries,
             logger=logger,
+            gt_config=generator_kwargs,
         )
 
         payload = {
@@ -1609,9 +1958,16 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             meta.get("type") == "continuous"
             for meta in domain.get("nodes", {}).values()
         )
-        payload["notes"]["off_manifold_distribution"] = (
-            "standard_normal" if has_continuous else "uniform_state"
-        )
+        if has_continuous:
+            has_ranges = any(
+                isinstance(meta.get("range"), dict)
+                for meta in domain.get("nodes", {}).values()
+            )
+            payload["notes"]["off_manifold_distribution"] = (
+                "uniform_range" if has_ranges else "standard_normal"
+            )
+        else:
+            payload["notes"]["off_manifold_distribution"] = "uniform_state"
         if inference_evidence_metrics.get("approx_on_manifold"):
             payload["notes"]["approx_on_manifold"] = True
             payload["notes"]["on_manifold_sampling"] = "approx_independent"

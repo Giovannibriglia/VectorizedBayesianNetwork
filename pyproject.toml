@@ -23,6 +23,7 @@ dependencies = [
 dev = ["pytest>=7.0", "ruff>=0.5", "black>=24.0", "mypy>=1.8"]
 test = ["pytest>=7.0", "pytest-cov", "coverage[toml]", "matplotlib>=3.8"]
 torch = ["torch>=2.0"]
+benchmark = ["pyreadr", "rds2py", "rdata"]
 
 [tool.setuptools]
 packages = {find = {where = ["."], include = ["vbn*"]}}

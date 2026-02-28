@@ -34,18 +34,17 @@
   "arth150": {
     "artifacts": [],
     "category": "gaussian_very_large",
-    "generated": {
-      "model_json": "https://www.bnlearn.com/bnrepository/arht150/arht150.bif.gz"
-    },
     "name": "ARTH150",
-    "source": "generated",
     "stats": {
       "arcs": 150,
       "nodes": 107,
       "parameters": 364
     },
     "type": "gaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/arth150/arth150.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/arth150/arth150.rds"
+    }
   },
   "asia": {
     "artifacts": [
@@ -146,18 +145,17 @@
   "ecoli70": {
     "artifacts": [],
     "category": "gaussian_medium",
-    "generated": {
-      "model_json": "https://www.bnlearn.com/bnrepository/ecoli70/ecoli70.bif.gz"
-    },
     "name": "ECOLI70",
-    "source": "generated",
     "stats": {
       "arcs": 70,
       "nodes": 46,
       "parameters": 162
     },
     "type": "gaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/ecoli70/ecoli70.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/ecoli70/ecoli70.rds"
+    }
   },
   "hailfinder": {
     "artifacts": [
@@ -178,18 +176,17 @@
   "healthcare": {
     "artifacts": [],
     "category": "clgaussian_small",
-    "generated": {
-      "model_json": "https://www.bnlearn.com/bnrepository/healthcare/healthcare.bif.gz"
-    },
     "name": "HEALTHCARE",
-    "source": "generated",
     "stats": {
       "arcs": 9,
       "nodes": 7,
       "parameters": 42
     },
     "type": "clgaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/healthcare/healthcare.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/healthcare/healthcare.rds"
+    }
   },
   "hepar2": {
     "artifacts": [
@@ -242,50 +239,47 @@
   "magic_irri": {
     "artifacts": [],
     "category": "gaussian_large",
-    "generated": {
-      "model_json": "benchmarking/bnrepo/generated/magic_irri/model.json"
-    },
     "name": "MAGIC-IRRI",
-    "source": "generated",
     "stats": {
       "arcs": 102,
       "nodes": 64,
       "parameters": 230
     },
     "type": "gaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/magic-irri/magic-irri.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/magic-irri/magic-irri.rds"
+    }
   },
   "magic_niab": {
     "artifacts": [],
     "category": "gaussian_medium",
-    "generated": {
-      "model_json": "https://www.bnlearn.com/bnrepository/magic-niab/magic-niab.bif.gz"
-    },
     "name": "MAGIC-NIAB",
-    "source": "generated",
     "stats": {
       "arcs": 66,
       "nodes": 44,
       "parameters": 154
     },
     "type": "gaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/magic-niab/magic-niab.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/magic-niab/magic-niab.rds"
+    }
   },
   "mehra": {
     "artifacts": [],
     "category": "clgaussian_medium",
-    "generated": {
-      "model_json": "https://www.bnlearn.com/bnrepository/mehra/mehra.bif.gz"
-    },
     "name": "MEHRA",
-    "source": "generated",
     "stats": {
       "arcs": 71,
       "nodes": 24,
       "parameters": 324423
     },
     "type": "clgaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/mehra/mehra-complete.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/mehra/mehra-complete.rds"
+    }
   },
   "mildew": {
     "artifacts": [
@@ -434,18 +428,17 @@
   "sangiovese": {
     "artifacts": [],
     "category": "clgaussian_small",
-    "generated": {
-      "model_json": "https://www.bnlearn.com/bnrepository/sangiovese/sangiovese.bif.gz"
-    },
     "name": "SANGIOVESE",
-    "source": "generated",
     "stats": {
       "arcs": 55,
       "nodes": 15,
       "parameters": 259
     },
     "type": "clgaussian",
-    "urls": {}
+    "urls": {
+      "rda": "https://www.bnlearn.com/bnrepository/sangiovese/sangiovese.rda",
+      "rds": "https://www.bnlearn.com/bnrepository/sangiovese/sangiovese.rds"
+    }
   },
   "survey": {
     "artifacts": [

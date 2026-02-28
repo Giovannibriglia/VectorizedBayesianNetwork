@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 
+from benchmarking import bnlearn_bnfit
 from benchmarking.utils import (
     ensure_dir,
     get_dataset_domain_metadata_path,
@@ -430,6 +431,7 @@ def _build_domain(
     node_states: Dict[str, List[str]],
     node_types: Dict[str, str],
     node_sources: Dict[str, str],
+    continuous_ranges: Dict[str, dict] | None = None,
 ) -> tuple[dict, bool, str | None]:
     domain_nodes: Dict[str, dict] = {}
     missing_states: List[str] = []
@@ -451,12 +453,24 @@ def _build_domain(
                 "source": node_sources.get(node, "metadata"),
             }
         else:
-            domain_nodes[node] = {
+            entry = {
                 "type": "continuous",
                 "dtype": None,
                 "range": None,
                 "source": node_sources.get(node, "metadata"),
             }
+            if continuous_ranges:
+                info = continuous_ranges.get(node)
+                if isinstance(info, dict):
+                    low = info.get("low")
+                    high = info.get("high")
+                    if low is not None and high is not None:
+                        entry["range"] = {"low": float(low), "high": float(high)}
+                    mean = info.get("mean")
+                    std = info.get("std")
+                    if mean is not None and std is not None:
+                        entry["gt"] = {"mean": float(mean), "std": float(std)}
+            domain_nodes[node] = entry
 
     unsupported = False
     reason = None
@@ -491,6 +505,7 @@ def _load_or_create_domain(
     node_types: Dict[str, str],
     node_sources: Dict[str, str],
     logger: logging.Logger,
+    continuous_ranges: Dict[str, dict] | None = None,
 ) -> tuple[Path, dict]:
     path = _domain_path(root_path, generator, dataset_id)
     if path.exists():
@@ -505,6 +520,7 @@ def _load_or_create_domain(
         node_states=node_states,
         node_types=node_types,
         node_sources=node_sources,
+        continuous_ranges=continuous_ranges,
     )
     ensure_dir(path.parent)
     write_json(path, domain)
@@ -571,6 +587,16 @@ class BNLearnDataGenerator(BaseDataGenerator):
         approx_domain = False
         approx_domain_reason = None
 
+        bnfit_path = bnlearn_bnfit.find_bnfit_path(dataset_dir, download_meta)
+        bnfit_model = None
+        bnfit_error = None
+        if bnfit_path is not None:
+            try:
+                bnfit_model = bnlearn_bnfit.load_bnfit(bnfit_path)
+            except Exception as exc:
+                bnfit_error = exc
+                bnfit_model = None
+
         bif_path = None
         if isinstance(download_meta, dict):
             downloaded = download_meta.get("downloaded_files") or {}
@@ -589,7 +615,35 @@ class BNLearnDataGenerator(BaseDataGenerator):
             if gz_candidate.exists():
                 bif_path = gz_candidate
 
-        if bif_path is None:
+        needs_bnfit = dataset_type in {"gaussian", "clgaussian"}
+        use_bnfit = bnfit_model is not None and (needs_bnfit or bif_path is None)
+        if needs_bnfit and bnfit_model is None:
+            reason = (
+                f"bn.fit parsing failed: {type(bnfit_error).__name__}: {bnfit_error}"
+                if bnfit_error is not None
+                else "bn.fit model missing"
+            )
+            logger.warning("Skipping %s: %s", dataset_id, reason)
+            return DataGenResult(
+                data_path=None,
+                format=None,
+                schema=None,
+                capabilities={
+                    "can_generate_data": False,
+                    "uses_bn_sampling": False,
+                    "supports_discrete": True,
+                    "supports_continuous": True,
+                },
+                notes={
+                    "approx_on_manifold": None,
+                    "approx_reason": reason,
+                    "approx_domain": approx_domain,
+                    "approx_domain_reason": approx_domain_reason,
+                },
+                skipped=True,
+                reason=reason,
+            )
+        if bif_path is None and not use_bnfit:
             reason = "Missing BIF file; cannot sample BN"
             if isinstance(download_meta, dict) and download_meta.get("reason"):
                 reason = download_meta.get("reason")
@@ -635,6 +689,106 @@ class BNLearnDataGenerator(BaseDataGenerator):
                 },
                 skipped=True,
                 reason=reason,
+            )
+
+        if use_bnfit:
+            nodes = sorted(list(bnfit_model.nodes))
+            node_states = {n: list(bnfit_model.states.get(n, [])) for n in nodes}
+            node_types = {n: bnfit_model.node_types.get(n, "discrete") for n in nodes}
+            node_sources = {n: "bnfit" for n in nodes}
+            continuous_ranges = bnlearn_bnfit.estimate_continuous_ranges(
+                bnfit_model,
+                n_samples=5000,
+                seed=self._stable_seed(f"{dataset_id}::range"),
+            )
+
+            domain_path, domain = _load_or_create_domain(
+                root_path=self.root_path,
+                generator=self.name,
+                dataset_id=dataset_id,
+                dataset_type=dataset_type,
+                nodes=nodes,
+                node_states=node_states,
+                node_types=node_types,
+                node_sources=node_sources,
+                logger=logger,
+                continuous_ranges=continuous_ranges,
+            )
+
+            if isinstance(domain, dict) and domain.get("unsupported"):
+                reason = domain.get("reason") or "Domain metadata marked unsupported"
+                logger.warning("Skipping %s: %s", dataset_id, reason)
+                return DataGenResult(
+                    data_path=None,
+                    format=None,
+                    schema=None,
+                    capabilities={
+                        "can_generate_data": False,
+                        "uses_bn_sampling": False,
+                        "supports_discrete": True,
+                        "supports_continuous": True,
+                    },
+                    notes={
+                        "approx_on_manifold": None,
+                        "approx_reason": reason,
+                        "approx_domain": approx_domain,
+                        "approx_domain_reason": approx_domain_reason,
+                    },
+                    skipped=True,
+                    reason=reason,
+                    domain_path=domain_path,
+                )
+
+            dataset_seed = self._stable_seed(dataset_id)
+            samples = bnlearn_bnfit.sample_bnfit(
+                bnfit_model, n_samples=self.n_samples, seed=dataset_seed
+            )
+
+            columns = list(nodes)
+            data: Dict[str, np.ndarray] = {}
+            domain_nodes = domain.get("nodes", {}) if isinstance(domain, dict) else {}
+            for col in columns:
+                values = samples[col]
+                meta = domain_nodes.get(col, {})
+                if meta.get("type") == "discrete":
+                    states = meta.get("states") or []
+                    codes = meta.get("codes") or {}
+                    if states:
+                        index_to_code = [codes.get(s, i) for i, s in enumerate(states)]
+                        if any(code != idx for idx, code in enumerate(index_to_code)):
+                            values = np.asarray(index_to_code, dtype=np.int64)[values]
+                    values = values.astype(np.int32)
+                data[col] = values
+
+            df = pd.DataFrame(data, columns=columns)
+
+            path_prefix = out_dir / (
+                f"data_{self.generation_strategy}_n{self.n_samples}_seed{self.seed}"
+            )
+            data_path, fmt = save_dataframe(df, path_prefix, prefer="parquet")
+
+            dtypes = {col: str(dtype) for col, dtype in df.dtypes.items()}
+            schema = _schema_from_domain(columns, domain, dtypes)
+
+            return DataGenResult(
+                data_path=data_path,
+                format=fmt,
+                schema=schema,
+                capabilities={
+                    "can_generate_data": True,
+                    "uses_bn_sampling": True,
+                    "supports_discrete": True,
+                    "supports_continuous": True,
+                },
+                notes={
+                    "approx_on_manifold": False,
+                    "approx_reason": None,
+                    "approx_domain": approx_domain,
+                    "approx_domain_reason": approx_domain_reason,
+                },
+                domain_path=domain_path,
+                skipped=False,
+                reason=None,
             )
 
         nodes, node_states, node_types, node_sources, parents_map, cpds = _parse_bif(

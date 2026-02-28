@@ -6,3 +6,6 @@ pyarrow
 scipy
 pgmpy
 pyyaml
+pyreadr
+rds2py
+rdata

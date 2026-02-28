@@ -62,6 +62,17 @@ def _domain_node(domain: dict, node: str) -> dict:
     return {}
 
 
+def _is_continuous(domain: dict, node: str) -> bool:
+    meta = _domain_node(domain, node)
+    node_type = meta.get("type")
+    if node_type == "continuous":
+        return True
+    if node_type == "discrete":
+        return False
+    states = meta.get("states") or []
+    return len(states) == 0
+
+
 def _to_float(value: Any) -> float:
     if isinstance(value, (list, tuple)) and value:
         value = value[0]
@@ -77,6 +88,25 @@ def _normalize_probs(probs: Iterable[float]) -> list[float]:
     if not math.isfinite(total) or total <= 0:
         return (np.ones_like(arr) / len(arr)).tolist()
     return (arr / total).tolist()
+
+
+def _result_ok(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    fmt = result.get("format")
+    if fmt == "categorical_probs":
+        return result.get("probs") is not None
+    if fmt == "normal_params":
+        mean = result.get("mean")
+        std = result.get("std")
+        if mean is not None and std is not None:
+            return math.isfinite(float(mean)) and math.isfinite(float(std))
+        samples = result.get("samples") or []
+        return bool(samples)
+    if fmt == "samples_1d":
+        samples = result.get("samples") or []
+        return bool(samples)
+    return False
 
 
 def _build_nodes_cpds(
@@ -225,6 +255,115 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             "uses_inference": True,
         }
 
+    def _continuous_params(
+        self, cpd_handle: Any, parents_values: dict
+    ) -> tuple[float | None, float | None]:
+        candidates = [cpd_handle]
+        cpd_obj = getattr(cpd_handle, "cpd", None)
+        if cpd_obj is not None and cpd_obj is not cpd_handle:
+            candidates.append(cpd_obj)
+        parents_tensor = None
+        if hasattr(cpd_handle, "_parents_tensor"):
+            try:
+                parents_tensor = cpd_handle._parents_tensor(parents_values)
+            except Exception:
+                parents_tensor = None
+        method_names = (
+            "conditional_mean_std",
+            "mean_std",
+            "get_mean_and_std",
+            "mean_and_std",
+            "mean_stddev",
+        )
+        for obj in candidates:
+            for name in method_names:
+                if not hasattr(obj, name):
+                    continue
+                try:
+                    fn = getattr(obj, name)
+                    out = fn(
+                        parents_tensor if parents_tensor is not None else parents_values
+                    )
+                    if isinstance(out, tuple) and len(out) >= 2:
+                        mean = float(np.asarray(out[0]).reshape(-1)[0])
+                        std = float(np.asarray(out[1]).reshape(-1)[0])
+                        if math.isfinite(mean) and math.isfinite(std):
+                            return mean, std
+                except Exception:
+                    continue
+        for obj in candidates:
+            if not hasattr(obj, "_params"):
+                continue
+            try:
+                loc, scale = obj._params(parents_tensor)
+                mean = float(np.asarray(loc).reshape(-1)[0])
+                std = float(np.asarray(scale).reshape(-1)[0])
+                if math.isfinite(mean) and math.isfinite(std):
+                    return mean, std
+            except Exception:
+                continue
+        return None, None
+
+    def _extract_samples_1d(self, samples: Any) -> np.ndarray:
+        if isinstance(samples, torch.Tensor):
+            samples = samples.detach().cpu().numpy()
+        arr = np.asarray(samples)
+        if arr.ndim == 0:
+            return arr.reshape(1)
+        if arr.ndim == 3:
+            arr = arr.reshape(-1, arr.shape[-1])
+        if arr.ndim == 2:
+            if arr.shape[1] == 1:
+                return arr[:, 0]
+            raise ValueError("Multivariate continuous targets are unsupported")
+        if arr.ndim == 1:
+            return arr
+        raise ValueError(f"Unsupported sample shape {arr.shape}")
+
+    def _continuous_from_samples(
+        self, samples: Any, weights: Any | None = None
+    ) -> dict:
+        vals = self._extract_samples_1d(samples)
+        if vals.size == 0:
+            raise ValueError("No samples returned for continuous target")
+        vals = vals.astype(float)
+        wts = None
+        if weights is not None:
+            if isinstance(weights, torch.Tensor):
+                weights = weights.detach().cpu().numpy()
+            wts_arr = np.asarray(weights).reshape(-1)
+            if wts_arr.size == vals.size and np.isfinite(wts_arr).any():
+                wts = wts_arr.astype(float)
+        if wts is not None:
+            wts = np.clip(wts, 0.0, np.inf)
+            total = float(wts.sum())
+            if total > 0:
+                wts = wts / total
+                mean = float(np.sum(wts * vals))
+                var = float(np.sum(wts * (vals - mean) ** 2))
+                std = math.sqrt(var)
+            else:
+                mean = float(np.mean(vals))
+                std = float(np.std(vals, ddof=0))
+        else:
+            mean = float(np.mean(vals))
+            std = float(np.std(vals, ddof=0))
+        max_keep = min(int(vals.size), 2048)
+        sample_list = [float(x) for x in vals[:max_keep]]
+        if math.isfinite(mean) and math.isfinite(std):
+            return {
+                "format": "normal_params",
+                "mean": mean,
+                "std": std,
+                "n_samples": int(vals.size),
+                "samples": sample_list,
+            }
+        return {
+            "format": "samples_1d",
+            "samples": sample_list,
+            "n_samples": int(vals.size),
+        }
+
     def fit(
         self, data_df: pd.DataFrame, *, progress: bool = True, **kwargs: Any
     ) -> None:
@@ -240,6 +379,24 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
 
     def _cpd_distribution(self, target: str, evidence: dict) -> dict:
         meta = _domain_node(self.domain, target)
+        if _is_continuous(self.domain, target):
+            parents = list(self._vbn.dag.parents(target))
+            if parents and not all(p in evidence for p in parents):
+                raise ValueError("Missing parents for continuous CPD")
+            parents_values = {p: [_to_float(evidence[p])] for p in parents}
+            cpd_handle = self._vbn.cpd(target)
+            mean, std = self._continuous_params(cpd_handle, parents_values)
+            if mean is not None and std is not None:
+                return {
+                    "format": "normal_params",
+                    "mean": float(mean),
+                    "std": float(std),
+                    "n_samples": None,
+                    "samples": None,
+                }
+            samples = cpd_handle.sample(parents_values, n_samples=1024)
+            return self._continuous_from_samples(samples)
+
         states = meta.get("states") or []
         k = len(states)
         if k == 0:
@@ -273,6 +430,14 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
 
     def _infer_distribution(self, target: str, evidence: dict, n_samples: int) -> dict:
         meta = _domain_node(self.domain, target)
+        if _is_continuous(self.domain, target):
+            evidence_values = {k: [_to_float(v)] for k, v in evidence.items()}
+            pdf, samples = self._vbn.infer_posterior(
+                {"target": target, "evidence": evidence_values},
+                n_samples=int(n_samples),
+            )
+            return self._continuous_from_samples(samples, weights=pdf)
+
         states = meta.get("states") or []
         k = len(states)
         if k == 0:
@@ -307,8 +472,8 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             else:
                 n_samples = _get_n_mc(query, default=200)
                 result = self._infer_distribution(target, evidence, n_samples)
-            ok = result.get("probs") is not None
-            error = None
+            ok = _result_ok(result)
+            error = None if ok else "Unsupported or empty CPD result"
         except Exception as exc:
             ok = False
             error = f"{type(exc).__name__}: {exc}"
@@ -325,8 +490,8 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             evidence = _extract_evidence(query)
             n_samples = _get_n_mc(query, default=200)
             result = self._infer_distribution(target, evidence, n_samples)
-            ok = result.get("probs") is not None
-            error = None
+            ok = _result_ok(result)
+            error = None if ok else "Unsupported or empty inference result"
         except Exception as exc:
             ok = False
             error = f"{type(exc).__name__}: {exc}"
@@ -340,6 +505,8 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
         target = queries[0].get("target")
         if not target:
             raise ValueError("Missing target in query")
+        if _is_continuous(self.domain, target):
+            return [self.answer_inference_query(q) for q in queries]
         evidence_vars = None
         for query in queries:
             evidence = (

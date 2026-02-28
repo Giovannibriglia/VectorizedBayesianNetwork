@@ -22,7 +22,8 @@ This benchmarking suite compares VBN and other probabilistic graphical model lib
 
 **Purpose.** Download and prepare dataset artifacts from registered sources so downstream stages can reuse the same inputs.
 
-**Supported sources.** Currently: bnlearn BIF repository.
+**Supported sources.** Currently: bnlearn BIF repository and bn.fit (RDS/RDA) artifacts
+for gaussian / CLG networks (no R runtime required; use `pyreadr` and optionally `rds2py`).
 
 **How to run.**
 
@@ -95,7 +96,7 @@ benchmarking/data/queries/log/<generator>/<problem>_seed<seed>.log
 benchmarking/data/metadata/<generator>/<problem>/domain.json
 ```
 
-Ground truth distributions are computed during query generation (pgmpy exact inference) and stored once per dataset in `ground_truth.jsonl`. The `queries.json` metadata records a pointer under `ground_truth.path` along with a status/reason if GT could not be computed.
+Ground truth distributions are computed during query generation and stored once per dataset in `ground_truth.jsonl`. Discrete targets use exact inference (pgmpy). Continuous targets store sample-based ground truth under `gt_samples` with summary stats. The `queries.json` metadata records a pointer under `ground_truth.path` along with a status/reason if GT could not be computed.
 The full query sets are stored in `cpds.jsonl` / `inference.jsonl`.
 
 **Query metadata JSON schema.**
@@ -165,7 +166,7 @@ python -m benchmarking.scripts.04_run_benchmark \
     --generator bnlearn \
     --seed 0 \
     --mode cpds \
-    --models vbn:vbn_linear_gauss_is,pgmpy:pgmpy_mle_ei
+    --models vbn:vbn_linear_gausspgmpy:pgmpy_mle
 ```
 
 ### Parameters

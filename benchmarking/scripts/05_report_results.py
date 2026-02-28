@@ -16,7 +16,13 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from benchmarking.metrics.divergences import _compute_discrete_metrics
+from benchmarking import bnlearn_bnfit
+from benchmarking.metrics.divergences import (
+    _compute_discrete_metrics,
+    jensen_shannon_divergence_samples,
+    jensen_shannon_divergence_samples_normalized,
+    wasserstein_distance_samples,
+)
 from benchmarking.utils import (
     ensure_dir,
     get_generator_datasets_dir,
@@ -79,6 +85,8 @@ RECORD_COLUMNS = [
     "jsd",
     "jsd_norm",
     "time",
+    "mean_abs_err",
+    "std_abs_err",
     "batch_enabled",
     "batch_size",
 ]
@@ -1093,6 +1101,33 @@ def _extract_pred_probs(record: dict) -> tuple[list[float] | None, dict | None]:
     return probs, output
 
 
+def _extract_pred_samples(
+    record: dict, *, seed: int, n_samples: int
+) -> tuple[list[float] | None, dict | None]:
+    output = record.get("result", {}).get("output")
+    if not isinstance(output, dict):
+        return None, None
+    samples = output.get("samples")
+    if isinstance(samples, list) and samples:
+        return samples, output
+    mean = output.get("mean")
+    std = output.get("std")
+    if mean is None or std is None:
+        return None, output
+    try:
+        mean = float(mean)
+        std = float(std)
+    except Exception:
+        return None, output
+    if not math.isfinite(mean) or not math.isfinite(std):
+        return None, output
+    if std < 0:
+        return None, output
+    rng = np.random.default_rng(int(seed))
+    draws = rng.normal(mean, std, size=int(n_samples)).astype(float)
+    return draws.tolist(), output
+
+
 def _extract_gt_probs(record: dict, gt_key: str) -> list[float] | None:
     value = _get_by_path(record, gt_key)
     if isinstance(value, list):
@@ -1100,36 +1135,53 @@ def _extract_gt_probs(record: dict, gt_key: str) -> list[float] | None:
     return None
 
 
-def _extract_gt_from_line(line: dict, gt_key: str) -> list[float] | None:
+def _extract_gt_samples(
+    record: dict, gt_key: str
+) -> tuple[list[float] | None, float | None, float | None]:
+    if isinstance(record.get("gt_samples"), list):
+        return record.get("gt_samples"), record.get("gt_mean"), record.get("gt_std")
+    value = _get_by_path(record, gt_key)
+    if isinstance(value, list):
+        return value, record.get("gt_mean"), record.get("gt_std")
+    return None, None, None
+
+
+def _extract_gt_from_line(line: dict, gt_key: str) -> dict | None:
+    if isinstance(line.get("gt_samples"), list):
+        return {
+            "samples": line.get("gt_samples"),
+            "mean": line.get("gt_mean"),
+            "std": line.get("gt_std"),
+        }
     if isinstance(line.get("gt_probs"), list):
-        return line.get("gt_probs")
+        return {"probs": line.get("gt_probs")}
     value = _get_by_path(line, gt_key)
     if isinstance(value, list):
-        return value
+        return {"probs": value}
     output = (
         line.get("result", {}).get("output")
         if isinstance(line.get("result"), dict)
         else None
     )
     if isinstance(output, dict) and isinstance(output.get("probs"), list):
-        return output.get("probs")
+        return {"probs": output.get("probs")}
     return None
 
 
 def _load_ground_truth_folder(
     run_dir: Path, gt_key: str, max_records: int | None
 ) -> dict:
-    gt_map: dict[tuple, list[float]] = {}
+    gt_map: dict[tuple, dict] = {}
     gt_dir = run_dir / "ground_truth"
     if gt_dir.exists():
         for name in ("cpds.jsonl", "inference.jsonl"):
             path = gt_dir / name
             for record in _read_jsonl(path, max_records=max_records):
-                probs = _extract_gt_from_line(record, gt_key)
-                if probs is None:
+                entry = _extract_gt_from_line(record, gt_key)
+                if entry is None:
                     continue
                 key = _join_key(record)
-                gt_map[key] = probs
+                gt_map[key] = entry
     sources_path = run_dir / "ground_truth_sources.json"
     if sources_path.exists():
         try:
@@ -1148,11 +1200,11 @@ def _load_ground_truth_folder(
                 if not gt_path.is_absolute():
                     gt_path = get_project_root() / gt_path
                 for record in _read_jsonl(gt_path, max_records=max_records):
-                    probs = _extract_gt_from_line(record, gt_key)
-                    if probs is None:
+                    entry = _extract_gt_from_line(record, gt_key)
+                    if entry is None:
                         continue
                     key = _join_key(record)
-                    gt_map[key] = probs
+                    gt_map[key] = entry
     return gt_map
 
 
@@ -1173,9 +1225,16 @@ def _compute_graph_stats(run_dir: Path) -> dict[str, dict[str, int]]:
             if bif_gz.exists():
                 bif_path = bif_gz
             else:
-                continue
+                bif_path = None
         try:
-            _, parents_map = parse_bif_structure(bif_path)
+            if bif_path is not None:
+                _, parents_map = parse_bif_structure(bif_path)
+            else:
+                bnfit_path = bnlearn_bnfit.find_bnfit_path(dataset_dir, None)
+                if bnfit_path is None:
+                    continue
+                model = bnlearn_bnfit.load_bnfit(bnfit_path)
+                parents_map = {k: list(v) for k, v in model.parents.items()}
         except Exception:
             continue
         children_map: dict[str, set[str]] = {node: set() for node in parents_map}
@@ -1215,7 +1274,7 @@ def _build_records(
     model_filter: set[str] | None,
 ) -> tuple[pd.DataFrame, list[str]]:
     errors: list[str] = []
-    gt_map: dict[tuple, list[float]] = {}
+    gt_map: dict[tuple, dict] = {}
     if gt_source == "folder":
         gt_map = _load_ground_truth_folder(run_dir, gt_key, max_records)
 
@@ -1275,14 +1334,21 @@ def _build_records(
                 query = (
                     record.get("query") if isinstance(record.get("query"), dict) else {}
                 )
-                pred_probs, pred_output = _extract_pred_probs(record)
-                if pred_probs is None:
-                    continue
-                gt_probs: list[float] | None = None
+                gt_entry: dict | None = None
                 if gt_source == "embedded":
-                    gt_probs = _extract_gt_probs(record, gt_key)
+                    gt_samples, gt_mean, gt_std = _extract_gt_samples(record, gt_key)
+                    if gt_samples is not None:
+                        gt_entry = {
+                            "samples": gt_samples,
+                            "mean": gt_mean,
+                            "std": gt_std,
+                        }
+                    else:
+                        gt_probs = _extract_gt_probs(record, gt_key)
+                        if gt_probs is not None:
+                            gt_entry = {"probs": gt_probs}
                 elif gt_source == "folder":
-                    gt_probs = gt_map.get(_join_key(record))
+                    gt_entry = gt_map.get(_join_key(record))
                 elif gt_source == "compute":
                     problem_id = record.get("problem", {}).get("id")
                     target = query.get("target")
@@ -1293,21 +1359,69 @@ def _build_records(
                             target=target,
                             evidence_vals=evidence_vals,
                         )
-                if gt_probs is None:
+                        if gt_probs is not None:
+                            gt_entry = {"probs": gt_probs}
+
+                if gt_entry is None:
                     continue
 
-                if len(pred_probs) != len(gt_probs):
-                    continue
+                kl = wass = jsd = jsd_norm = float("nan")
+                mean_abs_err = None
+                std_abs_err = None
+                pred_output = None
 
-                try:
-                    kl, wass, jsd, jsd_norm = _compute_discrete_metrics(
-                        gt_probs,
-                        pred_probs,
-                        eps,
-                        compute_jsd=_is_discrete_output(pred_output),
+                if "probs" in gt_entry:
+                    pred_probs, pred_output = _extract_pred_probs(record)
+                    if pred_probs is None:
+                        continue
+                    gt_probs = gt_entry.get("probs") or []
+                    if len(pred_probs) != len(gt_probs):
+                        continue
+                    try:
+                        kl, wass, jsd, jsd_norm = _compute_discrete_metrics(
+                            gt_probs,
+                            pred_probs,
+                            eps,
+                            compute_jsd=_is_discrete_output(pred_output),
+                        )
+                    except Exception as exc:
+                        errors.append(str(exc))
+                        continue
+                elif "samples" in gt_entry:
+                    gt_samples = gt_entry.get("samples") or []
+                    if not isinstance(gt_samples, list) or not gt_samples:
+                        continue
+                    gt_mean = gt_entry.get("mean")
+                    gt_std = gt_entry.get("std")
+                    if gt_mean is None or gt_std is None:
+                        arr = np.asarray(gt_samples, dtype=float)
+                        if arr.size > 0 and np.isfinite(arr).any():
+                            gt_mean = float(np.mean(arr))
+                            gt_std = float(np.std(arr, ddof=0))
+                    query_id = query.get("id") or record.get("query", {}).get("id")
+                    seed_src = str(query_id or _join_key(record))
+                    seed = int(
+                        hashlib.sha256(seed_src.encode("utf-8")).hexdigest()[:8], 16
                     )
-                except Exception as exc:
-                    errors.append(str(exc))
+                    pred_samples, pred_output = _extract_pred_samples(
+                        record, seed=seed, n_samples=len(gt_samples)
+                    )
+                    if pred_samples is None:
+                        continue
+                    wass = wasserstein_distance_samples(gt_samples, pred_samples)
+                    jsd = jensen_shannon_divergence_samples(gt_samples, pred_samples)
+                    jsd_norm = jensen_shannon_divergence_samples_normalized(
+                        gt_samples, pred_samples
+                    )
+                    arr_pred = np.asarray(pred_samples, dtype=float)
+                    if arr_pred.size > 0 and np.isfinite(arr_pred).any():
+                        pred_mean = float(np.mean(arr_pred))
+                        pred_std = float(np.std(arr_pred, ddof=0))
+                        if gt_mean is not None:
+                            mean_abs_err = float(abs(pred_mean - float(gt_mean)))
+                        if gt_std is not None:
+                            std_abs_err = float(abs(pred_std - float(gt_std)))
+                else:
                     continue
 
                 time_ms = None
@@ -1426,6 +1540,8 @@ def _build_records(
                         "jsd": jsd,
                         "jsd_norm": jsd_norm,
                         "time": time_ms,
+                        "mean_abs_err": mean_abs_err,
+                        "std_abs_err": std_abs_err,
                         "batch_enabled": batch_enabled,
                         "batch_size": batch_size,
                     }

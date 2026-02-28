@@ -110,3 +110,62 @@ def _compute_discrete_metrics(
     jsd = jensen_shannon_divergence(p_arr, q_arr)
     jsd_norm = jensen_shannon_divergence_normalized(p_arr, q_arr)
     return kl, wass, jsd, jsd_norm
+
+
+def _as_sample_array(values: Iterable[float]) -> np.ndarray | None:
+    arr = np.asarray(list(values), dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return None
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return arr
+
+
+def wasserstein_distance_samples(
+    p_samples: Iterable[float], q_samples: Iterable[float]
+) -> float:
+    p_arr = _as_sample_array(p_samples)
+    q_arr = _as_sample_array(q_samples)
+    if p_arr is None or q_arr is None:
+        return float("nan")
+    if _scipy_wasserstein is not None:
+        return float(_scipy_wasserstein(p_arr, q_arr))
+    # Fallback: approximate using sorted samples.
+    p_sorted = np.sort(p_arr)
+    q_sorted = np.sort(q_arr)
+    n = min(len(p_sorted), len(q_sorted))
+    if n == 0:
+        return float("nan")
+    return float(np.mean(np.abs(p_sorted[:n] - q_sorted[:n])))
+
+
+def jensen_shannon_divergence_samples(
+    p_samples: Iterable[float],
+    q_samples: Iterable[float],
+    *,
+    bins: int = 64,
+) -> float:
+    p_arr = _as_sample_array(p_samples)
+    q_arr = _as_sample_array(q_samples)
+    if p_arr is None or q_arr is None:
+        return float("nan")
+    low = float(min(np.min(p_arr), np.min(q_arr)))
+    high = float(max(np.max(p_arr), np.max(q_arr)))
+    if not math.isfinite(low) or not math.isfinite(high):
+        return float("nan")
+    if low == high:
+        return 0.0
+    hist_p, bin_edges = np.histogram(p_arr, bins=bins, range=(low, high))
+    hist_q, _ = np.histogram(q_arr, bins=bin_edges)
+    return jensen_shannon_divergence(hist_p, hist_q, eps=1e-12)
+
+
+def jensen_shannon_divergence_samples_normalized(
+    p_samples: Iterable[float],
+    q_samples: Iterable[float],
+    *,
+    bins: int = 64,
+) -> float:
+    jsd = jensen_shannon_divergence_samples(p_samples, q_samples, bins=bins)
+    return float(jsd / np.log(2.0))

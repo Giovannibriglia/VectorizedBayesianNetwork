@@ -6,6 +6,7 @@ from typing import List
 
 import networkx as nx
 
+from benchmarking import bnlearn_bnfit
 from benchmarking.utils import (
     get_dataset_domain_metadata_path,
     get_dataset_queries_dir,
@@ -49,12 +50,16 @@ class BNLearnBenchmarkRunner(BaseBenchmarkRunner):
             if bif_gz.exists():
                 bif_path = bif_gz
             else:
-                return ProblemLoadResult(
-                    problem=problem,
-                    assets=None,
-                    skipped=True,
-                    reason="Missing model.bif",
-                )
+                bif_path = None
+
+        bnfit_path = bnlearn_bnfit.find_bnfit_path(dataset_dir, None)
+        if bif_path is None and bnfit_path is None:
+            return ProblemLoadResult(
+                problem=problem,
+                assets=None,
+                skipped=True,
+                reason="Missing model.bif and model.rds/rda",
+            )
 
         domain_path = get_dataset_domain_metadata_path(
             self.root, self.generator, problem
@@ -160,14 +165,20 @@ class BNLearnBenchmarkRunner(BaseBenchmarkRunner):
             queries["ground_truth"] = queries_meta.get("ground_truth")
 
         try:
-            nodes, parents_map = parse_bif_structure(bif_path)
+            if bif_path is not None:
+                nodes, parents_map = parse_bif_structure(bif_path)
+            else:
+                model = bnlearn_bnfit.load_bnfit(bnfit_path)
+                nodes = list(model.nodes)
+                parents_map = {k: list(v) for k, v in model.parents.items()}
             dag = _build_dag(nodes, parents_map)
         except Exception as exc:
+            kind = "BIF" if bif_path is not None else "bn.fit"
             return ProblemLoadResult(
                 problem=problem,
                 assets=None,
                 skipped=True,
-                reason=f"Failed to parse BIF: {type(exc).__name__}: {exc}",
+                reason=f"Failed to parse {kind}: {type(exc).__name__}: {exc}",
             )
 
         assets = ProblemAssets(
