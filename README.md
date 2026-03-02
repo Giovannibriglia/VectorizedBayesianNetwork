@@ -56,15 +56,27 @@ Vectorized Bayesian Networks is a **continuous-first**, **torch-native** Bayesia
 - [benchmarking] Introducing sensitive analysis on *n_queries*
 - [benchmarking] New generators (rl, cv, protein...)
 - [library] Saving to .onnx
-- [library] pip install
-- [library] installation with clone and with pip
 - [library] check dependencies between vbn and benchmarking
 
-## Installation
+### Installation
 ```bash
+git clone https://github.com/Giovannibriglia/VectorizedBayesianNetwork
+cd VectorizedBayesianNetwork
+
+# (Optional but recommended)
+python -m venv .venv
+source .venv/bin/activate
+
 pip install -e .
-python setup.py install
 ```
+
+**Important**
+
+PyTorch is required for learning and inference but is **not installed automatically**.
+
+Please install PyTorch separately according to your system configuration from:
+
+[Install Torch on your device](https://pytorch.org/get-started/locally/)
 
 ## Minimal Usage
 ```python
@@ -181,12 +193,7 @@ tests/
 
 ## Testing
 
-Install the project in editable mode (ensures tests use local sources):
-
-```bash
-pip uninstall -y vbn
-pip install -e ".[test]"
-```
+Ensure the project is installed in editable mode (see Installation). Then run:
 
 Quick Run:
 
@@ -239,7 +246,7 @@ Module execution avoids `PYTHONPATH`/`sys.path` hacks, ensures consistent import
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 pre-commit install
 ```
 
