@@ -67,6 +67,9 @@ cd VectorizedBayesianNetwork
 python -m venv .venv
 source .venv/bin/activate
 
+# Ensure editable installs work with pyproject.toml
+python -m pip install -U pip setuptools wheel
+
 pip install -e .
 ```
 
