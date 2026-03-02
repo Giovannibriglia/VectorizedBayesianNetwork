@@ -38,6 +38,20 @@ def _extract_evidence(query: dict) -> dict:
     return {k: v for k, v in values.items() if v is not None}
 
 
+def get_device_info() -> str:
+    """
+    Returns a human-readable description of the current torch device.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    device = torch.device("cuda")
+    gpu_name = torch.cuda.get_device_name(device)
+    total_mem = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+
+    return f"cuda:0 ({gpu_name}, {total_mem:.1f}GB)"
+
+
 def _get_n_mc(query: dict, default: int = 200) -> int:
     kwargs = query.get("generator_kwargs")
     if isinstance(kwargs, dict) and "n_mc" in kwargs:

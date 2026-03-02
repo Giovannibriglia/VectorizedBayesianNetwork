@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, Iterator
 
 import pandas as pd
 from tqdm.auto import tqdm
+from vbn.utils.device_logging import log_device
 
 from benchmarking.models import get_benchmark_model
 from benchmarking.models.config import apply_overrides, config_hash
@@ -264,6 +265,22 @@ class BaseBenchmarkRunner(ABC):
         if self.batch_size_queries < 1:
             raise ValueError("batch_size_queries must be >= 1")
         self.logger = logging.getLogger(__name__)
+
+    def _resolve_model_device(self, model) -> object | None:
+        device = getattr(model, "device", None)
+        if device is None:
+            vbn_model = getattr(model, "_vbn", None)
+            device = getattr(vbn_model, "device", None)
+        if device is None:
+            return None
+        try:
+            import torch
+
+            if isinstance(device, str):
+                return torch.device(device)
+        except Exception:
+            return None
+        return device
 
     @abstractmethod
     def list_problem_dirs(self) -> list[Path]:
@@ -542,6 +559,7 @@ class BaseBenchmarkRunner(ABC):
 
         self.logger.info("Benchmark output: %s", run_dir)
         self.logger.info("Benchmark mode: %s", self.mode)
+        log_device(self.logger, phase="benchmark_start", once_key="benchmark_start")
         problem_dirs = self.list_problem_dirs()
         if self.max_problems is not None:
             problem_dirs = problem_dirs[: int(self.max_problems)]
@@ -689,6 +707,15 @@ class BaseBenchmarkRunner(ABC):
                         continue
 
                     try:
+                        model_device = self._resolve_model_device(model)
+                        self.logger.info(
+                            "[vbn] Model=%s Method=learning:%s cpd:%s inference:%s Phase=fit_start",
+                            model_name,
+                            model_config.learning.name,
+                            model_config.cpd.name,
+                            model_config.inference.name,
+                        )
+                        log_device(self.logger, phase="fit_start", device=model_device)
                         self.logger.info("[%s] Fit start", model_name)
                         _flush_logs()
                         _, fit_ms = timed_call(
@@ -873,6 +900,16 @@ class BaseBenchmarkRunner(ABC):
 
                     inf_desc = f"{self.generator}/{problem} | {model_name} | Inference"
                     self.logger.info(
+                        "[vbn] Model=%s Method=learning:%s cpd:%s inference:%s Phase=inference_start",
+                        model_name,
+                        model_config.learning.name,
+                        model_config.cpd.name,
+                        model_config.inference.name,
+                    )
+                    log_device(
+                        self.logger, phase="inference_start", device=model_device
+                    )
+                    self.logger.info(
                         "[%s] Inference start: n=%s", model_name, len(inf_queries)
                     )
                     _flush_logs()
@@ -894,6 +931,18 @@ class BaseBenchmarkRunner(ABC):
                             ),
                         )
                         _flush_logs()
+                    self.logger.info(
+                        "[vbn] Model=%s Method=learning:%s cpd:%s inference:%s Phase=query_answering_start",
+                        model_name,
+                        model_config.learning.name,
+                        model_config.cpd.name,
+                        model_config.inference.name,
+                    )
+                    log_device(
+                        self.logger,
+                        phase="query_answering_start",
+                        device=model_device,
+                    )
                     for chunk in _iter_inference_batches(
                         inf_queries,
                         batch_size_queries,
