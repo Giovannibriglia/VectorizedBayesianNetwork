@@ -245,7 +245,10 @@ def _pgmpy_config_from_preset(
     kwargs = cpds.get("kwargs", {})
     learning_spec = _component_from_method("learning", estimator, kwargs)
 
-    cpd_name = f"tabular_{estimator}"
+    if str(estimator).startswith("gaussian"):
+        cpd_name = str(estimator)
+    else:
+        cpd_name = f"tabular_{estimator}"
     cpd_spec = _component_from_method("cpd", cpd_name, kwargs)
 
     inference = preset.get("inference") or {}

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import argparse
 import hashlib
 import json
@@ -13,10 +17,9 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
-matplotlib.use("Agg")
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 
-from benchmarking import bnlearn_bnfit
 from benchmarking.metrics.divergences import (
     _compute_discrete_metrics,
     jensen_shannon_divergence_samples,
@@ -27,7 +30,6 @@ from benchmarking.utils import (
     ensure_dir,
     get_generator_datasets_dir,
     get_project_root,
-    parse_bif_structure,
     read_json,
 )
 from benchmarking.utils_errors import classify_error
@@ -1211,56 +1213,80 @@ def _load_ground_truth_folder(
 def _compute_graph_stats(run_dir: Path) -> dict[str, dict[str, int]]:
     generator = run_dir.parent.name
     project_root = get_project_root()
-    datasets_dir = get_generator_datasets_dir(project_root, generator)
     stats: dict[str, dict[str, int]] = {}
-    if not datasets_dir.exists():
-        return stats
-    for dataset_dir in sorted(datasets_dir.iterdir()):
-        if not dataset_dir.is_dir():
+
+    def _ensure_entry(problem_id: str) -> dict[str, int]:
+        entry = stats.get(problem_id)
+        if entry is None:
+            entry = {"mb_sizes": {}, "parent_sizes": {}}
+            stats[problem_id] = entry
+        return entry
+
+    # Priority 1: from run JSONL records
+    for subdir in ("cpds", "inference"):
+        base_dir = run_dir / subdir
+        if not base_dir.exists():
             continue
-        problem_id = dataset_dir.name
-        bif_path = dataset_dir / "model.bif"
-        if not bif_path.exists():
-            bif_gz = dataset_dir / "model.bif.gz"
-            if bif_gz.exists():
-                bif_path = bif_gz
-            else:
-                bif_path = None
-        try:
-            if bif_path is not None:
-                _, parents_map = parse_bif_structure(bif_path)
-            else:
-                bnfit_path = bnlearn_bnfit.find_bnfit_path(dataset_dir, None)
-                if bnfit_path is None:
+        for path in sorted(base_dir.glob("*.jsonl")):
+            for record in _read_jsonl(path, max_records=None):
+                problem_meta = (
+                    record.get("problem")
+                    if isinstance(record.get("problem"), dict)
+                    else {}
+                )
+                problem_id = (
+                    problem_meta.get("id")
+                    or problem_meta.get("problem_id")
+                    or record.get("problem_id")
+                    or record.get("problem")
+                )
+                if not problem_id:
                     continue
-                model = bnlearn_bnfit.load_bnfit(bnfit_path)
-                parents_map = {k: list(v) for k, v in model.parents.items()}
-        except Exception:
-            continue
-        children_map: dict[str, set[str]] = {node: set() for node in parents_map}
-        for child, parents in parents_map.items():
-            for parent in parents:
-                children_map.setdefault(parent, set()).add(child)
-        mb_sizes: dict[str, int] = {}
-        parent_sizes: dict[str, int] = {}
-        for node, parents in parents_map.items():
-            parent_set = set(parents)
-            child_set = children_map.get(node, set())
-            spouses = set()
-            for child in child_set:
-                spouses.update(set(parents_map.get(child, [])))
-            spouses.discard(node)
-            mb = parent_set | child_set | spouses
-            mb_sizes[node] = len(mb)
-            parent_sizes[node] = len(parent_set)
-        n_nodes = len(parents_map)
-        n_edges = sum(len(parents) for parents in parents_map.values())
-        stats[problem_id] = {
-            "mb_sizes": mb_sizes,
-            "parent_sizes": parent_sizes,
-            "n_nodes": n_nodes,
-            "n_edges": n_edges,
-        }
+                entry = _ensure_entry(str(problem_id))
+                n_nodes = _coerce_int(problem_meta.get("n_nodes"))
+                n_edges = _coerce_int(problem_meta.get("n_edges"))
+                if n_nodes is not None:
+                    entry["n_nodes"] = n_nodes
+                if n_edges is not None:
+                    entry["n_edges"] = n_edges
+
+    # Priority 2: metadata JSON (no R parsing)
+    meta_root = project_root / "benchmarking" / "data" / "metadata" / generator
+    if meta_root.exists():
+        for problem_dir in sorted(meta_root.iterdir()):
+            if not problem_dir.is_dir():
+                continue
+            problem_id = problem_dir.name
+            entry = _ensure_entry(problem_id)
+            if entry.get("n_nodes") is None:
+                domain_path = problem_dir / "domain.json"
+                if domain_path.exists():
+                    try:
+                        domain = read_json(domain_path)
+                    except Exception:
+                        domain = {}
+                    nodes = domain.get("nodes", {}) if isinstance(domain, dict) else {}
+                    if isinstance(nodes, dict) and nodes:
+                        entry["n_nodes"] = int(len(nodes))
+            if entry.get("n_edges") is None:
+                for name in ("dataset.json", "download.json"):
+                    meta_path = problem_dir / name
+                    if not meta_path.exists():
+                        continue
+                    try:
+                        meta = read_json(meta_path)
+                    except Exception:
+                        meta = {}
+                    if isinstance(meta, dict):
+                        n_edges = _coerce_int(meta.get("n_edges"))
+                        if n_edges is not None:
+                            entry["n_edges"] = n_edges
+                            break
+                        edges = meta.get("edges")
+                        if isinstance(edges, list):
+                            entry["n_edges"] = int(len(edges))
+                            break
+
     return stats
 
 
@@ -1272,13 +1298,15 @@ def _build_records(
     max_records: int | None,
     eps: float,
     model_filter: set[str] | None,
+    graph_stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     errors: list[str] = []
     gt_map: dict[tuple, dict] = {}
     if gt_source == "folder":
         gt_map = _load_ground_truth_folder(run_dir, gt_key, max_records)
 
-    graph_stats = _compute_graph_stats(run_dir)
+    if graph_stats is None:
+        graph_stats = _compute_graph_stats(run_dir)
     generator = run_dir.parent.name
     gt_computer = (
         GTComputer(run_dir=run_dir, generator=generator)
@@ -1562,8 +1590,10 @@ def _build_attempts(
     run_dir: Path,
     max_records: int | None,
     model_filter: set[str] | None,
+    graph_stats: dict[str, dict[str, int]] | None = None,
 ) -> pd.DataFrame:
-    graph_stats = _compute_graph_stats(run_dir)
+    if graph_stats is None:
+        graph_stats = _compute_graph_stats(run_dir)
     rows: list[dict] = []
     for subdir in ("cpds", "inference"):
         base_dir = run_dir / subdir
@@ -1870,29 +1900,36 @@ def _plot_error_vs_size(
 ) -> Path | None:
     if df.empty:
         return None
-    plt.figure(figsize=(8, 4.5))
-    method_ids = sorted(df["method_id"].dropna().unique())
-    for method_id in method_ids:
-        group = df[df["method_id"] == method_id]
-        group = group[group[size_col].notna()]
-        group = group[group[f"{metric}_iqm"].notna()]
-        if group.empty:
-            continue
-        group = group.sort_values(size_col)
-        x = group[size_col].astype(int).tolist()
-        y = group[f"{metric}_iqm"].tolist()
-        yerr = group[f"{metric}_iqr_std"].tolist()
-        plt.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
-    plt.title(title_prefix)
-    plt.xlabel(size_col)
-    plt.ylabel(_metric_label(metric))
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    out_path = out_dir / f"{filename_prefix}.png"
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
+    fig = None
+    try:
+        fig = plt.figure(figsize=(8, 4.5))
+        method_ids = sorted(df["method_id"].dropna().unique())
+        for method_id in method_ids:
+            group = df[df["method_id"] == method_id]
+            group = group[group[size_col].notna()]
+            group = group[group[f"{metric}_iqm"].notna()]
+            if group.empty:
+                continue
+            group = group.sort_values(size_col)
+            x = group[size_col].astype(int).tolist()
+            y = group[f"{metric}_iqm"].tolist()
+            yerr = group[f"{metric}_iqr_std"].tolist()
+            plt.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
+        plt.title(title_prefix)
+        plt.xlabel(size_col)
+        plt.ylabel(_metric_label(metric))
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        out_path = out_dir / f"{filename_prefix}.png"
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename_prefix, exc)
+        if fig is not None:
+            plt.close(fig)
+        return None
 
 
 def _plot_error_vs_evidence_size(
@@ -1905,37 +1942,44 @@ def _plot_error_vs_evidence_size(
 ) -> Path | None:
     if df.empty:
         return None
-    data = df
-    if mode is not None:
-        data = data[data["evidence_mode"] == mode]
-    data = data[data["evidence_size"].notna()]
-    data = data[data[f"{metric}_iqm"].notna()]
-    if data.empty:
+    fig = None
+    try:
+        data = df
+        if mode is not None:
+            data = data[data["evidence_mode"] == mode]
+        data = data[data["evidence_size"].notna()]
+        data = data[data[f"{metric}_iqm"].notna()]
+        if data.empty:
+            return None
+        fig = plt.figure(figsize=(8, 4.5))
+        method_ids = sorted(data["method_id"].dropna().unique())
+        for method_id in method_ids:
+            sub = data[data["method_id"] == method_id].sort_values("evidence_size")
+            if sub.empty:
+                continue
+            x = sub["evidence_size"].astype(int).tolist()
+            y = sub[f"{metric}_iqm"].tolist()
+            yerr = sub[f"{metric}_iqr_std"].tolist()
+            plt.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
+        title = f"Inference {_metric_label(metric)} vs Evidence Size"
+        if mode is not None:
+            title = f"{title} ({mode})"
+        plt.title(title)
+        plt.xlabel("evidence_size")
+        plt.ylabel(_metric_label(metric))
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        suffix = f"__mode_{mode}" if mode else ""
+        out_path = out_dir / f"{filename_prefix}{suffix}.png"
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename_prefix, exc)
+        if fig is not None:
+            plt.close(fig)
         return None
-    plt.figure(figsize=(8, 4.5))
-    method_ids = sorted(data["method_id"].dropna().unique())
-    for method_id in method_ids:
-        sub = data[data["method_id"] == method_id].sort_values("evidence_size")
-        if sub.empty:
-            continue
-        x = sub["evidence_size"].astype(int).tolist()
-        y = sub[f"{metric}_iqm"].tolist()
-        yerr = sub[f"{metric}_iqr_std"].tolist()
-        plt.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
-    title = f"Inference {_metric_label(metric)} vs Evidence Size"
-    if mode is not None:
-        title = f"{title} ({mode})"
-    plt.title(title)
-    plt.xlabel("evidence_size")
-    plt.ylabel(_metric_label(metric))
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    suffix = f"__mode_{mode}" if mode else ""
-    out_path = out_dir / f"{filename_prefix}{suffix}.png"
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
 
 
 def _plot_category_bars(
@@ -1950,45 +1994,52 @@ def _plot_category_bars(
 ) -> Path | None:
     if df.empty:
         return None
-    data = df[df[category_col].notna()]
-    data = data[data[f"{metric}_iqm"].notna()]
-    if data.empty:
+    fig = None
+    try:
+        data = df[df[category_col].notna()]
+        data = data[data[f"{metric}_iqm"].notna()]
+        if data.empty:
+            return None
+        ordered = [c for c in category_order if c in set(data[category_col])]
+        ordered += [
+            c for c in sorted(data[category_col].dropna().unique()) if c not in ordered
+        ]
+        method_ids = sorted(data["method_id"].dropna().unique())
+        if not method_ids:
+            return None
+        x = np.arange(len(ordered))
+        width = 0.8 / max(1, len(method_ids))
+        fig = plt.figure(figsize=(10, 4.5))
+        for idx, method_id in enumerate(method_ids):
+            sub = data[data["method_id"] == method_id]
+            sub = sub[sub[category_col].isin(ordered)].copy()
+            if sub.empty:
+                continue
+            sub[category_col] = pd.Categorical(
+                sub[category_col], categories=ordered, ordered=True
+            )
+            sub = sub.sort_values(category_col)
+            y_map = dict(zip(sub[category_col], sub[f"{metric}_iqm"]))
+            err_map = dict(zip(sub[category_col], sub[f"{metric}_iqr_std"]))
+            y = [y_map.get(cat, np.nan) for cat in ordered]
+            yerr = [err_map.get(cat, np.nan) for cat in ordered]
+            offset = (idx - (len(method_ids) - 1) / 2) * width
+            plt.bar(x + offset, y, width=width, yerr=yerr, capsize=3, label=method_id)
+        plt.xticks(x, ordered, rotation=30, ha="right")
+        plt.title(title_prefix)
+        plt.ylabel(_metric_label(metric))
+        plt.legend()
+        plt.grid(axis="y", alpha=0.3)
+        out_path = out_dir / f"{filename_prefix}.png"
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename_prefix, exc)
+        if fig is not None:
+            plt.close(fig)
         return None
-    ordered = [c for c in category_order if c in set(data[category_col])]
-    ordered += [
-        c for c in sorted(data[category_col].dropna().unique()) if c not in ordered
-    ]
-    method_ids = sorted(data["method_id"].dropna().unique())
-    if not method_ids:
-        return None
-    x = np.arange(len(ordered))
-    width = 0.8 / max(1, len(method_ids))
-    plt.figure(figsize=(10, 4.5))
-    for idx, method_id in enumerate(method_ids):
-        sub = data[data["method_id"] == method_id]
-        sub = sub[sub[category_col].isin(ordered)].copy()
-        if sub.empty:
-            continue
-        sub[category_col] = pd.Categorical(
-            sub[category_col], categories=ordered, ordered=True
-        )
-        sub = sub.sort_values(category_col)
-        y_map = dict(zip(sub[category_col], sub[f"{metric}_iqm"]))
-        err_map = dict(zip(sub[category_col], sub[f"{metric}_iqr_std"]))
-        y = [y_map.get(cat, np.nan) for cat in ordered]
-        yerr = [err_map.get(cat, np.nan) for cat in ordered]
-        offset = (idx - (len(method_ids) - 1) / 2) * width
-        plt.bar(x + offset, y, width=width, yerr=yerr, capsize=3, label=method_id)
-    plt.xticks(x, ordered, rotation=30, ha="right")
-    plt.title(title_prefix)
-    plt.ylabel(_metric_label(metric))
-    plt.legend()
-    plt.grid(axis="y", alpha=0.3)
-    out_path = out_dir / f"{filename_prefix}.png"
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
 
 
 def plot_success_rate_bar(
@@ -2002,48 +2053,57 @@ def plot_success_rate_bar(
 ) -> Path | None:
     if df.empty:
         return None
-    data = df[df[category_col].notna()]
-    data = data[data["success_rate"].notna()]
-    if data.empty:
+    fig = None
+    try:
+        data = df[df[category_col].notna()]
+        data = data[data["success_rate"].notna()]
+        if data.empty:
+            return None
+        ordered: list[str]
+        if category_order:
+            ordered = [c for c in category_order if c in set(data[category_col])]
+            ordered += [
+                c
+                for c in sorted(data[category_col].dropna().unique())
+                if c not in ordered
+            ]
+        else:
+            ordered = sorted(data[category_col].dropna().unique())
+        method_ids = sorted(data["method_id"].dropna().unique())
+        if not method_ids:
+            return None
+        x = np.arange(len(ordered))
+        width = 0.8 / max(1, len(method_ids))
+        fig = plt.figure(figsize=(10, 4.5))
+        for idx, method_id in enumerate(method_ids):
+            sub = data[data["method_id"] == method_id]
+            sub = sub[sub[category_col].isin(ordered)].copy()
+            if sub.empty:
+                continue
+            sub[category_col] = pd.Categorical(
+                sub[category_col], categories=ordered, ordered=True
+            )
+            sub = sub.sort_values(category_col)
+            y_map = dict(zip(sub[category_col], sub["success_rate"]))
+            y = [y_map.get(cat, np.nan) for cat in ordered]
+            offset = (idx - (len(method_ids) - 1) / 2) * width
+            plt.bar(x + offset, y, width=width, label=method_id)
+        plt.xticks(x, ordered, rotation=30, ha="right")
+        plt.title(title_prefix)
+        plt.ylabel("Success Rate")
+        plt.ylim(0.0, 1.0)
+        plt.legend()
+        plt.grid(axis="y", alpha=0.3)
+        out_path = out_dir / f"{filename_prefix}.png"
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename_prefix, exc)
+        if fig is not None:
+            plt.close(fig)
         return None
-    ordered: list[str]
-    if category_order:
-        ordered = [c for c in category_order if c in set(data[category_col])]
-        ordered += [
-            c for c in sorted(data[category_col].dropna().unique()) if c not in ordered
-        ]
-    else:
-        ordered = sorted(data[category_col].dropna().unique())
-    method_ids = sorted(data["method_id"].dropna().unique())
-    if not method_ids:
-        return None
-    x = np.arange(len(ordered))
-    width = 0.8 / max(1, len(method_ids))
-    plt.figure(figsize=(10, 4.5))
-    for idx, method_id in enumerate(method_ids):
-        sub = data[data["method_id"] == method_id]
-        sub = sub[sub[category_col].isin(ordered)].copy()
-        if sub.empty:
-            continue
-        sub[category_col] = pd.Categorical(
-            sub[category_col], categories=ordered, ordered=True
-        )
-        sub = sub.sort_values(category_col)
-        y_map = dict(zip(sub[category_col], sub["success_rate"]))
-        y = [y_map.get(cat, np.nan) for cat in ordered]
-        offset = (idx - (len(method_ids) - 1) / 2) * width
-        plt.bar(x + offset, y, width=width, label=method_id)
-    plt.xticks(x, ordered, rotation=30, ha="right")
-    plt.title(title_prefix)
-    plt.ylabel("Success Rate")
-    plt.ylim(0.0, 1.0)
-    plt.legend()
-    plt.grid(axis="y", alpha=0.3)
-    out_path = out_dir / f"{filename_prefix}.png"
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
 
 
 def plot_success_rate_line(
@@ -2056,32 +2116,39 @@ def plot_success_rate_line(
 ) -> Path | None:
     if df.empty:
         return None
-    data = df[df["success_rate"].notna()]
-    if data.empty:
+    fig = None
+    try:
+        data = df[df["success_rate"].notna()]
+        if data.empty:
+            return None
+        fig = plt.figure(figsize=(8, 4.5))
+        for model in sorted(data["model"].dropna().unique()):
+            sub = data[data["model"] == model].sort_values("x_mid")
+            if sub.empty:
+                continue
+            plt.errorbar(
+                sub["x_mid"].astype(float),
+                sub["success_rate"],
+                fmt="-o",
+                capsize=3,
+                label=model,
+            )
+        plt.title(title)
+        plt.xlabel(x_label)
+        plt.ylabel("Success Rate")
+        plt.ylim(0.0, 1.0)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        out_path = out_dir / filename
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename, exc)
+        if fig is not None:
+            plt.close(fig)
         return None
-    plt.figure(figsize=(8, 4.5))
-    for model in sorted(data["model"].dropna().unique()):
-        sub = data[data["model"] == model].sort_values("x_mid")
-        if sub.empty:
-            continue
-        plt.errorbar(
-            sub["x_mid"].astype(float),
-            sub["success_rate"],
-            fmt="-o",
-            capsize=3,
-            label=model,
-        )
-    plt.title(title)
-    plt.xlabel(x_label)
-    plt.ylabel("Success Rate")
-    plt.ylim(0.0, 1.0)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    out_path = out_dir / filename
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
 
 
 def plot_coverage_line(
@@ -2094,31 +2161,38 @@ def plot_coverage_line(
 ) -> Path | None:
     if df.empty:
         return None
-    data = df[df["n_attempts"].notna()]
-    if data.empty:
+    fig = None
+    try:
+        data = df[df["n_attempts"].notna()]
+        if data.empty:
+            return None
+        fig = plt.figure(figsize=(8, 4.5))
+        for model in sorted(data["model"].dropna().unique()):
+            sub = data[data["model"] == model].sort_values("x_mid")
+            if sub.empty:
+                continue
+            plt.errorbar(
+                sub["x_mid"].astype(float),
+                sub["n_attempts"].astype(float),
+                fmt="-o",
+                capsize=3,
+                label=model,
+            )
+        plt.title(title)
+        plt.xlabel(x_label)
+        plt.ylabel("n_queries")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        out_path = out_dir / filename
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename, exc)
+        if fig is not None:
+            plt.close(fig)
         return None
-    plt.figure(figsize=(8, 4.5))
-    for model in sorted(data["model"].dropna().unique()):
-        sub = data[data["model"] == model].sort_values("x_mid")
-        if sub.empty:
-            continue
-        plt.errorbar(
-            sub["x_mid"].astype(float),
-            sub["n_attempts"].astype(float),
-            fmt="-o",
-            capsize=3,
-            label=model,
-        )
-    plt.title(title)
-    plt.xlabel(x_label)
-    plt.ylabel("n_queries")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    out_path = out_dir / filename
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
 
 
 def _plot_error_type_distribution(
@@ -2131,34 +2205,43 @@ def _plot_error_type_distribution(
 ) -> Path | None:
     if df.empty:
         return None
-    data = df[df["error_type"].notna()]
-    if data.empty:
+    fig = None
+    try:
+        data = df[df["error_type"].notna()]
+        if data.empty:
+            return None
+        top_types = data["error_type"].value_counts().head(top_k).index.tolist()
+        data = data.copy()
+        data["error_type_plot"] = data["error_type"].where(
+            data["error_type"].isin(top_types), "Other"
+        )
+        pivot = (
+            data.groupby(["method_id", "error_type_plot"]).size().unstack(fill_value=0)
+        )
+        if pivot.empty:
+            return None
+        pivot = pivot.sort_index()
+        fig = plt.figure(figsize=(10, 4.5))
+        bottoms = np.zeros(len(pivot))
+        for col in pivot.columns:
+            values = pivot[col].values
+            plt.bar(pivot.index, values, bottom=bottoms, label=str(col))
+            bottoms = bottoms + values
+        plt.title(title)
+        plt.ylabel("Error Count")
+        plt.xticks(rotation=30, ha="right")
+        plt.legend()
+        plt.grid(axis="y", alpha=0.3)
+        out_path = out_dir / filename
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename, exc)
+        if fig is not None:
+            plt.close(fig)
         return None
-    top_types = data["error_type"].value_counts().head(top_k).index.tolist()
-    data = data.copy()
-    data["error_type_plot"] = data["error_type"].where(
-        data["error_type"].isin(top_types), "Other"
-    )
-    pivot = data.groupby(["method_id", "error_type_plot"]).size().unstack(fill_value=0)
-    if pivot.empty:
-        return None
-    pivot = pivot.sort_index()
-    plt.figure(figsize=(10, 4.5))
-    bottoms = np.zeros(len(pivot))
-    for col in pivot.columns:
-        values = pivot[col].values
-        plt.bar(pivot.index, values, bottom=bottoms, label=str(col))
-        bottoms = bottoms + values
-    plt.title(title)
-    plt.ylabel("Error Count")
-    plt.xticks(rotation=30, ha="right")
-    plt.legend()
-    plt.grid(axis="y", alpha=0.3)
-    out_path = out_dir / filename
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
 
 
 def _pareto_frontier(points: list[tuple[float, float]]) -> list[bool]:
@@ -2185,73 +2268,80 @@ def _plot_pareto(
 ) -> Path | None:
     if df.empty:
         return None
-    sub = df.copy()
-    sub = sub[sub[f"{metric}_iqm"].notna() & sub["time_iqm"].notna()]
-    if sub.empty:
-        return None
-    points = list(
-        zip(sub["time_iqm"].astype(float), sub[f"{metric}_iqm"].astype(float))
-    )
-    pareto_mask = _pareto_frontier(points)
-    plt.figure(figsize=(7.5, 5))
-    pareto_label_added = False
-    other_label_added = False
-    for (time_val, err_val), is_pareto, method_id, xerr, yerr in zip(
-        points,
-        pareto_mask,
-        sub["method_id"].tolist(),
-        sub["time_iqr_std"].tolist(),
-        sub[f"{metric}_iqr_std"].tolist(),
-    ):
-        if is_pareto:
-            plt.errorbar(
-                time_val,
-                err_val,
-                xerr=xerr,
-                yerr=yerr,
-                fmt="o",
-                color="C1",
-                capsize=3,
-                label="Pareto" if not pareto_label_added else None,
-            )
-            plt.annotate(
-                method_id,
-                (time_val, err_val),
-                textcoords="offset points",
-                xytext=(6, 6),
-            )
-            pareto_label_added = True
-        else:
-            plt.errorbar(
-                time_val,
-                err_val,
-                xerr=xerr,
-                yerr=yerr,
-                fmt="x",
-                color="0.6",
-                capsize=2,
-                label="Other" if not other_label_added else None,
-            )
-            other_label_added = True
-    pareto_points = [pt for pt, keep in zip(points, pareto_mask) if keep]
-    if pareto_points:
-        pareto_points = sorted(pareto_points, key=lambda t: t[0])
-        plt.plot(
-            [p[0] for p in pareto_points],
-            [p[1] for p in pareto_points],
-            color="C1",
-            alpha=0.5,
+    fig = None
+    try:
+        sub = df.copy()
+        sub = sub[sub[f"{metric}_iqm"].notna() & sub["time_iqm"].notna()]
+        if sub.empty:
+            return None
+        points = list(
+            zip(sub["time_iqm"].astype(float), sub[f"{metric}_iqm"].astype(float))
         )
-    plt.xlabel("IQM time (ms)")
-    plt.ylabel(f"IQM {_metric_label(metric)}")
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    out_path = out_dir / filename
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    return out_path
+        pareto_mask = _pareto_frontier(points)
+        fig = plt.figure(figsize=(7.5, 5))
+        pareto_label_added = False
+        other_label_added = False
+        for (time_val, err_val), is_pareto, method_id, xerr, yerr in zip(
+            points,
+            pareto_mask,
+            sub["method_id"].tolist(),
+            sub["time_iqr_std"].tolist(),
+            sub[f"{metric}_iqr_std"].tolist(),
+        ):
+            if is_pareto:
+                plt.errorbar(
+                    time_val,
+                    err_val,
+                    xerr=xerr,
+                    yerr=yerr,
+                    fmt="o",
+                    color="C1",
+                    capsize=3,
+                    label="Pareto" if not pareto_label_added else None,
+                )
+                plt.annotate(
+                    method_id,
+                    (time_val, err_val),
+                    textcoords="offset points",
+                    xytext=(6, 6),
+                )
+                pareto_label_added = True
+            else:
+                plt.errorbar(
+                    time_val,
+                    err_val,
+                    xerr=xerr,
+                    yerr=yerr,
+                    fmt="x",
+                    color="0.6",
+                    capsize=2,
+                    label="Other" if not other_label_added else None,
+                )
+                other_label_added = True
+        pareto_points = [pt for pt, keep in zip(points, pareto_mask) if keep]
+        if pareto_points:
+            pareto_points = sorted(pareto_points, key=lambda t: t[0])
+            plt.plot(
+                [p[0] for p in pareto_points],
+                [p[1] for p in pareto_points],
+                color="C1",
+                alpha=0.5,
+            )
+        plt.xlabel("IQM time (ms)")
+        plt.ylabel(f"IQM {_metric_label(metric)}")
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        out_path = out_dir / filename
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        logging.warning("Plot failed (%s): %s", filename, exc)
+        if fig is not None:
+            plt.close(fig)
+        return None
 
 
 def _write_report_md(
@@ -3475,6 +3565,7 @@ def main() -> None:
     if max_subsets is None and args.max_partitions is not None:
         max_subsets = args.max_partitions
 
+    graph_stats = _compute_graph_stats(run_dir)
     df, errors = _build_records(
         run_dir=run_dir,
         gt_source=args.gt_source,
@@ -3482,11 +3573,13 @@ def main() -> None:
         max_records=args.max_records,
         eps=float(args.eps),
         model_filter=model_filter,
+        graph_stats=graph_stats,
     )
     attempts_df = _build_attempts(
         run_dir=run_dir,
         max_records=args.max_records,
         model_filter=model_filter,
+        graph_stats=graph_stats,
     )
 
     if not df.empty and "query_type" in df.columns:

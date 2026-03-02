@@ -15,6 +15,11 @@ cpds:
       kwargs:
         equivalent_sample_size: 10
 
+  pgmpy_gaussian:
+    cpds:
+      estimator: gaussian_exact
+      kwargs: {}
+
 inference:
   default:
     cpds:
@@ -40,3 +45,24 @@ inference:
     inference:
       method: exact_variable_elimination
       kwargs: {}
+
+  pgmpy_gaussian_exact:
+    cpds:
+      estimator: gaussian_exact
+      kwargs: {}
+    inference:
+      method: gaussian_exact
+      kwargs:
+        n_samples_infer: 0
+        n_resample: 1024
+
+  pgmpy_gaussian_forward_sample:
+    cpds:
+      estimator: gaussian_exact
+      kwargs: {}
+    inference:
+      method: gaussian_forward_sample
+      kwargs:
+        n_samples_infer: 4096
+        n_resample: 1024
+        evidence_tau: null

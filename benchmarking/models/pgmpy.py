@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import logging
 import math
 import random
 import time
@@ -29,6 +31,13 @@ def _require_pgmpy():
         from pgmpy.estimators import BayesianEstimator, MaximumLikelihoodEstimator
         from pgmpy.inference import VariableElimination
         from pgmpy.models import BayesianNetwork
+
+        try:
+            from pgmpy.factors.continuous import LinearGaussianCPD
+            from pgmpy.models import LinearGaussianBayesianNetwork
+        except Exception:
+            LinearGaussianBayesianNetwork = None
+            LinearGaussianCPD = None
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "pgmpy is required for the pgmpy benchmark model. "
@@ -39,6 +48,8 @@ def _require_pgmpy():
         MaximumLikelihoodEstimator,
         BayesianEstimator,
         VariableElimination,
+        LinearGaussianBayesianNetwork,
+        LinearGaussianCPD,
     )
 
 
@@ -71,10 +82,34 @@ def _extract_evidence(query: dict) -> dict:
     return {k: v for k, v in values.items() if v is not None}
 
 
+def _get_n_mc(query: dict, default: int = 200) -> int:
+    kwargs = query.get("generator_kwargs")
+    if isinstance(kwargs, dict) and "n_mc" in kwargs:
+        try:
+            return int(kwargs["n_mc"])
+        except Exception:
+            pass
+    if "n_mc" in query:
+        try:
+            return int(query["n_mc"])
+        except Exception:
+            pass
+    return int(default)
+
+
 def _to_int(value: Any) -> int:
     if isinstance(value, (list, tuple)) and value:
         value = value[0]
     return int(value)
+
+
+def _to_float(value: Any) -> float:
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    try:
+        return float(value)
+    except Exception:
+        return float("nan")
 
 
 def _normalize_probs(probs: Iterable[float]) -> list[float]:
@@ -109,11 +144,64 @@ def _domain_nodes(domain: dict) -> dict:
     return nodes if isinstance(nodes, dict) else {}
 
 
+def _domain_node(domain: dict, node: str) -> dict:
+    if not isinstance(domain, dict):
+        return {}
+    nodes = domain.get("nodes", {})
+    if isinstance(nodes, dict):
+        return nodes.get(node, {})
+    return {}
+
+
+def _is_continuous(domain: dict, node: str) -> bool:
+    meta = _domain_node(domain, node)
+    node_type = meta.get("type")
+    if node_type == "continuous":
+        return True
+    if node_type == "discrete":
+        return False
+    states = meta.get("states") or []
+    return len(states) == 0
+
+
+def _result_ok(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    fmt = result.get("format")
+    if fmt == "categorical_probs":
+        return result.get("probs") is not None
+    if fmt == "normal_params":
+        mean = result.get("mean")
+        std = result.get("std")
+        if mean is not None and std is not None:
+            return math.isfinite(float(mean)) and math.isfinite(float(std))
+        samples = result.get("samples") or []
+        return bool(samples)
+    if fmt == "samples_1d":
+        samples = result.get("samples") or []
+        return bool(samples)
+    return False
+
+
+def _lg_fit_is_stubbed(lg_model) -> bool:
+    fit_fn = getattr(lg_model, "fit", None)
+    if fit_fn is None:
+        return True
+    try:
+        src = inspect.getsource(fit_fn)
+    except Exception:
+        src = ""
+    if "NotImplementedError" in src:
+        return True
+    return False
+
+
 @register_benchmark_model
 class PgmpyBenchmarkModel(BaseBenchmarkModel):
     name = "pgmpy"
     family = "pgmpy"
     version = _package_version()
+    _logger = logging.getLogger("benchmarking.pgmpy")
 
     def __init__(
         self,
@@ -134,12 +222,25 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
         random.seed(self.seed)
         np.random.seed(self.seed)
 
-        BayesianNetwork, _, _, _ = _require_pgmpy()
+        (
+            BayesianNetwork,
+            _,
+            _,
+            _,
+            LinearGaussianBayesianNetwork,
+            _,
+        ) = _require_pgmpy()
         edges = _sorted_edges(dag)
         self._model = BayesianNetwork(edges)
         self._model.add_nodes_from(_sorted_nodes(dag))
+        self._lg_model = None
         self._inference_engine = None
         self.state_map: dict[str, list[str]] = {}
+        self._continuous = False
+        self._lg_joint = None
+        self._lg_order: list[str] = []
+        self._lg_index: dict[str, int] = {}
+        self._rng = np.random.default_rng(self.seed)
 
     def supports(self) -> dict:
         return {
@@ -149,7 +250,15 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             "uses_inference": True,
         }
 
-    def _validate_domain(self) -> dict:
+    def _nx_graph(self):
+        g = self.dag
+        if not hasattr(g, "edges") or not hasattr(g, "predecessors"):
+            raise TypeError(
+                f"Expected dag to be a networkx DiGraph-like object, got {type(g)}"
+            )
+        return g
+
+    def _validate_domain(self) -> tuple[dict, str]:
         if not isinstance(self.domain, dict):
             raise ValueError("Domain metadata missing or invalid")
         if self.domain.get("unsupported"):
@@ -158,30 +267,39 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
         nodes = _domain_nodes(self.domain)
         if not nodes:
             raise ValueError("Domain metadata missing 'nodes'")
+        node_types = {}
         for node, meta in nodes.items():
             node_type = meta.get("type")
-            if node_type == "continuous":
-                raise ValueError(
-                    "Continuous variables are not supported by pgmpy baselines"
-                )
-            if node_type != "discrete":
+            if node_type not in {"discrete", "continuous"}:
                 raise ValueError(
                     f"Unsupported node type '{node_type}' for '{node}' in domain"
                 )
-            states = meta.get("states") or []
-            if not states:
-                raise ValueError(f"Missing states for discrete node '{node}'")
-        return nodes
+            node_types[node] = node_type
+        if all(t == "continuous" for t in node_types.values()):
+            return nodes, "continuous"
+        if all(t == "discrete" for t in node_types.values()):
+            for node, meta in nodes.items():
+                states = meta.get("states") or []
+                if not states:
+                    raise ValueError(f"Missing states for discrete node '{node}'")
+            return nodes, "discrete"
+        raise NotImplementedError(
+            "pgmpy gaussian backend supports only all-continuous networks"
+        )
 
     def fit(
         self, data_df: pd.DataFrame, *, progress: bool = True, **kwargs: Any
     ) -> None:
         del progress
-        nodes = self._validate_domain()
+        nodes, mode = self._validate_domain()
 
         missing_cols = [node for node in nodes if node not in data_df.columns]
         if missing_cols:
             raise ValueError(f"Data missing columns for nodes: {sorted(missing_cols)}")
+
+        if mode == "continuous":
+            self._fit_gaussian_pgmpy(data_df, nodes)
+            return
 
         df_states = data_df.copy()
         self.state_map = {}
@@ -198,6 +316,8 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             MaximumLikelihoodEstimator,
             BayesianEstimator,
             VariableElimination,
+            _,
+            _,
         ) = _require_pgmpy()
         del BayesianNetwork
 
@@ -231,6 +351,284 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
 
         self._inference_engine = VariableElimination(self._model)
 
+    def _fit_gaussian_pgmpy(self, data_df: pd.DataFrame, nodes: dict) -> None:
+        (
+            _,
+            _,
+            _,
+            _,
+            LinearGaussianBayesianNetwork,
+            LinearGaussianCPD,
+        ) = _require_pgmpy()
+        if LinearGaussianBayesianNetwork is None or LinearGaussianCPD is None:
+            raise NotImplementedError(
+                "pgmpy gaussian backend requires LinearGaussianBayesianNetwork"
+            )
+        self._continuous = True
+        nodes_list = list(nodes.keys())
+        graph = self._nx_graph()
+        edges = list(graph.edges())
+        lg = LinearGaussianBayesianNetwork(edges)
+        lg.add_nodes_from(nodes_list)
+
+        if _lg_fit_is_stubbed(lg):
+            self._logger.info(
+                "pgmpy.fit unavailable; using manual OLS to build LinearGaussianCPD objects"
+            )
+            cpds = []
+            for node in nodes_list:
+                parents = (
+                    list(graph.predecessors(node))
+                    if hasattr(graph, "predecessors")
+                    else []
+                )
+                y = data_df[node].to_numpy(dtype=float)
+                if parents:
+                    X = data_df[parents].to_numpy(dtype=float)
+                    X_aug = np.concatenate([np.ones((len(y), 1)), X], axis=1)
+                    beta, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
+                    intercept = float(beta[0])
+                    coeffs = [float(b) for b in beta[1:]]
+                    mean = X_aug @ beta
+                else:
+                    intercept = float(np.mean(y))
+                    coeffs = []
+                    mean = np.full_like(y, intercept, dtype=float)
+                resid = y - mean
+                variance = float(np.var(resid, ddof=0))
+                if not math.isfinite(variance) or variance <= 0:
+                    variance = 1e-6
+                beta_vec = [intercept] + coeffs
+                cpd_kwargs = {}
+                sig = inspect.signature(LinearGaussianCPD.__init__)
+                if "beta" in sig.parameters:
+                    cpd_kwargs["beta"] = beta_vec
+                if "evidence_mean" in sig.parameters:
+                    cpd_kwargs["evidence_mean"] = beta_vec
+                if "std" in sig.parameters:
+                    cpd_kwargs["std"] = math.sqrt(variance)
+                if "evidence_variance" in sig.parameters:
+                    cpd_kwargs["evidence_variance"] = variance
+                if "evidence_mean" not in sig.parameters and "beta" in cpd_kwargs:
+                    cpd_kwargs["evidence_mean"] = beta_vec
+                if "evidence_variance" not in sig.parameters and "std" in cpd_kwargs:
+                    cpd_kwargs["evidence_variance"] = float(variance)
+                cpd = LinearGaussianCPD(
+                    variable=node,
+                    evidence=parents,
+                    **cpd_kwargs,
+                )
+                cpds.append(cpd)
+            lg.add_cpds(*cpds)
+        else:
+            lg.fit(data_df[nodes_list])
+        self._lg_model = lg
+        if hasattr(lg, "check_model") and not lg.check_model():
+            raise ValueError("pgmpy LinearGaussianBayesianNetwork validation failed")
+        try:
+            joint = lg.to_joint_gaussian()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to derive joint Gaussian from LinearGaussianBayesianNetwork"
+            ) from exc
+        self._lg_joint = joint
+        self._lg_order = list(joint.variables)
+        self._lg_index = {v: i for i, v in enumerate(self._lg_order)}
+        if set(self._lg_order) != set(nodes_list):
+            raise ValueError(
+                "Joint Gaussian variables do not match dataset nodes: "
+                f"{sorted(set(self._lg_order) ^ set(nodes_list))}"
+            )
+        mu = np.asarray(joint.mean, dtype=float).reshape(-1)
+        cov = np.asarray(joint.covariance, dtype=float)
+        n_vars = len(self._lg_order)
+        if mu.shape[0] != n_vars or cov.shape != (n_vars, n_vars):
+            raise ValueError("Joint Gaussian mean/cov dimensions do not match nodes")
+
+    def _gaussian_exact_condition(
+        self,
+        *,
+        target: str,
+        evidence: dict,
+        n_samples: int = 0,
+        max_return_samples: int = 2048,
+        seed: int | None = None,
+    ) -> dict:
+        if self._lg_joint is None or self._lg_model is None:
+            raise RuntimeError("Gaussian model is not fitted")
+        if target not in self._lg_index:
+            raise ValueError(f"Unknown target variable '{target}'")
+
+        mu = np.asarray(self._lg_joint.mean, dtype=float).reshape(-1)
+        cov = np.asarray(self._lg_joint.covariance, dtype=float)
+        if mu.shape[0] != cov.shape[0]:
+            raise RuntimeError("Joint Gaussian mean/cov dimension mismatch")
+        idx_target = self._lg_index[target]
+
+        if not evidence:
+            mean = float(mu[idx_target])
+            var = float(cov[idx_target, idx_target])
+            std = math.sqrt(var) if var >= 0 else float("nan")
+            sample_list: list[float] | None = None
+            if n_samples > 0:
+                rng = np.random.default_rng(seed)
+                draws = rng.normal(mean, std, size=min(n_samples, max_return_samples))
+                sample_list = [float(x) for x in draws]
+            return {
+                "format": "normal_params",
+                "mean": mean,
+                "std": std,
+                "n_samples": len(sample_list) if sample_list is not None else None,
+                "samples": sample_list,
+            }
+
+        evidence_vars = [var for var in evidence if var in self._lg_index]
+        if len(evidence_vars) != len(evidence):
+            missing = sorted(set(evidence) - set(evidence_vars))
+            raise ValueError(f"Evidence variables not in model: {missing}")
+        for var in evidence_vars:
+            if not math.isfinite(float(evidence[var])):
+                raise ValueError(
+                    f"Non-finite evidence value for '{var}': {evidence[var]}"
+                )
+        idx_e = [self._lg_index[var] for var in evidence_vars]
+        mu_x = mu[idx_target]
+        mu_e = mu[idx_e]
+        cov_xx = cov[idx_target, idx_target]
+        cov_xe = cov[np.ix_([idx_target], idx_e)]
+        cov_ee = cov[np.ix_(idx_e, idx_e)]
+        cov_ee = cov_ee + 1e-8 * np.eye(len(idx_e))
+        diff = np.asarray([evidence[v] for v in evidence_vars]) - mu_e
+        try:
+            cov_ee_inv = np.linalg.inv(cov_ee)
+        except np.linalg.LinAlgError:
+            cov_ee_inv = np.linalg.pinv(cov_ee)
+        mean = float(mu_x + (cov_xe @ cov_ee_inv @ diff).reshape(-1)[0])
+        var = float(cov_xx - (cov_xe @ cov_ee_inv @ cov_xe.T).reshape(-1)[0])
+        if var < 0 and var > -1e-12:
+            var = 0.0
+        std = math.sqrt(var) if var >= 0 else float("nan")
+
+        sample_list: list[float] | None = None
+        if n_samples > 0 and math.isfinite(std):
+            rng = np.random.default_rng(seed)
+            draws = rng.normal(mean, std, size=min(n_samples, max_return_samples))
+            sample_list = [float(x) for x in draws]
+        return {
+            "format": "normal_params",
+            "mean": mean,
+            "std": std,
+            "n_samples": len(sample_list) if sample_list is not None else None,
+            "samples": sample_list,
+        }
+
+    def _gaussian_forward_sample(
+        self,
+        *,
+        target: str,
+        evidence: dict,
+        n_samples: int,
+        n_resample: int,
+        evidence_tau: float | None,
+        seed: int | None = None,
+        max_return_samples: int = 2048,
+    ) -> dict:
+        if self._lg_joint is None or self._lg_model is None:
+            raise RuntimeError("Gaussian model is not fitted")
+        if target not in self._lg_index:
+            raise ValueError(f"Unknown target variable '{target}'")
+        if n_samples <= 0:
+            raise ValueError("n_samples must be positive for gaussian_forward_sample")
+        rng = np.random.default_rng(seed)
+        graph = self._nx_graph()
+        topo = list(graph.nodes())
+        try:
+            import networkx as nx
+
+            topo = list(nx.topological_sort(graph))
+        except Exception:
+            pass
+
+        samples: dict[str, np.ndarray] = {}
+        for node in topo:
+            cpd = self._lg_model.get_cpds(node)
+            if cpd is None:
+                raise ValueError(f"Missing CPD for '{node}'")
+            parents = list(getattr(cpd, "evidence", []) or [])
+            beta = np.asarray(getattr(cpd, "mean", []), dtype=float).reshape(-1)
+            if beta.size == 0:
+                raise ValueError(f"Missing CPD coefficients for '{node}'")
+            intercept = float(beta[0])
+            coeffs = beta[1:]
+            if len(coeffs) != len(parents):
+                raise ValueError(
+                    f"CPD parent count mismatch for '{node}': "
+                    f"{len(coeffs)} coeffs vs {len(parents)} parents"
+                )
+            mean = np.full(int(n_samples), intercept, dtype=float)
+            for parent, coeff in zip(parents, coeffs):
+                mean += float(coeff) * samples[parent]
+            variance = float(getattr(cpd, "variance", float("nan")))
+            std = math.sqrt(variance) if variance >= 0 else float("nan")
+            draws = rng.normal(mean, std, size=int(n_samples))
+            samples[node] = draws.astype(float)
+
+        logw = np.zeros(int(n_samples), dtype=float)
+        if evidence:
+            for var, value in evidence.items():
+                if var not in samples:
+                    raise ValueError(f"Evidence variables not in model: {var}")
+                if not math.isfinite(float(value)):
+                    raise ValueError(f"Non-finite evidence value for '{var}': {value}")
+                if evidence_tau is None:
+                    idx = self._lg_index[var]
+                    cov = np.asarray(self._lg_joint.covariance, dtype=float)
+                    std_var = (
+                        math.sqrt(float(cov[idx, idx]))
+                        if cov[idx, idx] >= 0
+                        else float("nan")
+                    )
+                    tau = (
+                        1e-3 * std_var
+                        if math.isfinite(std_var) and std_var > 0
+                        else 1e-2
+                    )
+                else:
+                    tau = float(evidence_tau)
+                tau = max(tau, 1e-8)
+                diff = samples[var] - float(value)
+                logw += -0.5 * ((diff / tau) ** 2 + math.log(2.0 * math.pi * tau * tau))
+
+        if not np.isfinite(logw).any():
+            weights = np.ones(int(n_samples), dtype=float) / float(n_samples)
+        else:
+            logw = logw - float(np.nanmax(logw))
+            weights = np.exp(logw)
+            total = float(weights.sum())
+            if total <= 0 or not math.isfinite(total):
+                weights = np.ones(int(n_samples), dtype=float) / float(n_samples)
+            else:
+                weights /= total
+
+        target_vals = samples[target]
+        mean = float(np.sum(weights * target_vals))
+        var = float(np.sum(weights * (target_vals - mean) ** 2))
+        std = math.sqrt(var) if var >= 0 else float("nan")
+
+        resample_n = min(int(n_resample), int(n_samples)) if n_resample > 0 else 0
+        sample_list: list[float] | None = None
+        if resample_n > 0:
+            idx = rng.choice(len(target_vals), size=resample_n, replace=True, p=weights)
+            sample_vals = target_vals[idx]
+            sample_list = [float(x) for x in sample_vals[:max_return_samples]]
+        return {
+            "format": "normal_params",
+            "mean": mean,
+            "std": std,
+            "n_samples": len(sample_list) if sample_list is not None else None,
+            "samples": sample_list,
+        }
+
     def _format_evidence(self, evidence: dict) -> dict:
         mapped = {}
         for var, value in evidence.items():
@@ -243,7 +641,48 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             mapped[var] = states[idx]
         return mapped
 
-    def _infer_distribution(self, target: str, evidence: dict) -> dict:
+    def _infer_distribution(
+        self,
+        target: str,
+        evidence: dict,
+        *,
+        n_samples: int | None = None,
+        n_resample: int | None = None,
+    ) -> dict:
+        if self._continuous:
+            if self._lg_joint is None or self._lg_model is None:
+                raise RuntimeError("Gaussian model is not fitted")
+            inference_kwargs = {}
+            inference_name = "gaussian_exact"
+            if self.benchmark_config is not None:
+                inference_kwargs = dict(self.benchmark_config.inference.kwargs)
+                inference_name = str(
+                    self.benchmark_config.inference.name or inference_name
+                )
+            if n_samples is None:
+                n_samples = int(inference_kwargs.get("n_samples_infer", 0))
+            if n_resample is None:
+                n_resample = int(inference_kwargs.get("n_resample", 1024))
+            seed = inference_kwargs.get("seed")
+            evidence_vals = {k: _to_float(v) for k, v in evidence.items()}
+            if inference_name == "gaussian_forward_sample":
+                n_samples = int(n_samples) if int(n_samples) > 0 else 4096
+                evidence_tau = inference_kwargs.get("evidence_tau")
+                return self._gaussian_forward_sample(
+                    target=target,
+                    evidence=evidence_vals,
+                    n_samples=int(n_samples),
+                    n_resample=int(n_resample),
+                    evidence_tau=evidence_tau,
+                    seed=seed,
+                )
+            return self._gaussian_exact_condition(
+                target=target,
+                evidence=evidence_vals,
+                n_samples=int(n_samples),
+                seed=seed,
+            )
+
         if self._inference_engine is None:
             raise RuntimeError("Model is not fitted")
         if target not in self.state_map:
@@ -293,9 +732,16 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             if not target:
                 raise ValueError("Missing target in query")
             evidence = _extract_evidence(query)
-            result = self._infer_distribution(target, evidence)
-            ok = result.get("probs") is not None
-            error = None
+            if self._continuous or _is_continuous(self.domain, target):
+                result = self._gaussian_exact_condition(
+                    target=target,
+                    evidence={k: _to_float(v) for k, v in evidence.items()},
+                    n_samples=0,
+                )
+            else:
+                result = self._infer_distribution(target, evidence)
+            ok = _result_ok(result)
+            error = None if ok else "Unsupported or empty CPD result"
         except Exception as exc:
             ok = False
             error = f"{type(exc).__name__}: {exc}"
@@ -310,9 +756,22 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             if not target:
                 raise ValueError("Missing target in query")
             evidence = _extract_evidence(query)
-            result = self._infer_distribution(target, evidence)
-            ok = result.get("probs") is not None
-            error = None
+            if self._continuous or _is_continuous(self.domain, target):
+                n_samples = _get_n_mc(
+                    query,
+                    default=(
+                        self.benchmark_config.inference.kwargs.get(
+                            "n_samples_infer", 4096
+                        )
+                        if self.benchmark_config is not None
+                        else 4096
+                    ),
+                )
+                result = self._infer_distribution(target, evidence, n_samples=n_samples)
+            else:
+                result = self._infer_distribution(target, evidence)
+            ok = _result_ok(result)
+            error = None if ok else "Unsupported or empty inference result"
         except Exception as exc:
             ok = False
             error = f"{type(exc).__name__}: {exc}"

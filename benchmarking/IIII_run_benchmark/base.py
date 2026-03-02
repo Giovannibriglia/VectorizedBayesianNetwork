@@ -465,6 +465,8 @@ class BaseBenchmarkRunner(ABC):
             return None
         if isinstance(result, dict) and result.get("format"):
             output = dict(result)
+            if output.get("format") in {"normal_params", "samples_1d"}:
+                return output
             if (
                 output.get("format") == "categorical_probs"
                 and output.get("support") is None
