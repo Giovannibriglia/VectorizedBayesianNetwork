@@ -1,9 +1,11 @@
+import argparse
 import os
 from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 import torch
+from _common import auto_device, print_env_header, require_optional, seed_all
 from tqdm import tqdm
 from vbn import CPD_REGISTRY, defaults, VBN
 
@@ -32,32 +34,21 @@ def make_df(n=1000, seed=0):
     return pd.DataFrame({"x1": x1.numpy(), "x2": x2.numpy(), "y": y.numpy()})
 
 
-def _skip_plots() -> bool:
-    flag = os.getenv("VBN_SKIP_PLOTS", "0").strip().lower()
-    return flag in {"1", "true", "yes"}
-
-
-def _maybe_import_matplotlib():
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        if not os.getenv("CI"):
-            print(
-                "matplotlib is not installed; skipping plots. "
-                "Install it with 'pip install matplotlib'."
-            )
-        return None
-    return plt
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Categorical CPD benchmark.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument("--plot", action="store_true", help="Enable plotting output.")
+    return parser.parse_args()
 
 
 def _cpd_config(cpd_key: str) -> dict:
+    fit_conf = {"epochs": 6, "batch_size": 256, "lr": 1e-3, "weight_decay": 0.0}
     try:
         if cpd_key != "softmax_nn":
-            return defaults.cpd(cpd_key)
-        else:
-            return {**defaults.cpd("softmax_nn"), "n_classes": K}
+            return {**defaults.cpd(cpd_key), "fit": dict(fit_conf)}
+        return {**defaults.cpd("softmax_nn"), "n_classes": K, "fit": dict(fit_conf)}
     except Exception:
-        return {"cpd": CPD_REGISTRY[cpd_key]}
+        return {"cpd": CPD_REGISTRY[cpd_key], "fit": dict(fit_conf)}
 
 
 def _samples_to_labels(samples: torch.Tensor) -> torch.Tensor:
@@ -70,24 +61,23 @@ def _samples_to_labels(samples: torch.Tensor) -> torch.Tensor:
 
 
 def main():
-    if os.getenv("CI") and "VBN_SKIP_PLOTS" not in os.environ:
-        os.environ["VBN_SKIP_PLOTS"] = "1"
-    os.environ.setdefault("MPLBACKEND", "Agg")
-
-    skip_plots = _skip_plots()
-    plt = None
-    if not skip_plots:
-        plt = _maybe_import_matplotlib()
-        if plt is None:
-            skip_plots = True
+    args = _parse_args()
+    seed_all(args.seed)
+    device = auto_device()
+    print_env_header("01_categorical_cpds_benchmark", device)
 
     out_path = None
-    if not skip_plots:
+    plt = None
+    if args.plot:
+        os.environ.setdefault("MPLBACKEND", "Agg")
+        require_optional("matplotlib.pyplot", "plotting")
+        import matplotlib.pyplot as plt
+
         out_dir = Path(__file__).resolve().parent / "out"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "01_categorical_cpds_benchmark.png"
 
-    df = make_df(n=4096, seed=0)
+    df = make_df(n=2048, seed=args.seed)
     g = nx.DiGraph()
     g.add_edges_from([("x1", "y"), ("x2", "y")])
 
@@ -99,7 +89,7 @@ def main():
     for cpd_key in pbar:
         pbar.set_postfix(cpd_key=cpd_key)
 
-        vbn = VBN(g, seed=0, device="cpu")
+        vbn = VBN(g, seed=args.seed, device=device)
 
         nodes_cpds = {node: _cpd_config(cpd_key) for node in ("x1", "x2", "y")}
         vbn.set_learning_method(
@@ -128,10 +118,11 @@ def main():
             print(f"{cpd_key}: skipped ({exc})")
             continue
 
-    if skip_plots:
-        return
     if not results:
         print("No CPDs succeeded; nothing to plot.")
+        return
+    if plt is None:
+        print(f"Completed {len(results)} CPD fits (plotting disabled).")
         return
 
     fig, axes = plt.subplots(nrows=K, ncols=1, figsize=(7, 2.2 * K), sharex=True)

@@ -1,9 +1,11 @@
+import argparse
 import os
 from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 import torch
+from _common import auto_device, print_env_header, require_optional, seed_all
 from tqdm import tqdm
 from vbn import CPD_REGISTRY, defaults, VBN
 
@@ -17,42 +19,30 @@ def make_df(n=1000, seed=0):
     return pd.DataFrame({"x1": x1.numpy(), "x2": x2.numpy(), "y": y.numpy()})
 
 
-def _skip_plots() -> bool:
-    flag = os.getenv("VBN_SKIP_PLOTS", "0").strip().lower()
-    return flag in {"1", "true", "yes"}
-
-
-def _maybe_import_matplotlib():
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        if not os.getenv("CI"):
-            print(
-                "matplotlib is not installed; skipping plots. "
-                "Install it with 'pip install matplotlib'."
-            )
-        return None
-    return plt
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Continuous CPD benchmark.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument("--plot", action="store_true", help="Enable plotting output.")
+    return parser.parse_args()
 
 
 def main():
-    if os.getenv("CI") and "VBN_SKIP_PLOTS" not in os.environ:
-        os.environ["VBN_SKIP_PLOTS"] = "1"
-    os.environ.setdefault("MPLBACKEND", "Agg")
+    args = _parse_args()
+    seed_all(args.seed)
+    device = auto_device()
+    print_env_header("01_continous_cpds_benchmark", device)
 
-    skip_plots = _skip_plots()
     plt = None
-    if not skip_plots:
-        plt = _maybe_import_matplotlib()
-        if plt is None:
-            skip_plots = True
-
     out_dir = None
-    if not skip_plots:
+    if args.plot:
+        os.environ.setdefault("MPLBACKEND", "Agg")
+        require_optional("matplotlib.pyplot", "plotting")
+        import matplotlib.pyplot as plt
+
         out_dir = Path(__file__).resolve().parent / "out"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = make_df(n=4096, seed=0)
+    df = make_df(n=2048, seed=args.seed)
 
     g = nx.DiGraph()
     g.add_edges_from([("x1", "y"), ("x2", "y")])
@@ -67,43 +57,55 @@ def main():
     # Store results for all CPDs
     results = {}
 
+    fit_conf = {"epochs": 6, "batch_size": 256, "lr": 1e-3, "weight_decay": 0.0}
     pbar = tqdm(cpd_keys, desc="training...")
     for cpd_key in pbar:
         pbar.set_postfix(cpd_key=cpd_key)
 
-        vbn = VBN(g, seed=0, device="cpu")
-        nodes_cpds = {node: defaults.cpd(cpd_key) for node in ("x1", "x2", "y")}
-        vbn.set_learning_method(
-            method=defaults.learning("node_wise"), nodes_cpds=nodes_cpds
-        )
-        vbn.fit(df, verbosity=0)
+        try:
+            vbn = VBN(g, seed=args.seed, device=device)
+            nodes_cpds = {
+                node: {**defaults.cpd(cpd_key), "fit": dict(fit_conf)}
+                for node in ("x1", "x2", "y")
+            }
+            vbn.set_learning_method(
+                method=defaults.learning("node_wise"), nodes_cpds=nodes_cpds
+            )
+            vbn.fit(df, verbosity=0)
 
-        handle = vbn.cpd("y")
+            handle = vbn.cpd("y")
 
-        parents_grid = torch.zeros(x1_grid.shape[0], len(handle.parents))
-        for idx, parent in enumerate(handle.parents):
-            if parent == "x1":
-                parents_grid[:, idx] = x1_grid
-            else:
-                parents_grid[:, idx] = 0.0
+            parents_grid = torch.zeros(x1_grid.shape[0], len(handle.parents))
+            for idx, parent in enumerate(handle.parents):
+                if parent == "x1":
+                    parents_grid[:, idx] = x1_grid
+                else:
+                    parents_grid[:, idx] = 0.0
 
-        with torch.no_grad():
-            samples = handle.sample(parents_grid, n_samples=200)
+            with torch.no_grad():
+                samples = handle.sample(parents_grid, n_samples=200)
 
-        if samples.dim() == 2:
-            samples = samples.unsqueeze(0)
+            if samples.dim() == 2:
+                samples = samples.unsqueeze(0)
 
-        mean = samples.mean(dim=1).squeeze(-1)
-        std = samples.std(dim=1).squeeze(-1)
+            mean = samples.mean(dim=1).squeeze(-1)
+            std = samples.std(dim=1).squeeze(-1)
 
-        results[cpd_key] = {
-            "mean": mean.detach().cpu().numpy(),
-            "std": std.detach().cpu().numpy(),
-        }
+            results[cpd_key] = {
+                "mean": mean.detach().cpu().numpy(),
+                "std": std.detach().cpu().numpy(),
+            }
+        except Exception as exc:
+            print(f"{cpd_key}: skipped ({exc})")
+            continue
 
         # print(f"{cpd_key}: fit ok, sample shape {tuple(samples.shape)}")
 
-    if skip_plots:
+    if not results:
+        print("No CPDs succeeded; nothing to plot.")
+        return
+    if plt is None:
+        print(f"Completed {len(results)} CPD fits (plotting disabled).")
         return
 
     # === SINGLE FIGURE ===

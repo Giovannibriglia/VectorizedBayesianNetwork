@@ -1,11 +1,12 @@
+import argparse
 import os
 from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 import torch
+from _common import auto_device, print_env_header, require_optional, seed_all
 from vbn import defaults, VBN
-from vbn.display import plot_inference_posterior, plot_sampling_outcome
 
 
 def make_df(n=200, seed=0):
@@ -18,28 +19,35 @@ def make_df(n=200, seed=0):
     )
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Save/load example.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument("--plot", action="store_true", help="Enable plotting output.")
+    return parser.parse_args()
+
+
 def main():
-    if os.getenv("CI") and "VBN_SKIP_PLOTS" not in os.environ:
-        os.environ["VBN_SKIP_PLOTS"] = "1"
-    os.environ.setdefault("MPLBACKEND", "Agg")
-    # Directory of the current script
-    SCRIPT_DIR = Path(__file__).resolve().parent
+    args = _parse_args()
+    seed_all(args.seed)
+    device = auto_device()
+    print_env_header("05_save_load", device)
 
-    # Create "out" inside the script directory
-    OUT_DIR = SCRIPT_DIR / "out"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    df = make_df()
+    df = make_df(seed=args.seed)
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
-    vbn = VBN(g, seed=0, device="cpu")
+    fit_conf = {"epochs": 8, "batch_size": 256, "lr": 1e-3, "weight_decay": 0.0}
+    vbn = VBN(g, seed=args.seed, device=device)
     vbn.set_learning_method(
         method=defaults.learning("node_wise"),
         nodes_cpds={
-            "feature_0": defaults.cpd("gaussian_nn"),
-            "feature_1": defaults.cpd("gaussian_nn"),
-            "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
+            "feature_0": {**defaults.cpd("gaussian_nn"), "fit": dict(fit_conf)},
+            "feature_1": {**defaults.cpd("gaussian_nn"), "fit": dict(fit_conf)},
+            "feature_2": {
+                **defaults.cpd("mdn"),
+                "n_components": 3,
+                "fit": dict(fit_conf),
+            },
         },
     )
     vbn.fit(df)
@@ -49,35 +57,43 @@ def main():
     )
     vbn.set_sampling_method(defaults.sampling("gibbs"), n_samples=50)
 
-    model_path = os.path.join(OUT_DIR, "saved_model.pt")
+    out_dir = Path(__file__).resolve().parent / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = os.path.join(out_dir, "saved_model.pt")
     vbn.save(model_path)
     print(f"Saved model to {model_path}")
 
-    loaded = VBN.load(model_path, map_location="cpu")
+    loaded = VBN.load(model_path, map_location=device)
     query = {
         "target": "feature_2",
         "evidence": {
-            "feature_0": torch.tensor([[0.2]]),
-            "feature_1": torch.tensor([[-0.1]]),
+            "feature_0": torch.tensor([[0.2]], device=device),
+            "feature_1": torch.tensor([[-0.1]], device=device),
         },
     }
     pdf, samples = loaded.infer_posterior(query)
     assert not pdf.requires_grad and not samples.requires_grad
     print("loaded pdf shape:", pdf.shape)
     print("loaded samples shape:", samples.shape)
-    plot_inference_posterior(
-        pdf,
-        samples,
-        save_path=os.path.join(OUT_DIR, "05_loaded_inference_posterior.png"),
-    )
 
     samp = loaded.sample(query, n_samples=50)
     assert not samp.requires_grad
     print("loaded sampling shape:", samp.shape)
-    plot_sampling_outcome(
-        samp,
-        save_path=os.path.join(OUT_DIR, "05_loaded_sampling_outcome.png"),
-    )
+    if args.plot:
+        os.environ.setdefault("MPLBACKEND", "Agg")
+        require_optional("matplotlib.pyplot", "plotting")
+        from vbn.display import plot_inference_posterior, plot_sampling_outcome
+
+        plot_inference_posterior(
+            pdf,
+            samples,
+            save_path=os.path.join(out_dir, "05_loaded_inference_posterior.png"),
+        )
+
+        plot_sampling_outcome(
+            samp,
+            save_path=os.path.join(out_dir, "05_loaded_sampling_outcome.png"),
+        )
     print("Loaded model run complete.")
 
 

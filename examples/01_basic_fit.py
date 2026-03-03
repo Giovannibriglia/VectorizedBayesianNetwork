@@ -1,11 +1,12 @@
+import argparse
 import os
 from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 import torch
+from _common import auto_device, print_env_header, require_optional, seed_all
 from vbn import defaults, VBN
-from vbn.display import plot_cpd_fit
 
 
 def make_df(n=200, seed=0):
@@ -18,48 +19,62 @@ def make_df(n=200, seed=0):
     )
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Basic VBN fit example.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument("--plot", action="store_true", help="Enable plotting output.")
+    return parser.parse_args()
+
+
 def main():
-    if os.getenv("CI") and "VBN_SKIP_PLOTS" not in os.environ:
-        os.environ["VBN_SKIP_PLOTS"] = "1"
-    os.environ.setdefault("MPLBACKEND", "Agg")
-    # Directory of the current script
-    SCRIPT_DIR = Path(__file__).resolve().parent
+    args = _parse_args()
+    seed_all(args.seed)
+    device = auto_device()
+    print_env_header("01_basic_fit", device)
 
-    # Create "out" inside the script directory
-    OUT_DIR = SCRIPT_DIR / "out"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    df = make_df()
+    df = make_df(seed=args.seed)
     g = nx.DiGraph()
     g.add_edges_from([("feature_0", "feature_2"), ("feature_1", "feature_2")])
 
-    vbn = VBN(g, seed=0, device="cpu")
+    fit_conf = {"epochs": 8, "batch_size": 256, "lr": 1e-3, "weight_decay": 0.0}
+    vbn = VBN(g, seed=args.seed, device=device)
     vbn.set_learning_method(
         method=defaults.learning("node_wise"),
         nodes_cpds={
-            "feature_0": defaults.cpd("gaussian_nn"),
-            "feature_1": defaults.cpd("gaussian_nn"),
-            "feature_2": {**defaults.cpd("mdn"), "n_components": 3},
+            "feature_0": {**defaults.cpd("gaussian_nn"), "fit": dict(fit_conf)},
+            "feature_1": {**defaults.cpd("gaussian_nn"), "fit": dict(fit_conf)},
+            "feature_2": {
+                **defaults.cpd("mdn"),
+                "n_components": 3,
+                "fit": dict(fit_conf),
+            },
         },
     )
     vbn.fit(df)
 
-    parents_grid = torch.tensor([[0.0, 0.0], [0.5, -0.5], [1.0, -1.0]])
-    handle = vbn.cpd("feature_2")
-    plot_cpd_fit(
-        handle,
-        parents_grid=parents_grid,
-        n_samples=256,
-        save_path=os.path.join(OUT_DIR, "01_basic_fit_cpd_features2.png"),
-    )
+    if args.plot:
+        os.environ.setdefault("MPLBACKEND", "Agg")
+        require_optional("matplotlib.pyplot", "plotting")
+        from vbn.display import plot_cpd_fit
 
-    vbn_cat = VBN(g, seed=0, device="cpu")
+        out_dir = Path(__file__).resolve().parent / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        parents_grid = torch.tensor([[0.0, 0.0], [0.5, -0.5], [1.0, -1.0]])
+        handle = vbn.cpd("feature_2")
+        plot_cpd_fit(
+            handle,
+            parents_grid=parents_grid,
+            n_samples=256,
+            save_path=str(out_dir / "01_basic_fit_cpd_features2.png"),
+        )
+
+    vbn_cat = VBN(g, seed=args.seed, device=device)
     vbn_cat.set_learning_method(
         method=defaults.learning("node_wise"),
         nodes_cpds={
-            "feature_0": defaults.cpd("softmax_nn"),
-            "feature_1": defaults.cpd("softmax_nn"),
-            "feature_2": defaults.cpd("softmax_nn"),
+            "feature_0": {**defaults.cpd("softmax_nn"), "fit": dict(fit_conf)},
+            "feature_1": {**defaults.cpd("softmax_nn"), "fit": dict(fit_conf)},
+            "feature_2": {**defaults.cpd("softmax_nn"), "fit": dict(fit_conf)},
         },
     )
     vbn_cat.fit(df)
