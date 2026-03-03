@@ -186,11 +186,16 @@ vbn/
   update/
   configs/
 examples/
-  __init__.py
+  _common.py
   01_basic_fit.py
+  01_categorical_cpds_benchmark.py
+  01_continous_cpds_benchmark.py
   02_infer_posterior.py
   03_sampling.py
+  04_update_mechanisms_demo.py
   04_update_online.py
+  05_save_load.py
+  06_prediction_vs_diagnosis.py
 tests/
 ```
 
@@ -230,11 +235,34 @@ Focus Single Test:
 pytest tests/test_learning.py -vv
 ```
 
-## Running Examples (Module Execution)
-Run examples from the repo root using `python -m`:
+## Running Examples
+Run examples from the repo root:
 
 ```bash
-python -m examples.03_sampling
+python examples/03_sampling.py --seed 0
+```
+
+## Examples
+Each example accepts `--seed` and prints an environment header. Plots are disabled by default; pass `--plot` to enable them.
+
+- `examples/01_basic_fit.py`: Basic fit of continuous CPDs and categorical sampling.
+- `examples/01_categorical_cpds_benchmark.py`: Compare categorical CPDs on a discrete target.
+- `examples/01_continous_cpds_benchmark.py`: Compare continuous CPDs on a Gaussian target.
+- `examples/02_infer_posterior.py`: Posterior inference with Monte Carlo marginalization.
+- `examples/03_sampling.py`: Sampling with a Gibbs sampler.
+- `examples/04_update_mechanisms_demo.py`: Update-policy comparison under concept drift.
+- `examples/04_update_online.py`: Online update and re-inference demo.
+- `examples/05_save_load.py`: Save/load a model and run inference/sampling.
+- `examples/06_prediction_vs_diagnosis.py`: Discrete BN showing prediction vs diagnosis with exact vs learned probabilities.
+
+Prediction vs Diagnosis:
+Prediction infers effects from causes (e.g., `P(Fever=1 | Exposure=1)`), while diagnosis infers causes from effects (e.g., `P(Disease=1 | Fever=1, Cough=1)`).
+
+Run:
+
+```bash
+python examples/06_prediction_vs_diagnosis.py
+pytest -q
 ```
 
 ## Benchmarking
@@ -242,8 +270,8 @@ python -m examples.03_sampling
 See `benchmarking/README.md` for the full benchmarking workflow.
 The reporting script now produces plots vs `n_nodes` and `n_edges` plus a flat results table with network sizes.
 
-## Why We Use `python -m`
-Module execution avoids `PYTHONPATH`/`sys.path` hacks, ensures consistent imports from the repo root, and works cleanly with editable installs and CI. Registries remain in place to keep the system extensible without modifying core scripts.
+## Why We Use Direct Script Execution
+Running examples directly keeps them self-contained (including `examples/_common.py`) and works cleanly with editable installs and CI.
 
 ## Contribution Guidelines
 ```bash
