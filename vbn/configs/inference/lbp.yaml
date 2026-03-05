@@ -1,0 +1,5 @@
+name: lbp
+n_samples: 512
+n_iters: 10
+damping: 0.5
+fallback: importance_sampling
