@@ -35,6 +35,15 @@ cpds:
         method: linear_gaussian
         kwargs: {}
 
+  vbn_kde:
+    learning:
+      method: node_wise
+      kwargs: { }
+    cpds:
+      default:
+        method: kde
+        kwargs: { }
+
 inference:
   default:
     learning:
