@@ -20,7 +20,7 @@ def _import_plt():
     except Exception:  # pragma: no cover - import guard
         if not os.getenv("CI"):
             print(
-                "matplotlib is not installed; skipping plots. Install it with 'pip install matplotlib'.",
+                "matplotlib is not installed; skipping plots2. Install it with 'pip install matplotlib'.",
                 file=sys.stderr,
             )
         return None

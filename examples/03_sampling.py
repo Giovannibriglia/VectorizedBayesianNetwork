@@ -61,6 +61,7 @@ def main():
         },
     }
     samples = vbn.sample(query, n_samples=64)
+    assert samples.shape == (2, 64, 1)
     assert not samples.requires_grad
     if args.plot:
         os.environ.setdefault("MPLBACKEND", "Agg")
