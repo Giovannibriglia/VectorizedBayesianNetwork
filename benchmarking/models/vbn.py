@@ -31,6 +31,23 @@ def _extract_evidence(query: dict) -> dict:
         evidence = query.get("evidence")
         if isinstance(evidence, dict):
             values = evidence.get("values")
+            if values is None and "vars" not in evidence:
+                values = evidence
+    if values is None:
+        return {}
+    if not isinstance(values, dict):
+        return {}
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def _extract_do(query: dict) -> dict:
+    values = query.get("do_values")
+    if values is None:
+        do = query.get("do")
+        if isinstance(do, dict):
+            values = do.get("values")
+            if values is None and "vars" not in do:
+                values = do
     if values is None:
         return {}
     if not isinstance(values, dict):
@@ -391,8 +408,41 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             data_df, verbosity=verbosity, show_progress=show_progress, **kwargs
         )
 
-    def _cpd_distribution(self, target: str, evidence: dict) -> dict:
+    def _cpd_distribution(
+        self, target: str, evidence: dict, do: dict | None = None
+    ) -> dict:
+        do = do or {}
         meta = _domain_node(self.domain, target)
+        if target in do:
+            do_value = _to_float(do[target])
+            if _is_continuous(self.domain, target):
+                return {
+                    "format": "normal_params",
+                    "mean": float(do_value),
+                    "std": 0.0,
+                    "n_samples": None,
+                    "samples": None,
+                }
+            states = meta.get("states") or []
+            k = len(states)
+            if k == 0:
+                return {
+                    "format": "categorical_probs",
+                    "probs": None,
+                    "k": 0,
+                    "support": [],
+                }
+            idx = int(round(float(do_value)))
+            if idx < 0 or idx >= k:
+                raise ValueError("do value out of bounds for discrete target")
+            probs = [0.0] * k
+            probs[idx] = 1.0
+            return {
+                "format": "categorical_probs",
+                "probs": probs,
+                "k": k,
+                "support": list(range(k)),
+            }
         if _is_continuous(self.domain, target):
             parents = list(self._vbn.dag.parents(target))
             if parents and not all(p in evidence for p in parents):
@@ -442,12 +492,15 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             "support": list(range(k)),
         }
 
-    def _infer_distribution(self, target: str, evidence: dict, n_samples: int) -> dict:
+    def _infer_distribution(
+        self, target: str, evidence: dict, do: dict, n_samples: int
+    ) -> dict:
         meta = _domain_node(self.domain, target)
         if _is_continuous(self.domain, target):
             evidence_values = {k: [_to_float(v)] for k, v in evidence.items()}
+            do_values = {k: [_to_float(v)] for k, v in do.items()}
             pdf, samples = self._vbn.infer_posterior(
-                {"target": target, "evidence": evidence_values},
+                {"target": target, "evidence": evidence_values, "do": do_values},
                 n_samples=int(n_samples),
             )
             return self._continuous_from_samples(samples, weights=pdf)
@@ -462,8 +515,10 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
                 "support": [],
             }
         evidence_values = {k: [_to_float(v)] for k, v in evidence.items()}
+        do_values = {k: [_to_float(v)] for k, v in do.items()}
         pdf, samples = self._vbn.infer_posterior(
-            {"target": target, "evidence": evidence_values}, n_samples=int(n_samples)
+            {"target": target, "evidence": evidence_values, "do": do_values},
+            n_samples=int(n_samples),
         )
         probs = _estimate_discrete_posterior(samples, pdf, k)
         return {
@@ -480,12 +535,19 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             if not target:
                 raise ValueError("Missing target in query")
             evidence = _extract_evidence(query)
+            do = _extract_do(query)
+            overlap = set(evidence) & set(do)
+            if overlap:
+                raise ValueError("Nodes cannot be in both evidence and do")
+            assignment = {**evidence, **do}
             parents = list(self._vbn.dag.parents(target))
-            if parents and all(p in evidence for p in parents):
-                result = self._cpd_distribution(target, evidence)
+            if target in do:
+                result = self._cpd_distribution(target, assignment, do=do)
+            elif all(p in assignment for p in parents):
+                result = self._cpd_distribution(target, assignment, do=do)
             else:
                 n_samples = _get_n_mc(query, default=200)
-                result = self._infer_distribution(target, evidence, n_samples)
+                result = self._infer_distribution(target, evidence, do, n_samples)
             ok = _result_ok(result)
             error = None if ok else "Unsupported or empty CPD result"
         except Exception as exc:
@@ -502,8 +564,12 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
             if not target:
                 raise ValueError("Missing target in query")
             evidence = _extract_evidence(query)
+            do = _extract_do(query)
+            overlap = set(evidence) & set(do)
+            if overlap:
+                raise ValueError("Nodes cannot be in both evidence and do")
             n_samples = _get_n_mc(query, default=200)
-            result = self._infer_distribution(target, evidence, n_samples)
+            result = self._infer_distribution(target, evidence, do, n_samples)
             ok = _result_ok(result)
             error = None if ok else "Unsupported or empty inference result"
         except Exception as exc:
@@ -519,6 +585,8 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
         target = queries[0].get("target")
         if not target:
             raise ValueError("Missing target in query")
+        if any(_extract_do(q) for q in queries):
+            return [self.answer_inference_query(q) for q in queries]
         if _is_continuous(self.domain, target):
             return [self.answer_inference_query(q) for q in queries]
         evidence_vars = None

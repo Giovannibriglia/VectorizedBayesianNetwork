@@ -8,6 +8,7 @@ from vbn.core.utils import ensure_2d
 from vbn.inference.importance_sampling import ImportanceSampling
 from vbn.inference.monte_carlo_marginalization import MonteCarloMarginalization
 from vbn.utils import infer_batch_size
+from vbn.utils.interventions import is_intervened
 
 
 @register_inference("lbp")
@@ -41,7 +42,7 @@ class LoopyBeliefPropagation:
         damping = float(kwargs.get("damping", self.damping))
         eps = 1e-12
 
-        b = infer_batch_size(query.evidence)
+        b = infer_batch_size(query.evidence, query.do)
         if self.fallback == "monte_carlo_marginalization":
             pdf, target_samples = self._mcm.infer_posterior(
                 vbn, query, n_samples=n_samples
@@ -52,7 +53,14 @@ class LoopyBeliefPropagation:
                 vbn, query, n_samples=n_samples
             )
 
-        if query.target in query.evidence:
+        if is_intervened(query.target, query):
+            target_samples = (
+                ensure_2d(query.do[query.target])
+                .to(vbn.device)
+                .unsqueeze(1)
+                .expand(b, n_samples, -1)
+            )
+        elif query.target in query.evidence:
             target_samples = (
                 ensure_2d(query.evidence[query.target])
                 .to(vbn.device)

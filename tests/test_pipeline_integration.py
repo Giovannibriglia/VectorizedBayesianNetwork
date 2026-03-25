@@ -32,6 +32,15 @@ def test_full_pipeline():
     assert pdf1.shape == (4, 5)
     assert samples1.shape == (4, 5, 1)
 
+    query_do = {
+        "target": "z",
+        "evidence": {"y": torch.randn(4, 1)},
+        "do": {"x": torch.randn(4, 1)},
+    }
+    pdf_do, samples_do = vbn.infer_posterior(query_do)
+    assert pdf_do.shape == (4, 5)
+    assert samples_do.shape == (4, 5, 1)
+
     vbn.set_sampling_method("ancestral", n_samples=5)
     samples2 = vbn.sample(query, n_samples=5)
     assert samples2.shape == (4, 5, 1)

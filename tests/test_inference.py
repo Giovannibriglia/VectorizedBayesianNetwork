@@ -1,6 +1,7 @@
 import os
 
 import networkx as nx
+import pytest
 import torch
 from tqdm.auto import tqdm
 from vbn import VBN
@@ -35,3 +36,24 @@ def test_inference_methods_suite():
         pdf, samples = vbn.infer_posterior(query)
         assert pdf.shape == (4, 5)
         assert samples.shape == (4, 5, 1)
+
+
+def test_inference_do_only_shapes():
+    vbn = _make_vbn()
+    vbn.set_inference_method("likelihood_weighting", n_samples=6)
+    query = {"target": "y", "do": {"x": torch.tensor([[0.5], [-0.5]])}}
+    pdf, samples = vbn.infer_posterior(query)
+    assert pdf.shape == (2, 6)
+    assert samples.shape == (2, 6, 1)
+
+
+def test_inference_rejects_do_evidence_overlap():
+    vbn = _make_vbn()
+    vbn.set_inference_method("monte_carlo_marginalization", n_samples=5)
+    query = {
+        "target": "y",
+        "evidence": {"x": torch.randn(2, 1)},
+        "do": {"x": torch.randn(2, 1)},
+    }
+    with pytest.raises(ValueError):
+        vbn.infer_posterior(query)

@@ -63,6 +63,13 @@ def main():
     samples = vbn.sample(query, n_samples=64)
     assert samples.shape == (2, 64, 1)
     assert not samples.requires_grad
+    query_do = {
+        "target": "feature_2",
+        "evidence": {"feature_1": torch.tensor([[0.1], [0.2]], device=device)},
+        "do": {"feature_0": torch.tensor([[0.9], [0.3]], device=device)},
+    }
+    samples_do = vbn.sample(query_do, n_samples=64)
+    assert samples_do.shape == (2, 64, 1)
     if args.plot:
         os.environ.setdefault("MPLBACKEND", "Agg")
         require_optional("matplotlib.pyplot", "plotting")
@@ -76,6 +83,7 @@ def main():
             save_path=os.path.join(out_dir, "03_sampling_outcome.png"),
         )
     print("Sampling complete.")
+    print("Sampling with do-intervention complete.")
 
 
 if __name__ == "__main__":

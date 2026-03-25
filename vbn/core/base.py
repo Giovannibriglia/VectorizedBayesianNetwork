@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Protocol
 
 import torch
@@ -17,8 +17,12 @@ class CPDOutput:
 
 @dataclass
 class Query:
+    """Inference/sampling query: evidence conditions; do clamps without likelihood."""
+
     target: str
     evidence: Dict[str, torch.Tensor]
+    # do-interventions clamp values without contributing likelihood.
+    do: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class BaseCPD(nn.Module, ABC):

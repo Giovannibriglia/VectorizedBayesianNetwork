@@ -7,6 +7,7 @@ from vbn.core.registry import register_sampling
 from vbn.core.utils import ensure_2d
 from vbn.sampling.ancestral import _ancestral_sample_joint
 from vbn.utils import infer_batch_size
+from vbn.utils.interventions import get_fixed_value
 
 
 @register_sampling("gibbs")
@@ -20,14 +21,15 @@ class GibbsSampler:
 
     def sample(self, vbn, query: Query, n_samples: int | None = None, **kwargs):
         n_samples = int(n_samples or self.n_samples)
-        b = infer_batch_size(query.evidence)
+        b = infer_batch_size(query.evidence, query.do)
         current = _ancestral_sample_joint(vbn, query, n_samples=1)
         collected = []
         total_steps = self.burn_in + n_samples
         for step in range(total_steps):
             for node in vbn.dag.topological_order():
-                if node in query.evidence:
-                    value = ensure_2d(query.evidence[node]).to(vbn.device)
+                fixed = get_fixed_value(node, query)
+                if fixed is not None:
+                    value = ensure_2d(fixed).to(vbn.device)
                     current[node] = value.unsqueeze(1)
                     continue
                 parents = vbn.dag.parents(node)

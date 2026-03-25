@@ -8,6 +8,7 @@ from vbn.core.base import Query
 from vbn.core.registry import register_inference
 from vbn.core.utils import ensure_2d
 from vbn.utils import infer_batch_size
+from vbn.utils.interventions import get_fixed_value
 
 
 def _concat_parent_samples(
@@ -36,24 +37,26 @@ class LikelihoodWeighting:
         normalize = bool(kwargs.get("normalize", self.normalize))
         eps = float(kwargs.get("eps", self.eps))
 
-        b = infer_batch_size(query.evidence)
+        b = infer_batch_size(query.evidence, query.do)
         samples: Dict[str, torch.Tensor] = {}
         log_weights = torch.zeros(b, n_samples, device=vbn.device)
 
         for node in vbn.dag.topological_order():
             parents = vbn.dag.parents(node)
             parent_tensor = _concat_parent_samples(samples, parents)
-            if node in query.evidence:
-                evidence_value = ensure_2d(query.evidence[node]).to(vbn.device)
-                evidence_value = evidence_value.unsqueeze(1).expand(b, n_samples, -1)
-                samples[node] = evidence_value
-
-                cpd = vbn.nodes[node]
-                if not hasattr(cpd, "log_prob") or not callable(cpd.log_prob):
-                    raise NotImplementedError(
-                        f"CPD for node '{node}' does not implement log_prob."
-                    )
-                log_weights = log_weights + cpd.log_prob(evidence_value, parent_tensor)
+            fixed = get_fixed_value(node, query)
+            if fixed is not None:
+                fixed_value = ensure_2d(fixed).to(vbn.device)
+                fixed_value = fixed_value.unsqueeze(1).expand(b, n_samples, -1)
+                samples[node] = fixed_value
+                if node in query.evidence:
+                    # Evidence contributes likelihood; do-interventions do not.
+                    cpd = vbn.nodes[node]
+                    if not hasattr(cpd, "log_prob") or not callable(cpd.log_prob):
+                        raise NotImplementedError(
+                            f"CPD for node '{node}' does not implement log_prob."
+                        )
+                    log_weights = log_weights + cpd.log_prob(fixed_value, parent_tensor)
             else:
                 samples[node] = vbn.nodes[node].sample(parent_tensor, n_samples)
 

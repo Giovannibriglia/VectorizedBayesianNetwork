@@ -8,13 +8,18 @@ from vbn.core.base import Query
 from vbn.core.registry import register_inference
 from vbn.core.utils import ensure_2d
 from vbn.utils import infer_batch_size
+from vbn.utils.interventions import is_intervened
 
 
 def _ancestral_sample_prior(
-    vbn, batch_size: int, n_samples: int
+    vbn, query: Query, batch_size: int, n_samples: int
 ) -> Dict[str, torch.Tensor]:
     samples: Dict[str, torch.Tensor] = {}
     for node in vbn.dag.topological_order():
+        if is_intervened(node, query):
+            fixed_value = ensure_2d(query.do[node]).to(vbn.device)
+            samples[node] = fixed_value.unsqueeze(1).expand(batch_size, n_samples, -1)
+            continue
         parents = vbn.dag.parents(node)
         if parents:
             parent_tensor = torch.cat([samples[p] for p in parents], dim=-1)
@@ -39,8 +44,8 @@ class ImportanceSampling:
 
     def infer_posterior(self, vbn, query: Query, **kwargs):
         n_samples = int(kwargs.get("n_samples", self.n_samples))
-        b = infer_batch_size(query.evidence)
-        samples = _ancestral_sample_prior(vbn, b, n_samples)
+        b = infer_batch_size(query.evidence, query.do)
+        samples = _ancestral_sample_prior(vbn, query, b, n_samples)
         log_weights = torch.zeros(b, n_samples, device=vbn.device)
         for node, value in query.evidence.items():
             evidence_value = ensure_2d(value).to(vbn.device)
@@ -50,7 +55,14 @@ class ImportanceSampling:
             log_w = vbn.nodes[node].log_prob(evidence_value, parent_tensor)
             log_weights = log_weights + log_w
         weights = torch.softmax(log_weights, dim=-1)
-        if query.target in query.evidence:
+        if is_intervened(query.target, query):
+            target_samples = (
+                ensure_2d(query.do[query.target])
+                .to(vbn.device)
+                .unsqueeze(1)
+                .expand(b, n_samples, -1)
+            )
+        elif query.target in query.evidence:
             target_samples = (
                 ensure_2d(query.evidence[query.target])
                 .to(vbn.device)

@@ -31,7 +31,7 @@ from vbn.core.utils import (
     to_plain_dict,
 )
 from vbn.defaults import defaults
-from vbn.utils import df_to_tensor_dict, dict_to_device
+from vbn.utils import df_to_tensor_dict, dict_to_device, infer_batch_size
 
 
 @dataclass
@@ -495,17 +495,40 @@ class VBN:
                 k: ensure_2d(ensure_tensor(v, device=self.device))
                 for k, v in query.evidence.items()
             }
-            return Query(target=query.target, evidence=evidence)
-        if not isinstance(query, dict):
-            raise TypeError("query must be a dict or Query")
-        target = query.get("target") or query.get("target_feature")
-        if target is None:
-            raise ValueError("query must contain 'target'")
-        evidence = {
-            k: ensure_2d(ensure_tensor(v, device=self.device))
-            for k, v in query.get("evidence", {}).items()
-        }
-        return Query(target=target, evidence=evidence)
+            do = {
+                k: ensure_2d(ensure_tensor(v, device=self.device))
+                for k, v in (query.do or {}).items()
+            }
+            target = query.target
+        else:
+            if not isinstance(query, dict):
+                raise TypeError("query must be a dict or Query")
+            target = query.get("target") or query.get("target_feature")
+            if target is None:
+                raise ValueError("query must contain 'target'")
+            evidence_src = query.get("evidence") or {}
+            do_src = query.get("do") or {}
+            evidence = {
+                k: ensure_2d(ensure_tensor(v, device=self.device))
+                for k, v in evidence_src.items()
+            }
+            do = {
+                k: ensure_2d(ensure_tensor(v, device=self.device))
+                for k, v in do_src.items()
+            }
+        nodes = set(self.dag.nodes())
+        if target not in nodes:
+            raise ValueError(f"Unknown target node '{target}'.")
+        unknown = (set(evidence) | set(do)) - nodes
+        if unknown:
+            raise ValueError(f"Unknown query nodes: {sorted(unknown)}")
+        overlap = set(evidence) & set(do)
+        if overlap:
+            raise ValueError(
+                f"Nodes cannot be in both evidence and do: {sorted(overlap)}"
+            )
+        infer_batch_size(evidence, do)
+        return Query(target=target, evidence=evidence, do=do)
 
     # ----------------- device management -----------------
     def to_device(self, device: str | torch.device) -> None:

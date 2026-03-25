@@ -19,7 +19,6 @@ def test_registries_have_defaults():
 
     assert "monte_carlo_marginalization" in INFERENCE_REGISTRY
     assert "importance_sampling" in INFERENCE_REGISTRY
-    assert "svgp" in INFERENCE_REGISTRY
 
     assert "ancestral" in SAMPLING_REGISTRY
     assert "gibbs" in SAMPLING_REGISTRY

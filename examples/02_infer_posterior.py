@@ -64,6 +64,13 @@ def main():
     }
     pdf, samples = vbn.infer_posterior(query)
     assert not pdf.requires_grad and not samples.requires_grad
+    query_do = {
+        "target": "feature_2",
+        "evidence": {"feature_1": torch.tensor([[-0.2]], device=device)},
+        "do": {"feature_0": torch.tensor([[0.6]], device=device)},
+    }
+    pdf_do, samples_do = vbn.infer_posterior(query_do)
+    assert pdf_do.shape == samples_do.shape[:2]
     if args.plot:
         os.environ.setdefault("MPLBACKEND", "Agg")
         require_optional("matplotlib.pyplot", "plotting")
@@ -77,6 +84,7 @@ def main():
             save_path=os.path.join(out_dir, "02_inference_posterior.png"),
         )
     print("Posterior computed.")
+    print("Posterior with do-intervention computed.")
 
 
 if __name__ == "__main__":

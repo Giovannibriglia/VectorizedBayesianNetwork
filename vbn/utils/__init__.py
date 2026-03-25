@@ -43,8 +43,19 @@ def concat_parents(
     return torch.cat([data[p] for p in parent_list], dim=-1)
 
 
-def infer_batch_size(evidence: Dict[str, torch.Tensor]) -> int:
-    if not evidence:
-        return 1
-    first = next(iter(evidence.values()))
-    return int(first.shape[0])
+def infer_batch_size(
+    evidence: Dict[str, torch.Tensor],
+    do: Optional[Dict[str, torch.Tensor]] = None,
+) -> int:
+    evidence = evidence or {}
+    do = do or {}
+    if evidence:
+        batch = int(next(iter(evidence.values())).shape[0])
+        if do:
+            do_batch = int(next(iter(do.values())).shape[0])
+            if batch != do_batch:
+                raise ValueError("Evidence and do batch sizes must match.")
+        return batch
+    if do:
+        return int(next(iter(do.values())).shape[0])
+    return 1
