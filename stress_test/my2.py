@@ -33,6 +33,7 @@ class DataConfig:
     n_actions: int
     mode: str = "linear"  # "linear" or "nonlinear"
     seed: int = 42
+    include_next_state: bool = False
 
 
 @dataclass
@@ -48,10 +49,11 @@ class ExperimentConfig:
     n_inference_queries: int = 16
     inference_seed: int = 123
     vbn_inference_method: str = "monte_carlo_marginalization"
-    vbn_inference_n_samples: int = 512
+    vbn_inference_n_samples: int = 1024
     vbn_inference_batch_size: int = 16
     vbn_device: str = "auto"
     out_dir: str = "stress_test/out"
+    include_next_state: bool = True
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time")
     inference_metrics: Sequence[str] = (
         "kl",
@@ -418,24 +420,29 @@ def define_df(cfg: DataConfig) -> pd.DataFrame:
         states, actions, reward_noise, mode=cfg.mode, card=cfg.card
     ).astype(np.int32)
 
-    for i in range(cfg.n_states):
-        s = data[f"state_{i}"]
-        a = data[f"action_{i % cfg.n_actions}"]
-        noise = rng.integers(1, max(2, cfg.card), size=cfg.n_samples_df)
+    if cfg.include_next_state:
+        for i in range(cfg.n_states):
+            s = data[f"state_{i}"]
+            a = data[f"action_{i % cfg.n_actions}"]
+            noise = rng.integers(1, max(2, cfg.card), size=cfg.n_samples_df)
 
-        if cfg.mode == "linear":
-            next_s = s + 2 * a + noise
-        elif cfg.mode == "nonlinear":
-            next_s = s + a + np.sin(s + a) * (cfg.card / 3) + (s * a) % cfg.card + noise
-        else:
-            raise ValueError(f"Unsupported mode: {cfg.mode}")
+            if cfg.mode == "linear":
+                next_s = s + 2 * a + noise
+            elif cfg.mode == "nonlinear":
+                next_s = (
+                    s + a + np.sin(s + a) * (cfg.card / 3) + (s * a) % cfg.card + noise
+                )
+            else:
+                raise ValueError(f"Unsupported mode: {cfg.mode}")
 
-        data[f"next_state_{i}"] = np.asarray(next_s, dtype=np.int32) % cfg.card
+            data[f"next_state_{i}"] = np.asarray(next_s, dtype=np.int32) % cfg.card
 
     return pd.DataFrame(data)
 
 
-def get_rl_dag(n_states: int, n_actions: int) -> nx.DiGraph:
+def get_rl_dag(
+    n_states: int, n_actions: int, *, include_next_state: bool = True
+) -> nx.DiGraph:
     dag = nx.DiGraph()
 
     for s in range(n_states):
@@ -443,11 +450,13 @@ def get_rl_dag(n_states: int, n_actions: int) -> nx.DiGraph:
             dag.add_edge(f"state_{s}", f"action_{a}")
 
     for s in range(n_states):
-        dag.add_edge(f"state_{s}", f"next_state_{s}")
+        if include_next_state:
+            dag.add_edge(f"state_{s}", f"next_state_{s}")
         dag.add_edge(f"state_{s}", "reward")
 
     for a in range(n_actions):
-        dag.add_edge(f"action_{a}", f"next_state_{a % n_states}")
+        if include_next_state and n_states > 0:
+            dag.add_edge(f"action_{a}", f"next_state_{a % n_states}")
         dag.add_edge(f"action_{a}", "reward")
 
     return dag
@@ -931,7 +940,19 @@ class VBNBackend(RewardBackend):
 
     @property
     def name(self) -> str:
+        return self.cpd_result_name
+
+    @property
+    def cpd_result_name(self) -> str:
         return f"vbn_{self.cpd_name}"
+
+    @property
+    def inference_result_name(self) -> str:
+        return f"vbn_{self.cpd_name}_{self.inf_method}"
+
+    @property
+    def training_cache_key(self) -> Tuple[str, str, int, str]:
+        return ("vbn", self.cpd_name, int(self.seed), str(self.device))
 
     def fit_reward_pmf(
         self,
@@ -941,10 +962,10 @@ class VBNBackend(RewardBackend):
     ) -> BackendResult:
         from vbn import defaults, VBN
 
-        bn = VBN(dag, seed=self.seed, device=self.device)
+        vbn = VBN(dag, seed=self.seed, device=self.device)
         fit_conf = {"batch_size": max(1, int(len(df) / 4))}
 
-        bn.set_learning_method(
+        vbn.set_learning_method(
             method=defaults.learning("node_wise"),
             nodes_cpds={
                 feat: {**defaults.cpd(self.cpd_name), "fit": dict(fit_conf)}
@@ -953,11 +974,10 @@ class VBNBackend(RewardBackend):
         )
 
         t0 = time.time()
-        bn.fit(df, verbosity=0)
-        bn.set_inference_method(self.inf_method, n_samples=self.inf_n_samples)
+        vbn.fit(df, verbosity=0)
 
         parents_df = get_parent_combinations(df)
-        handle = bn.get_cpd("reward")
+        handle = vbn.get_cpd("reward")
 
         if reward_support is None:
             reward_support = np.sort(df["reward"].unique())
@@ -966,16 +986,16 @@ class VBNBackend(RewardBackend):
             handle,
             parents_df,
             reward_support=reward_support,
-            device=bn.device,
+            device=vbn.device,
         )
 
         return BackendResult(
-            name=self.name,
+            name=self.cpd_result_name,
             fit_time=time.time() - t0,
             support=np.asarray(reward_support),
             parents_df=parents_df,
             pmf=pmf,
-            artifact=bn,
+            artifact=vbn,
         )
 
     def infer_reward_posterior(
@@ -989,14 +1009,19 @@ class VBNBackend(RewardBackend):
         if vbn is None:
             raise ValueError("VBN backend missing fitted model for inference")
 
-        n_samples = int(kwargs.get("n_samples", self.inf_n_samples))
+        requested_n_samples = int(kwargs.get("n_samples", self.inf_n_samples))
         batch_size = int(kwargs.get("batch_size", 256))
         batch_size = max(1, batch_size)
         reward_support = np.asarray(reward_support, dtype=np.int64)
+        effective_n_samples = resolve_effective_vbn_n_samples(
+            requested_n_samples, reward_support
+        )
 
         pmf = np.zeros((len(evidence_df), len(reward_support)), dtype=np.float64)
         if len(evidence_df) == 0:
             return pmf, 0.0
+
+        vbn.set_inference_method(self.inf_method, n_samples=effective_n_samples)
 
         evidence_cols = list(evidence_df.columns)
         infer_weights = self.inf_method.lower() != "monte_carlo_marginalization"
@@ -1011,7 +1036,9 @@ class VBNBackend(RewardBackend):
             query = {"target": "reward", "evidence": evidence}
             with torch.no_grad():
                 ttt = time.time()
-                weights, samples = vbn.infer_posterior(query, n_samples=n_samples)
+                weights, samples = vbn.infer_posterior(
+                    query, n_samples=effective_n_samples
+                )
                 t += time.time() - ttt
             weights_np = weights.detach().cpu().numpy()
             samples_np = samples.detach().cpu().numpy()
@@ -1027,6 +1054,49 @@ class VBNBackend(RewardBackend):
 # ============================================================
 # Logging and persistence
 # ============================================================
+
+
+def resolve_effective_vbn_n_samples(
+    requested_n_samples: int, reward_support: Sequence[int]
+) -> int:
+    return int(min(int(requested_n_samples), int(len(reward_support))))
+
+
+def unique_preserve_order(items: Sequence[str]) -> List[str]:
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def get_backend_cpd_name(backend: RewardBackend) -> str:
+    if isinstance(backend, VBNBackend):
+        return backend.cpd_result_name
+    return backend.name
+
+
+def get_backend_inference_name(backend: RewardBackend) -> str:
+    if isinstance(backend, VBNBackend):
+        return backend.inference_result_name
+    return backend.name
+
+
+def get_vbn_training_key(backend: VBNBackend) -> Tuple[str, str, int, str]:
+    return backend.training_cache_key
+
+
+def group_vbn_backends_by_training_key(
+    backends: Sequence[VBNBackend],
+) -> Dict[Tuple[str, str, int, str], List[VBNBackend]]:
+    groups: Dict[Tuple[str, str, int, str], List[VBNBackend]] = {}
+    for backend in backends:
+        key = get_vbn_training_key(backend)
+        groups.setdefault(key, []).append(backend)
+    return groups
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -1079,11 +1149,17 @@ def load_json(path: Path | str) -> Any:
 
 
 def initialize_logs(
-    evaluated_backends: Sequence[RewardBackend],
+    evaluated_backends: Sequence[Any],
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time"),
     track_ground_truth_time: bool = False,
 ) -> Dict[str, Any]:
-    evaluated_names = [b.name for b in evaluated_backends]
+    evaluated_names: List[str] = []
+    for item in evaluated_backends:
+        if isinstance(item, str):
+            evaluated_names.append(item)
+        else:
+            evaluated_names.append(item.name)
+    evaluated_names = unique_preserve_order(evaluated_names)
     logs: Dict[str, Any] = {
         "metrics": {
             metric: {name: [] for name in evaluated_names} for metric in metrics
@@ -1205,7 +1281,7 @@ def plot_metrics_grid(
     n_cols = 2
     n_rows = int(np.ceil(n_metrics / n_cols)) if n_metrics > 0 else 1
 
-    fig, axes = plt.subplots(n_rows, n_cols, dpi=500, figsize=(10, 3 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, dpi=500, figsize=(10, 5 * n_rows))
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
     axes = axes.reshape(-1)
@@ -1271,18 +1347,33 @@ def run_single_experiment(
     run_dir: Path,
     log_meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    cpd_logs = initialize_logs(evaluated_backends, metrics=exp_cfg.metrics)
-    inference_logs = initialize_logs(
-        evaluated_backends, metrics=exp_cfg.inference_metrics
+    cpd_names = unique_preserve_order(
+        [get_backend_cpd_name(b) for b in evaluated_backends]
     )
+    inference_names = unique_preserve_order(
+        [get_backend_inference_name(b) for b in evaluated_backends]
+    )
+    cpd_logs = initialize_logs(cpd_names, metrics=exp_cfg.metrics)
+    inference_logs = initialize_logs(inference_names, metrics=exp_cfg.inference_metrics)
     if log_meta:
         cpd_logs["meta"] = dict(log_meta)
         inference_logs["meta"] = dict(log_meta)
     persist_benchmark(run_dir, cpd_logs, inference_logs)
 
+    non_vbn_backends = [
+        backend for backend in evaluated_backends if not isinstance(backend, VBNBackend)
+    ]
+    vbn_backends = [
+        backend for backend in evaluated_backends if isinstance(backend, VBNBackend)
+    ]
+    vbn_groups = group_vbn_backends_by_training_key(vbn_backends)
+
     pbar = tqdm(exp_cfg.cards, desc=f"#states={n_states}, #actions={n_actions}")
     for card in pbar:
-        dag = get_rl_dag(n_states, n_actions)
+        training_cache: Dict[Tuple[str, str, int, str], BackendResult] = {}
+        dag = get_rl_dag(
+            n_states, n_actions, include_next_state=exp_cfg.include_next_state
+        )
 
         data_cfg = DataConfig(
             card=card,
@@ -1291,12 +1382,13 @@ def run_single_experiment(
             n_actions=n_actions,
             mode=exp_cfg.mode,
             seed=exp_cfg.seed,
+            include_next_state=exp_cfg.include_next_state,
         )
         df = define_df(data_cfg)
 
         reward_support = get_reward_support(df, card=card)
 
-        pbar.set_postfix_str("ground truth computation")
+        pbar.set_postfix_str("ground truth cpd")
         ground_truth_backend = GroundTruthBackend(
             n_states=n_states,
             n_actions=n_actions,
@@ -1310,6 +1402,7 @@ def run_single_experiment(
         )
         validate_backend_result(ground_truth, reward_support)
 
+        pbar.set_postfix_str("ground truth inference")
         inference_queries = sample_inference_queries(
             df,
             n_states=n_states,
@@ -1339,8 +1432,10 @@ def run_single_experiment(
             )
         validate_pmf(gt_inference_pmf, "ground_truth_inference")
 
-        for backend in evaluated_backends:
-            pbar.set_postfix_str(f"{backend.name} computations")
+        for backend in non_vbn_backends:
+            cpd_name = get_backend_cpd_name(backend)
+            inference_name = get_backend_inference_name(backend)
+            pbar.set_postfix_str(f"{cpd_name} learning")
             result = backend.fit_reward_pmf(dag, df, reward_support=reward_support)
             validate_backend_result(result, reward_support)
             append_fit_time(cpd_logs, result, card)
@@ -1355,9 +1450,10 @@ def run_single_experiment(
                 candidate_pmf=result.pmf,
                 support=reward_support,
             )
-            append_comparison_metrics(cpd_logs, result.name, metrics_dict, card)
+            append_comparison_metrics(cpd_logs, cpd_name, metrics_dict, card)
             persist_benchmark(run_dir, cpd_logs, inference_logs)
 
+            pbar.set_postfix_str(f"{inference_name} inference")
             inferred_pmf, inference_time = backend.infer_reward_posterior(
                 result,
                 inference_queries,
@@ -1365,26 +1461,98 @@ def run_single_experiment(
                 n_samples=exp_cfg.vbn_inference_n_samples,
                 batch_size=exp_cfg.vbn_inference_batch_size,
             )
-            validate_pmf(inferred_pmf, f"{result.name}_inference")
+            validate_pmf(inferred_pmf, f"{inference_name}_inference")
             inference_metrics = compare_reward_cpds(
                 reference_pmf=gt_inference_pmf,
                 candidate_pmf=inferred_pmf,
                 support=reward_support,
             )
             append_comparison_metrics(
-                inference_logs, result.name, inference_metrics, card
+                inference_logs, inference_name, inference_metrics, card
             )
             append_metric(
-                inference_logs, "inference_time", result.name, card, inference_time
+                inference_logs, "inference_time", inference_name, card, inference_time
             )
             point_metrics = compare_posterior_point_predictions(
                 reference_pmf=gt_inference_pmf,
                 candidate_pmf=inferred_pmf,
                 support=reward_support,
             )
-            append_comparison_metrics(inference_logs, result.name, point_metrics, card)
+            append_comparison_metrics(
+                inference_logs, inference_name, point_metrics, card
+            )
             persist_benchmark(run_dir, cpd_logs, inference_logs)
-            del backend
+
+        for key, group in vbn_groups.items():
+            train_backend = group[0]
+            cpd_name = train_backend.cpd_result_name
+            pbar.set_postfix_str(f"{cpd_name} learning")
+            if key not in training_cache:
+                result = train_backend.fit_reward_pmf(
+                    dag, df, reward_support=reward_support
+                )
+                validate_backend_result(result, reward_support)
+                training_cache[key] = result
+            else:
+                result = training_cache[key]
+
+            if not ground_truth.parents_df.equals(result.parents_df):
+                raise ValueError(
+                    f"Parents mismatch between {ground_truth.name} and {result.name}"
+                )
+
+            metrics_dict = compare_reward_cpds(
+                reference_pmf=ground_truth.pmf,
+                candidate_pmf=result.pmf,
+                support=reward_support,
+            )
+            append_fit_time(cpd_logs, result, card)
+            append_comparison_metrics(cpd_logs, cpd_name, metrics_dict, card)
+            persist_benchmark(run_dir, cpd_logs, inference_logs)
+
+            for inf_backend in group:
+                inference_name = inf_backend.inference_result_name
+                pbar.set_postfix_str(f"{inference_name} inference")
+                inferred_pmf, inference_time = inf_backend.infer_reward_posterior(
+                    result,
+                    inference_queries,
+                    reward_support,
+                    n_samples=exp_cfg.vbn_inference_n_samples,
+                    batch_size=exp_cfg.vbn_inference_batch_size,
+                )
+                validate_pmf(inferred_pmf, f"{inference_name}_inference")
+                inference_metrics = compare_reward_cpds(
+                    reference_pmf=gt_inference_pmf,
+                    candidate_pmf=inferred_pmf,
+                    support=reward_support,
+                )
+                append_comparison_metrics(
+                    inference_logs, inference_name, inference_metrics, card
+                )
+                append_metric(
+                    inference_logs,
+                    "inference_time",
+                    inference_name,
+                    card,
+                    inference_time,
+                )
+                point_metrics = compare_posterior_point_predictions(
+                    reference_pmf=gt_inference_pmf,
+                    candidate_pmf=inferred_pmf,
+                    support=reward_support,
+                )
+                append_comparison_metrics(
+                    inference_logs, inference_name, point_metrics, card
+                )
+                persist_benchmark(run_dir, cpd_logs, inference_logs)
+
+            if key in training_cache:
+                del training_cache[key]
+            if result.artifact is not None and str(
+                getattr(result.artifact, "device", "")
+            ).startswith("cuda"):
+                torch.cuda.empty_cache()
+            del result
 
         del df
 
@@ -1405,7 +1573,6 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
         device_warning = "CUDA requested but unavailable; fell back to CPU."
 
     evaluated_backends = [
-        # PgmpyBackend(),
         VBNBackend(
             cpd_name="kde",
             inf_method=exp_cfg.vbn_inference_method,
@@ -1413,7 +1580,63 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
             seed=exp_cfg.seed,
             device=resolved_device,
         ),
+        VBNBackend(
+            cpd_name="kde",
+            inf_method="likelihood_weighting",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        VBNBackend(
+            cpd_name="kde",
+            inf_method="lbp",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        VBNBackend(
+            cpd_name="kde",
+            inf_method="importance_sampling",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        VBNBackend(
+            cpd_name="gaussian_nn",
+            inf_method=exp_cfg.vbn_inference_method,
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        VBNBackend(
+            cpd_name="gaussian_nn",
+            inf_method="likelihood_weighting",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        VBNBackend(
+            cpd_name="gaussian_nn",
+            inf_method="lbp",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        VBNBackend(
+            cpd_name="gaussian_nn",
+            inf_method="importance_sampling",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+        ),
+        PgmpyBackend(),
     ]
+    cpd_backend_names = unique_preserve_order(
+        [get_backend_cpd_name(b) for b in evaluated_backends]
+    )
+    inference_backend_names = unique_preserve_order(
+        [get_backend_inference_name(b) for b in evaluated_backends]
+    )
 
     n_runs = len(exp_cfg.n_states_list) * len(exp_cfg.n_actions_list)
     use_subdirs = n_runs > 1
@@ -1425,6 +1648,8 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
         "vbn_device_warning": device_warning,
         "n_runs": n_runs,
         "backends": [b.name for b in evaluated_backends],
+        "cpd_backends": cpd_backend_names,
+        "inference_backends": inference_backend_names,
     }
     save_json(benchmark_dir / "run_metadata.json", top_level_meta)
 
@@ -1445,6 +1670,8 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
                 "n_states": n_states,
                 "n_actions": n_actions,
                 "backends": [b.name for b in evaluated_backends],
+                "cpd_backends": cpd_backend_names,
+                "inference_backends": inference_backend_names,
                 "config": asdict(exp_cfg),
             }
             save_json(run_dir / "config.json", config_payload)
@@ -1596,6 +1823,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out-dir", type=str, default=default_cfg.out_dir)
     parser.add_argument(
+        "--include-next-state",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.include_next_state,
+        help="Include next_state nodes and data generation.",
+    )
+    parser.add_argument(
         "--metrics",
         type=parse_str_list,
         default=default_cfg.metrics,
@@ -1627,6 +1860,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         vbn_inference_batch_size=args.vbn_inference_batch_size,
         vbn_device=args.vbn_device,
         out_dir=args.out_dir,
+        include_next_state=args.include_next_state,
         metrics=tuple(args.metrics),
         inference_metrics=tuple(args.inference_metrics),
     )
