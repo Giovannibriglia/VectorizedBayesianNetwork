@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 import time
 import warnings
 from dataclasses import asdict, dataclass
@@ -13,6 +14,11 @@ import pandas as pd
 import torch
 from matplotlib import pyplot as plt
 from tqdm import tqdm
+
+# Ensure repo root is on sys.path when executed as a script.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # ============================================================
 # Configuration
@@ -39,11 +45,11 @@ class ExperimentConfig:
     seed: int = 42
     n_mc_ground_truth: int = 20000
     n_mc_inference_ground_truth: Optional[int] = None
-    n_inference_queries: int = 512
+    n_inference_queries: int = 16
     inference_seed: int = 123
     vbn_inference_method: str = "monte_carlo_marginalization"
-    vbn_inference_n_samples: int = 1024
-    vbn_inference_batch_size: int = 512
+    vbn_inference_n_samples: int = 512
+    vbn_inference_batch_size: int = 16
     vbn_device: str = "auto"
     out_dir: str = "stress_test/out"
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time")
@@ -935,10 +941,10 @@ class VBNBackend(RewardBackend):
     ) -> BackendResult:
         from vbn import defaults, VBN
 
-        vbn = VBN(dag, seed=self.seed, device=self.device)
+        bn = VBN(dag, seed=self.seed, device=self.device)
         fit_conf = {"batch_size": max(1, int(len(df) / 4))}
 
-        vbn.set_learning_method(
+        bn.set_learning_method(
             method=defaults.learning("node_wise"),
             nodes_cpds={
                 feat: {**defaults.cpd(self.cpd_name), "fit": dict(fit_conf)}
@@ -947,11 +953,11 @@ class VBNBackend(RewardBackend):
         )
 
         t0 = time.time()
-        vbn.fit(df, verbosity=0)
-        vbn.set_inference_method(self.inf_method, n_samples=self.inf_n_samples)
+        bn.fit(df, verbosity=0)
+        bn.set_inference_method(self.inf_method, n_samples=self.inf_n_samples)
 
         parents_df = get_parent_combinations(df)
-        handle = vbn.get_cpd("reward")
+        handle = bn.get_cpd("reward")
 
         if reward_support is None:
             reward_support = np.sort(df["reward"].unique())
@@ -960,7 +966,7 @@ class VBNBackend(RewardBackend):
             handle,
             parents_df,
             reward_support=reward_support,
-            device=vbn.device,
+            device=bn.device,
         )
 
         return BackendResult(
@@ -969,7 +975,7 @@ class VBNBackend(RewardBackend):
             support=np.asarray(reward_support),
             parents_df=parents_df,
             pmf=pmf,
-            artifact=vbn,
+            artifact=bn,
         )
 
     def infer_reward_posterior(
@@ -1274,7 +1280,8 @@ def run_single_experiment(
         inference_logs["meta"] = dict(log_meta)
     persist_benchmark(run_dir, cpd_logs, inference_logs)
 
-    for card in tqdm(exp_cfg.cards, desc=f"#states={n_states}, #actions={n_actions}"):
+    pbar = tqdm(exp_cfg.cards, desc=f"#states={n_states}, #actions={n_actions}")
+    for card in pbar:
         dag = get_rl_dag(n_states, n_actions)
 
         data_cfg = DataConfig(
@@ -1289,6 +1296,7 @@ def run_single_experiment(
 
         reward_support = get_reward_support(df, card=card)
 
+        pbar.set_postfix_str("ground truth computation")
         ground_truth_backend = GroundTruthBackend(
             n_states=n_states,
             n_actions=n_actions,
@@ -1322,7 +1330,7 @@ def run_single_experiment(
             card=card,
             mode=exp_cfg.mode,
             n_mc_samples=n_mc_inference,
-            seed=exp_cfg.inference_seed + 10_000 + card,
+            seed=exp_cfg.inference_seed,
         )
         if not np.array_equal(gt_inference_support, reward_support):
             raise ValueError(
@@ -1332,6 +1340,7 @@ def run_single_experiment(
         validate_pmf(gt_inference_pmf, "ground_truth_inference")
 
         for backend in evaluated_backends:
+            pbar.set_postfix_str(f"{backend.name} computations")
             result = backend.fit_reward_pmf(dag, df, reward_support=reward_support)
             validate_backend_result(result, reward_support)
             append_fit_time(cpd_logs, result, card)
@@ -1375,6 +1384,7 @@ def run_single_experiment(
             )
             append_comparison_metrics(inference_logs, result.name, point_metrics, card)
             persist_benchmark(run_dir, cpd_logs, inference_logs)
+            del backend
 
         del df
 
@@ -1395,7 +1405,7 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
         device_warning = "CUDA requested but unavailable; fell back to CPU."
 
     evaluated_backends = [
-        PgmpyBackend(),
+        # PgmpyBackend(),
         VBNBackend(
             cpd_name="kde",
             inf_method=exp_cfg.vbn_inference_method,
