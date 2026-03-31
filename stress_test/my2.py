@@ -1,3 +1,4 @@
+import argparse
 import json
 import time
 import warnings
@@ -33,7 +34,7 @@ class ExperimentConfig:
     n_samples_df: int = 32000
     n_states_list: Sequence[int] = (1,)
     n_actions_list: Sequence[int] = (1,)
-    cards: Sequence[int] = (10, 20, 50)  # , 100, 200, 500, 1000
+    cards: Sequence[int] = (10, 20, 50, 100, 200, 500, 1000, 2000, 5000)
     mode: str = "linear"
     seed: int = 42
     n_mc_ground_truth: int = 20000
@@ -1484,12 +1485,149 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
 
 
 # ============================================================
+# CLI helpers
+# ============================================================
+
+
+def parse_int_list(values: Any) -> Tuple[int, ...]:
+    if isinstance(values, (list, tuple)):
+        return tuple(int(v) for v in values)
+    if values is None:
+        return tuple()
+    text = str(values).replace(",", " ").strip()
+    if not text:
+        return tuple()
+    return tuple(int(part) for part in text.split())
+
+
+def parse_str_list(values: Any) -> Tuple[str, ...]:
+    if isinstance(values, (list, tuple)):
+        return tuple(str(v) for v in values)
+    if values is None:
+        return tuple()
+    text = str(values).replace(",", " ").strip()
+    if not text:
+        return tuple()
+    return tuple(part for part in text.split() if part)
+
+
+def parse_optional_int(values: Any) -> Optional[int]:
+    if values is None:
+        return None
+    text = str(values).strip().lower()
+    if text in {"", "none", "null"}:
+        return None
+    return int(values)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    default_cfg = ExperimentConfig()
+    parser = argparse.ArgumentParser(
+        description="Run VBN stress-test experiments with configurable settings."
+    )
+    parser.add_argument("--n-samples-df", type=int, default=default_cfg.n_samples_df)
+    parser.add_argument("--mode", type=str, default=default_cfg.mode)
+    parser.add_argument("--seed", type=int, default=default_cfg.seed)
+    parser.add_argument(
+        "--cards",
+        type=parse_int_list,
+        default=default_cfg.cards,
+        help="Comma or space-separated list of cardinalities.",
+    )
+    parser.add_argument(
+        "--n-states-list",
+        type=parse_int_list,
+        default=default_cfg.n_states_list,
+        help="Comma or space-separated list of state counts.",
+    )
+    parser.add_argument(
+        "--n-actions-list",
+        type=parse_int_list,
+        default=default_cfg.n_actions_list,
+        help="Comma or space-separated list of action counts.",
+    )
+    parser.add_argument(
+        "--n-mc-ground-truth", type=int, default=default_cfg.n_mc_ground_truth
+    )
+    parser.add_argument(
+        "--n-mc-inference-ground-truth",
+        type=parse_optional_int,
+        default=default_cfg.n_mc_inference_ground_truth,
+        help="Optional int or 'none' to match n-mc-ground-truth.",
+    )
+    parser.add_argument(
+        "--n-inference-queries",
+        type=int,
+        default=default_cfg.n_inference_queries,
+    )
+    parser.add_argument(
+        "--inference-seed", type=int, default=default_cfg.inference_seed
+    )
+    parser.add_argument(
+        "--vbn-inference-method",
+        type=str,
+        default=default_cfg.vbn_inference_method,
+    )
+    parser.add_argument(
+        "--vbn-inference-n-samples",
+        type=int,
+        default=default_cfg.vbn_inference_n_samples,
+    )
+    parser.add_argument(
+        "--vbn-inference-batch-size",
+        type=int,
+        default=default_cfg.vbn_inference_batch_size,
+    )
+    parser.add_argument(
+        "--vbn-device",
+        type=str,
+        default=default_cfg.vbn_device,
+        help="Torch device: auto, cpu, cuda, or cuda:0.",
+    )
+    parser.add_argument("--out-dir", type=str, default=default_cfg.out_dir)
+    parser.add_argument(
+        "--metrics",
+        type=parse_str_list,
+        default=default_cfg.metrics,
+        help="Comma or space-separated CPD metrics.",
+    )
+    parser.add_argument(
+        "--inference-metrics",
+        type=parse_str_list,
+        default=default_cfg.inference_metrics,
+        help="Comma or space-separated inference metrics.",
+    )
+    return parser
+
+
+def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
+    return ExperimentConfig(
+        n_samples_df=args.n_samples_df,
+        n_states_list=tuple(args.n_states_list),
+        n_actions_list=tuple(args.n_actions_list),
+        cards=tuple(args.cards),
+        mode=args.mode,
+        seed=args.seed,
+        n_mc_ground_truth=args.n_mc_ground_truth,
+        n_mc_inference_ground_truth=args.n_mc_inference_ground_truth,
+        n_inference_queries=args.n_inference_queries,
+        inference_seed=args.inference_seed,
+        vbn_inference_method=args.vbn_inference_method,
+        vbn_inference_n_samples=args.vbn_inference_n_samples,
+        vbn_inference_batch_size=args.vbn_inference_batch_size,
+        vbn_device=args.vbn_device,
+        out_dir=args.out_dir,
+        metrics=tuple(args.metrics),
+        inference_metrics=tuple(args.inference_metrics),
+    )
+
+
+# ============================================================
 # Main
 # ============================================================
 
 if __name__ == "__main__":
-    exp_cfg = ExperimentConfig(
-        n_samples_df=32000,
-        mode="linear",
-    )
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    exp_cfg = config_from_args(args)
     run_experiments(exp_cfg)
