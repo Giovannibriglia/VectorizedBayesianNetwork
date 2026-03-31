@@ -10,6 +10,7 @@ from vbn.config_cast import coerce_numbers, UPDATE_SCHEMA
 from vbn.core.base import BaseCPD
 from vbn.core.registry import register_cpd
 from vbn.core.utils import broadcast_samples, ensure_2d, flatten_samples
+from vbn.cpds.utils import safe_softplus
 
 
 def _build_mlp(
@@ -177,7 +178,7 @@ class MDNCPD(BaseCPD):
         if self.input_dim == 0:
             logits = self._logits
             loc = self._loc
-            scale = torch.nn.functional.softplus(self._log_scale) + self.min_scale
+            scale = safe_softplus(self._log_scale, min_val=self.min_scale)
             return logits, loc, scale
 
         if parents is None:
@@ -192,7 +193,7 @@ class MDNCPD(BaseCPD):
         rest = rest.reshape(b, s, self.n_components, 2 * self.output_dim)
         loc = rest[..., : self.output_dim]
         log_scale = rest[..., self.output_dim :]
-        scale = torch.nn.functional.softplus(log_scale) + self.min_scale
+        scale = safe_softplus(log_scale, min_val=self.min_scale)
         return logits, loc, scale
 
     def sample(self, parents: Optional[torch.Tensor], n_samples: int) -> torch.Tensor:
@@ -203,7 +204,7 @@ class MDNCPD(BaseCPD):
                 b, n_samples, -1, -1
             )
             scale = (
-                (torch.nn.functional.softplus(self._log_scale) + self.min_scale)
+                safe_softplus(self._log_scale, min_val=self.min_scale)
                 .view(1, 1, self.n_components, self.output_dim)
                 .expand(b, n_samples, -1, -1)
             )
@@ -213,8 +214,10 @@ class MDNCPD(BaseCPD):
             parents = broadcast_samples(parents, n_samples)
             logits, loc, scale = self._params(parents)
         b, s, _ = logits.shape
-        logits = logits.reshape(b * s, self.n_components)
-        comps = torch.distributions.Categorical(logits=logits).sample().reshape(b, s)
+        pi = torch.softmax(logits, dim=-1).clamp_min(1e-5)
+        pi = pi / pi.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        comps = torch.distributions.Categorical(probs=pi.reshape(b * s, -1)).sample()
+        comps = comps.reshape(b, s)
         idx = comps.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.output_dim)
         loc = loc.gather(dim=2, index=idx).squeeze(2)
         scale = scale.gather(dim=2, index=idx).squeeze(2)
@@ -234,9 +237,12 @@ class MDNCPD(BaseCPD):
             loc = self._loc.view(1, 1, self.n_components, self.output_dim).expand(
                 b, s, -1, -1
             )
-            log_scale = self._log_scale.view(
-                1, 1, self.n_components, self.output_dim
-            ).expand(b, s, -1, -1)
+            scale = safe_softplus(self._log_scale, min_val=self.min_scale)
+            log_scale = torch.log(
+                scale.view(1, 1, self.n_components, self.output_dim).expand(
+                    b, s, -1, -1
+                )
+            )
         else:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")
@@ -250,5 +256,7 @@ class MDNCPD(BaseCPD):
         log_comp = -0.5 * (
             ((x_exp - loc) ** 2) / var + 2 * log_scale + math.log(2 * math.pi)
         ).sum(dim=-1)
-        log_mix = torch.log_softmax(logits, dim=-1)
-        return torch.logsumexp(log_mix + log_comp, dim=-1)
+        pi = torch.softmax(logits, dim=-1).clamp_min(1e-5)
+        pi = pi / pi.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        log_pi = torch.log(pi)
+        return torch.logsumexp(log_pi + log_comp, dim=-1)

@@ -547,6 +547,12 @@ class VBN:
     def cpd(self, node: str) -> CPDHandle:
         return CPDHandle(self, node)
 
+    def get_cpd(self, node: str) -> CPDHandle:
+        return CPDHandle(self, node)
+
+    def get_cpds(self) -> Dict[str, CPDHandle]:
+        return {node: CPDHandle(self, node) for node in self.dag.nodes()}
+
     # ----------------- persistence -----------------
     def save(
         self,

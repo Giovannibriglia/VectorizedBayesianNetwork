@@ -1,9 +1,10 @@
 name: kde
 bandwidth: 0.5
 parent_bandwidth: 0.5
-max_points: 1024
+max_points: 4096
+min_scale: 1e-4
 fit:
-  epochs: 50
+  epochs: 100
   batch_size: 4096
   lr: 1e-3
   weight_decay: 0.0

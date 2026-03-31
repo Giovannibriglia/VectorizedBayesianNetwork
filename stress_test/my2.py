@@ -1,0 +1,1121 @@
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import torch
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+
+# ============================================================
+# Configuration
+# ============================================================
+
+
+@dataclass
+class DataConfig:
+    card: int
+    n_samples_df: int
+    n_states: int
+    n_actions: int
+    mode: str = "linear"  # "linear" or "nonlinear"
+    seed: int = 42
+
+
+@dataclass
+class ExperimentConfig:
+    n_samples_df: int = 32000
+    n_states_list: Sequence[int] = (1,)
+    n_actions_list: Sequence[int] = (1,)
+    cards: Sequence[int] = (10, 20, 50, 100, 200, 500, 1000)
+    mode: str = "linear"
+    seed: int = 42
+    n_mc_ground_truth: int = 20000
+    n_mc_inference_ground_truth: Optional[int] = None
+    n_inference_queries: int = 32
+    inference_seed: int = 123
+    vbn_inference_method: str = "monte_carlo_marginalization"
+    vbn_inference_n_samples: int = 1024
+    vbn_inference_batch_size: int = 32
+    metrics: Sequence[str] = ("kl", "js", "ws", "fit_time")
+    inference_metrics: Sequence[str] = ("kl", "js", "ws", "inference_time")
+
+
+# ============================================================
+# Metrics
+# ============================================================
+
+
+def normalize_probs(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    p = np.clip(p, eps, None)
+    return p / p.sum(axis=-1, keepdims=True)
+
+
+def kl_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    p = normalize_probs(p, eps=eps)
+    q = normalize_probs(q, eps=eps)
+    return np.sum(p * (np.log(p) - np.log(q)), axis=-1)
+
+
+def js_divergence_normalized(
+    p: np.ndarray, q: np.ndarray, eps: float = 1e-12
+) -> np.ndarray:
+    p = normalize_probs(p, eps=eps)
+    q = normalize_probs(q, eps=eps)
+    m = 0.5 * (p + q)
+    js = 0.5 * kl_divergence(p, m, eps=eps) + 0.5 * kl_divergence(q, m, eps=eps)
+    return js / np.log(2.0)
+
+
+def wasserstein_1d(p: np.ndarray, q: np.ndarray, support: np.ndarray) -> np.ndarray:
+    p = normalize_probs(p)
+    q = normalize_probs(q)
+    order = np.argsort(support)
+    support = support[order]
+    p = p[:, order]
+    q = q[:, order]
+
+    cdf_p = np.cumsum(p, axis=1)
+    cdf_q = np.cumsum(q, axis=1)
+    dx = np.diff(support)
+
+    if dx.size == 0:
+        return np.zeros(p.shape[0], dtype=np.float64)
+
+    return np.sum(np.abs(cdf_p[:, :-1] - cdf_q[:, :-1]) * dx, axis=1)
+
+
+def compare_reward_cpds(
+    reference_pmf: np.ndarray,
+    candidate_pmf: np.ndarray,
+    support: np.ndarray,
+) -> Dict[str, float]:
+    if reference_pmf.shape != candidate_pmf.shape:
+        raise ValueError(
+            f"PMF shape mismatch: reference {reference_pmf.shape}, candidate {candidate_pmf.shape}"
+        )
+
+    return {
+        "kl": float(kl_divergence(reference_pmf, candidate_pmf).mean()),
+        "js": float(js_divergence_normalized(reference_pmf, candidate_pmf).mean()),
+        "ws": float(wasserstein_1d(reference_pmf, candidate_pmf, support).mean()),
+    }
+
+
+def validate_pmf(pmf: np.ndarray, name: str, atol: float = 1e-6) -> None:
+    if pmf.ndim != 2:
+        raise ValueError(f"{name} PMF must be 2D, got shape {pmf.shape}")
+    if not np.all(np.isfinite(pmf)):
+        raise ValueError(f"{name} PMF contains non-finite values")
+    if (pmf < -atol).any():
+        raise ValueError(f"{name} PMF contains negative entries below {-atol}")
+    row_sums = pmf.sum(axis=1)
+    if not np.allclose(row_sums, 1.0, atol=atol):
+        raise ValueError(
+            f"{name} PMF rows do not sum to 1. "
+            f"Min={row_sums.min()}, Max={row_sums.max()}"
+        )
+
+
+def validate_backend_result(
+    result: "BackendResult", reward_support: np.ndarray, atol: float = 1e-6
+) -> None:
+    support = np.asarray(result.support, dtype=np.int64)
+    reward_support = np.asarray(reward_support, dtype=np.int64)
+
+    if support.shape != reward_support.shape or not np.array_equal(
+        support, reward_support
+    ):
+        raise ValueError(
+            f"Support mismatch for {result.name}: {support} vs {reward_support}"
+        )
+
+    if result.pmf.shape[1] != reward_support.shape[0]:
+        raise ValueError(
+            f"PMF/support mismatch for {result.name}: "
+            f"pmf.shape={result.pmf.shape}, support={reward_support.shape}"
+        )
+
+    if result.pmf.shape[0] != len(result.parents_df):
+        raise ValueError(
+            f"PMF/parents mismatch for {result.name}: "
+            f"pmf.shape={result.pmf.shape}, parents={len(result.parents_df)}"
+        )
+
+    validate_pmf(result.pmf, result.name, atol=atol)
+
+
+# ============================================================
+# Data generation
+# ============================================================
+
+
+def extract_state_action_arrays(
+    df: pd.DataFrame, n_states: int, n_actions: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    if n_states > 0:
+        states = np.stack(
+            [df[f"state_{i}"].values for i in range(n_states)], axis=1
+        ).astype(np.float64)
+    else:
+        states = np.zeros((len(df), 0), dtype=np.float64)
+
+    if n_actions > 0:
+        actions = np.stack(
+            [df[f"action_{j}"].values for j in range(n_actions)], axis=1
+        ).astype(np.float64)
+    else:
+        actions = np.zeros((len(df), 0), dtype=np.float64)
+
+    return states, actions
+
+
+def compute_reward_base_from_arrays(
+    states: np.ndarray, actions: np.ndarray, mode: str, card: int
+) -> np.ndarray:
+    states = np.asarray(states, dtype=np.float64)
+    actions = np.asarray(actions, dtype=np.float64)
+    n_rows = states.shape[0]
+
+    base = np.zeros(n_rows, dtype=np.float64)
+
+    if mode == "linear":
+        if states.shape[1] > 0:
+            weights_s = np.arange(1, states.shape[1] + 1, dtype=np.float64)
+            base += states @ weights_s
+        if actions.shape[1] > 0:
+            weights_a = np.arange(1, actions.shape[1] + 1, dtype=np.float64)
+            base += actions @ weights_a
+        return base
+
+    if mode != "nonlinear":
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    if states.shape[1] > 0:
+        base += np.sum(np.sin(states) + 0.1 * (states**2), axis=1)
+
+    if actions.shape[1] > 0:
+        base += np.sum(np.cos(actions) + 0.05 * (actions**2), axis=1)
+
+    if states.shape[1] > 0 and actions.shape[1] > 0:
+        base += 0.2 * (states.sum(axis=1) * actions.sum(axis=1))
+        base += 0.1 * np.sin(states.sum(axis=1) + actions.sum(axis=1))
+
+    if actions.shape[1] > 1:
+        sum_a = actions.sum(axis=1)
+        sum_a2 = np.sum(actions**2, axis=1)
+        base += 0.05 * (0.5 * (sum_a**2 - sum_a2))
+
+    return base
+
+
+def finalize_reward_from_base(
+    base: np.ndarray, reward_noise: np.ndarray, card: int
+) -> np.ndarray:
+    reward = (base + reward_noise).astype(np.int64) % card
+    return reward
+
+
+def compute_reward_from_arrays(
+    states: np.ndarray,
+    actions: np.ndarray,
+    reward_noise: np.ndarray,
+    mode: str,
+    card: int,
+) -> np.ndarray:
+    base = compute_reward_base_from_arrays(states, actions, mode=mode, card=card)
+    return finalize_reward_from_base(base, reward_noise, card=card)
+
+
+def define_df(cfg: DataConfig) -> pd.DataFrame:
+    rng = np.random.default_rng(cfg.seed)
+    data: Dict[str, np.ndarray] = {}
+
+    for i in range(cfg.n_states):
+        data[f"state_{i}"] = rng.integers(0, cfg.card, size=cfg.n_samples_df)
+
+    for j in range(cfg.n_actions):
+        noise = rng.integers(0, cfg.card, size=cfg.n_samples_df)
+        base_state = data[f"state_{j % cfg.n_states}"]
+
+        if cfg.mode == "linear":
+            action = (2 * base_state + noise) % cfg.card
+        elif cfg.mode == "nonlinear":
+            action = (
+                np.sin(base_state) * (cfg.card / 2)
+                + (base_state * noise) % cfg.card
+                + np.cos(noise)
+            )
+        else:
+            raise ValueError(f"Unsupported mode: {cfg.mode}")
+
+        data[f"action_{j}"] = np.asarray(action, dtype=np.int32) % cfg.card
+
+    if cfg.n_states > 0:
+        states = np.stack(
+            [data[f"state_{i}"] for i in range(cfg.n_states)], axis=1
+        ).astype(np.float64)
+    else:
+        states = np.zeros((cfg.n_samples_df, 0), dtype=np.float64)
+
+    if cfg.n_actions > 0:
+        actions = np.stack(
+            [data[f"action_{j}"] for j in range(cfg.n_actions)], axis=1
+        ).astype(np.float64)
+    else:
+        actions = np.zeros((cfg.n_samples_df, 0), dtype=np.float64)
+
+    reward_noise = rng.normal(size=cfg.n_samples_df)
+    data["reward"] = compute_reward_from_arrays(
+        states, actions, reward_noise, mode=cfg.mode, card=cfg.card
+    ).astype(np.int32)
+
+    for i in range(cfg.n_states):
+        s = data[f"state_{i}"]
+        a = data[f"action_{i % cfg.n_actions}"]
+        noise = rng.integers(1, max(2, cfg.card), size=cfg.n_samples_df)
+
+        if cfg.mode == "linear":
+            next_s = s + 2 * a + noise
+        elif cfg.mode == "nonlinear":
+            next_s = s + a + np.sin(s + a) * (cfg.card / 3) + (s * a) % cfg.card + noise
+        else:
+            raise ValueError(f"Unsupported mode: {cfg.mode}")
+
+        data[f"next_state_{i}"] = np.asarray(next_s, dtype=np.int32) % cfg.card
+
+    return pd.DataFrame(data)
+
+
+def get_rl_dag(n_states: int, n_actions: int) -> nx.DiGraph:
+    dag = nx.DiGraph()
+
+    for s in range(n_states):
+        for a in range(n_actions):
+            dag.add_edge(f"state_{s}", f"action_{a}")
+
+    for s in range(n_states):
+        dag.add_edge(f"state_{s}", f"next_state_{s}")
+        dag.add_edge(f"state_{s}", "reward")
+
+    for a in range(n_actions):
+        dag.add_edge(f"action_{a}", f"next_state_{a % n_states}")
+        dag.add_edge(f"action_{a}", "reward")
+
+    return dag
+
+
+def get_state_action_columns(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if c.startswith("state_") or c.startswith("action_")]
+
+
+def get_parent_combinations(df: pd.DataFrame) -> pd.DataFrame:
+    return df[get_state_action_columns(df)].drop_duplicates().reset_index(drop=True)
+
+
+def get_reward_support(df: pd.DataFrame, card: Optional[int] = None) -> np.ndarray:
+    if card is not None:
+        return np.arange(card, dtype=np.int64)
+    return np.sort(df["reward"].unique()).astype(np.int64)
+
+
+# ============================================================
+# Inference utilities
+# ============================================================
+
+
+def get_inference_evidence_columns(
+    n_states: int, n_actions: int, include_actions: bool = False
+) -> List[str]:
+    cols = [f"state_{i}" for i in range(n_states)]
+    if include_actions:
+        cols += [f"action_{j}" for j in range(n_actions)]
+    return cols
+
+
+def sample_inference_queries(
+    df: pd.DataFrame,
+    n_states: int,
+    n_actions: int,
+    n_queries: int,
+    seed: int,
+    *,
+    include_actions: bool = False,
+) -> pd.DataFrame:
+    evidence_cols = get_inference_evidence_columns(
+        n_states, n_actions, include_actions=include_actions
+    )
+    candidates = df[evidence_cols].drop_duplicates().reset_index(drop=True)
+    if len(candidates) == 0 or n_queries <= 0:
+        return candidates.iloc[:0].copy()
+
+    n_queries = min(int(n_queries), len(candidates))
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(candidates), size=n_queries, replace=False)
+    return candidates.iloc[idx].reset_index(drop=True)
+
+
+def sample_actions_from_states(
+    states: np.ndarray, n_actions: int, card: int, mode: str, rng: np.random.Generator
+) -> np.ndarray:
+    states = np.asarray(states, dtype=np.float64)
+    n_samples = states.shape[0]
+    n_states = states.shape[1]
+
+    if n_actions <= 0:
+        return np.zeros((n_samples, 0), dtype=np.float64)
+
+    actions = np.zeros((n_samples, n_actions), dtype=np.float64)
+    for j in range(n_actions):
+        if n_states == 0:
+            base_state = np.zeros(n_samples, dtype=np.float64)
+        else:
+            base_state = states[:, j % n_states]
+        noise = rng.integers(0, card, size=n_samples)
+        if mode == "linear":
+            action = (2 * base_state + noise) % card
+        elif mode == "nonlinear":
+            action = (
+                np.sin(base_state) * (card / 2)
+                + (base_state * noise) % card
+                + np.cos(noise)
+            )
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+        actions[:, j] = np.asarray(action, dtype=np.int32) % card
+
+    return actions
+
+
+def estimate_ground_truth_inference_pmf(
+    evidence_df: pd.DataFrame,
+    n_states: int,
+    n_actions: int,
+    card: int,
+    mode: str,
+    n_mc_samples: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    reward_support = np.arange(card, dtype=np.int64)
+
+    state_cols = [f"state_{i}" for i in range(n_states)]
+    action_cols = [
+        f"action_{j}" for j in range(n_actions) if f"action_{j}" in evidence_df.columns
+    ]
+
+    if n_states > 0:
+        states = evidence_df[state_cols].to_numpy(dtype=np.float64)
+    else:
+        states = np.zeros((len(evidence_df), 0), dtype=np.float64)
+    observed_actions = None
+    if action_cols:
+        observed_actions = evidence_df[action_cols].to_numpy(dtype=np.float64)
+
+    pmf = np.zeros((len(evidence_df), card), dtype=np.float64)
+    for i in range(len(evidence_df)):
+        state_row = np.repeat(states[i : i + 1], n_mc_samples, axis=0)
+        actions = sample_actions_from_states(
+            state_row, n_actions=n_actions, card=card, mode=mode, rng=rng
+        )
+        if observed_actions is not None:
+            for idx, col in enumerate(action_cols):
+                action_idx = int(col.split("_")[1])
+                actions[:, action_idx] = observed_actions[i, idx]
+        reward_noise = rng.normal(size=n_mc_samples)
+        rewards = compute_reward_from_arrays(
+            state_row, actions, reward_noise, mode=mode, card=card
+        ).astype(np.int64)
+        counts = np.bincount(rewards, minlength=card).astype(np.float64)
+        pmf[i] = counts / counts.sum()
+
+    return reward_support, pmf
+
+
+def map_samples_to_support_indices(
+    samples: np.ndarray, support: np.ndarray
+) -> np.ndarray:
+    support = np.asarray(support, dtype=np.float64)
+    if support.ndim != 1:
+        raise ValueError("support must be 1D")
+    if support.size == 0:
+        raise ValueError("support must be non-empty")
+
+    support_sorted = np.sort(support)
+    contiguous = np.allclose(np.diff(support_sorted), 1.0)
+    if contiguous:
+        min_val = support_sorted[0]
+        max_val = support_sorted[-1]
+        idx = np.rint(samples).astype(np.int64)
+        idx = np.clip(idx, int(min_val), int(max_val)) - int(min_val)
+        return idx
+
+    flat = samples.reshape(-1)
+    idx = np.searchsorted(support_sorted, flat, side="left")
+    idx = np.clip(idx, 0, len(support_sorted) - 1)
+    left_idx = np.clip(idx - 1, 0, len(support_sorted) - 1)
+    right = support_sorted[idx]
+    left = support_sorted[left_idx]
+    choose_left = np.abs(flat - left) <= np.abs(flat - right)
+    idx = np.where(choose_left, left_idx, idx)
+    return idx.reshape(samples.shape)
+
+
+def weighted_samples_to_pmf(
+    samples: np.ndarray, weights: np.ndarray, support: np.ndarray
+) -> np.ndarray:
+    samples = np.asarray(samples)
+    weights = np.asarray(weights)
+
+    if samples.ndim == 3:
+        if samples.shape[-1] != 1:
+            raise ValueError(f"Expected 1D target samples, got {samples.shape}")
+        samples = samples[..., 0]
+    if weights.ndim == 3:
+        weights = weights[..., 0]
+
+    if samples.shape != weights.shape:
+        raise ValueError(
+            f"Sample/weight shape mismatch: {samples.shape} vs {weights.shape}"
+        )
+
+    indices = map_samples_to_support_indices(samples, support)
+    pmf = np.zeros((samples.shape[0], len(support)), dtype=np.float64)
+    weights = np.clip(weights, 0.0, None)
+
+    for i in range(samples.shape[0]):
+        np.add.at(pmf[i], indices[i], weights[i])
+
+    return normalize_probs(pmf)
+
+
+# ============================================================
+# PMF extraction utilities
+# ============================================================
+
+
+def pgmpy_reward_pmf(
+    cpd,
+    parents_df: pd.DataFrame,
+    reward_support: Optional[Sequence[int]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    evidence = list(getattr(cpd, "evidence", None) or cpd.variables[1:])
+    state_names = getattr(cpd, "state_names", None) or {}
+    cardinality = dict(zip(cpd.variables, cpd.cardinality))
+
+    if reward_support is None:
+        reward_support = state_names.get("reward")
+    if reward_support is None:
+        reward_support = list(
+            range(cardinality.get("reward", cpd.get_values().shape[0]))
+        )
+
+    reward_support = np.asarray(reward_support, dtype=np.int64)
+    reward_support = np.sort(reward_support)
+
+    reward_states = state_names.get("reward", reward_support)
+    reward_index = {v: i for i, v in enumerate(reward_states)}
+
+    values = np.asarray(cpd.get_values())
+    pmf = np.zeros((len(parents_df), len(reward_support)), dtype=np.float64)
+
+    evidence_index = {}
+    for var in evidence:
+        names = state_names.get(var)
+        if names is None:
+            names = list(range(cardinality[var]))
+        evidence_index[var] = {v: i for i, v in enumerate(names)}
+
+    strides = []
+    stride = 1
+    for var in reversed(evidence):
+        strides.append((var, stride))
+        stride *= cardinality[var]
+    strides = list(reversed(strides))
+
+    for i, row in parents_df.iterrows():
+        col = 0
+        for var, s in strides:
+            col += evidence_index[var][row[var]] * s
+        reward_probs = values[:, col]
+
+        if list(reward_support) != list(reward_states):
+            aligned = np.zeros(len(reward_support), dtype=np.float64)
+            for idx, v in enumerate(reward_support):
+                if v in reward_index:
+                    aligned[idx] = reward_probs[reward_index[v]]
+            reward_probs = aligned
+
+        pmf[i] = reward_probs
+
+    return reward_support, pmf
+
+
+def vbn_reward_pmf(
+    handle,
+    parents_df: pd.DataFrame,
+    reward_support: Sequence[int],
+    device: torch.device,
+) -> np.ndarray:
+    reward_support = np.asarray(reward_support)
+    reward_support = np.sort(reward_support)
+
+    parents_tensor = torch.cat(
+        [
+            torch.tensor(
+                parents_df[p].values, device=device, dtype=torch.long
+            ).unsqueeze(1)
+            for p in handle.parents
+        ],
+        dim=-1,
+    )  # [B, Dp]
+
+    reward_vals = torch.tensor(reward_support, device=device, dtype=torch.long).view(
+        1, -1, 1
+    )
+    b, k = parents_tensor.shape[0], reward_vals.shape[1]
+
+    parents_grid = parents_tensor.unsqueeze(1).expand(b, k, -1)  # [B, K, Dp]
+    reward_grid = reward_vals.expand(b, k, 1)  # [B, K, 1]
+
+    logp = handle.conditional_log_prob(reward_grid, parents_grid)
+    pmf = torch.softmax(logp, dim=1)
+
+    return pmf.detach().cpu().numpy()
+
+
+def estimate_ground_truth_reward_pmf(
+    parents_df: pd.DataFrame,
+    n_states: int,
+    n_actions: int,
+    card: int,
+    mode: str,
+    n_mc_samples: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    reward_support = np.arange(card, dtype=np.int64)
+
+    states, actions = extract_state_action_arrays(parents_df, n_states, n_actions)
+    base = compute_reward_base_from_arrays(states, actions, mode=mode, card=card)
+
+    pmf = np.zeros((len(parents_df), card), dtype=np.float64)
+    for i in range(len(parents_df)):
+        reward_noise = rng.normal(size=n_mc_samples)
+        rewards = finalize_reward_from_base(base[i], reward_noise, card=card)
+        counts = np.bincount(rewards, minlength=card).astype(np.float64)
+        pmf[i] = counts / counts.sum()
+
+    return reward_support, pmf
+
+
+# ============================================================
+# Backend interface
+# ============================================================
+
+
+@dataclass
+class BackendResult:
+    name: str
+    fit_time: float
+    support: np.ndarray
+    parents_df: pd.DataFrame
+    pmf: np.ndarray
+    artifact: Optional[object] = None
+
+
+class RewardBackend:
+    name: str
+
+    def fit_reward_pmf(
+        self,
+        dag: nx.DiGraph,
+        df: pd.DataFrame,
+        reward_support: Optional[Sequence[int]] = None,
+    ) -> BackendResult:
+        raise NotImplementedError
+
+    def infer_reward_posterior(
+        self,
+        result: BackendResult,
+        evidence_df: pd.DataFrame,
+        reward_support: Sequence[int],
+        **kwargs,
+    ) -> Tuple[np.ndarray, float]:
+        raise NotImplementedError
+
+
+@dataclass
+class GroundTruthBackend(RewardBackend):
+    n_states: int
+    n_actions: int
+    card: int
+    mode: str
+    n_mc_samples: int = 20000
+    seed: int = 42
+
+    name = "ground_truth"
+
+    def fit_reward_pmf(
+        self,
+        dag: nx.DiGraph,
+        df: pd.DataFrame,
+        reward_support: Optional[Sequence[int]] = None,
+    ) -> BackendResult:
+        del dag
+        t0 = time.time()
+
+        parents_df = get_parent_combinations(df)
+        support, pmf = estimate_ground_truth_reward_pmf(
+            parents_df=parents_df,
+            n_states=self.n_states,
+            n_actions=self.n_actions,
+            card=self.card,
+            mode=self.mode,
+            n_mc_samples=self.n_mc_samples,
+            seed=self.seed,
+        )
+
+        if reward_support is not None:
+            reward_support = np.asarray(reward_support, dtype=np.int64)
+            if not np.array_equal(reward_support, support):
+                raise ValueError(
+                    "Ground truth support mismatch: " f"{support} vs {reward_support}"
+                )
+
+        return BackendResult(
+            name=self.name,
+            fit_time=time.time() - t0,
+            support=np.asarray(support),
+            parents_df=parents_df,
+            pmf=pmf,
+            artifact=None,
+        )
+
+
+class PgmpyBackend(RewardBackend):
+    name = "pgmpy"
+
+    def fit_reward_pmf(
+        self,
+        dag: nx.DiGraph,
+        df: pd.DataFrame,
+        reward_support: Optional[Sequence[int]] = None,
+    ) -> BackendResult:
+        from pgmpy.estimators import MaximumLikelihoodEstimator
+        from pgmpy.models import BayesianNetwork
+
+        bn = BayesianNetwork(dag.edges)
+        t0 = time.time()
+
+        mle_est = MaximumLikelihoodEstimator(model=bn, data=df)
+        cpds = [mle_est.estimate_cpd(node=node) for node in bn.nodes()]
+        bn.add_cpds(*cpds)
+        bn.check_model()
+        cpd = bn.get_cpds("reward")
+
+        parents_df = get_parent_combinations(df)
+        support, pmf = pgmpy_reward_pmf(cpd, parents_df, reward_support=reward_support)
+
+        return BackendResult(
+            name=self.name,
+            fit_time=time.time() - t0,
+            support=np.asarray(support),
+            parents_df=parents_df,
+            pmf=pmf,
+            artifact=bn,
+        )
+
+    def infer_reward_posterior(
+        self,
+        result: BackendResult,
+        evidence_df: pd.DataFrame,
+        reward_support: Sequence[int],
+        **kwargs,
+    ) -> Tuple[np.ndarray, float]:
+        from pgmpy.inference import VariableElimination
+
+        model = result.artifact
+        if model is None:
+            raise ValueError("pgmpy backend missing fitted model for inference")
+
+        reward_support = np.asarray(reward_support, dtype=np.int64)
+        reward_cpd = model.get_cpds("reward")
+        state_names = getattr(reward_cpd, "state_names", None) or {}
+        reward_states = state_names.get("reward") or list(reward_support)
+        reward_index = {v: i for i, v in enumerate(reward_states)}
+
+        inference = VariableElimination(model)
+        pmf = np.zeros((len(evidence_df), len(reward_support)), dtype=np.float64)
+        evidence_cols = list(evidence_df.columns)
+
+        t = 0
+        for i, row in enumerate(evidence_df.itertuples(index=False, name=None)):
+            evidence = {col: int(val) for col, val in zip(evidence_cols, row)}
+            ttt = time.time()
+            factor = inference.query(
+                variables=["reward"], evidence=evidence, show_progress=False
+            )
+            t += time.time() - ttt
+            values = np.asarray(factor.values).reshape(-1)
+            if list(reward_support) != list(reward_states):
+                aligned = np.zeros(len(reward_support), dtype=np.float64)
+                for idx, v in enumerate(reward_support):
+                    if v in reward_index:
+                        aligned[idx] = values[reward_index[v]]
+                pmf[i] = aligned
+            else:
+                pmf[i] = values
+
+        return pmf, t
+
+
+@dataclass
+class VBNBackend(RewardBackend):
+    cpd_name: str
+    inf_method: str = "monte_carlo_marginalization"
+    inf_n_samples: int = 512
+    seed: int = 42
+
+    @property
+    def name(self) -> str:
+        return f"vbn_{self.cpd_name}"
+
+    def fit_reward_pmf(
+        self,
+        dag: nx.DiGraph,
+        df: pd.DataFrame,
+        reward_support: Optional[Sequence[int]] = None,
+    ) -> BackendResult:
+        from vbn import defaults, VBN
+
+        vbn = VBN(dag, seed=self.seed)
+        fit_conf = {"batch_size": max(1, int(len(df) / 4))}
+
+        vbn.set_learning_method(
+            method=defaults.learning("node_wise"),
+            nodes_cpds={
+                feat: {**defaults.cpd(self.cpd_name), "fit": dict(fit_conf)}
+                for feat in dag.nodes
+            },
+        )
+
+        t0 = time.time()
+        vbn.fit(df, verbosity=0)
+        vbn.set_inference_method(self.inf_method, n_samples=self.inf_n_samples)
+
+        parents_df = get_parent_combinations(df)
+        handle = vbn.get_cpd("reward")
+
+        if reward_support is None:
+            reward_support = np.sort(df["reward"].unique())
+
+        pmf = vbn_reward_pmf(
+            handle,
+            parents_df,
+            reward_support=reward_support,
+            device=vbn.device,
+        )
+
+        return BackendResult(
+            name=self.name,
+            fit_time=time.time() - t0,
+            support=np.asarray(reward_support),
+            parents_df=parents_df,
+            pmf=pmf,
+            artifact=vbn,
+        )
+
+    def infer_reward_posterior(
+        self,
+        result: BackendResult,
+        evidence_df: pd.DataFrame,
+        reward_support: Sequence[int],
+        **kwargs,
+    ) -> Tuple[np.ndarray, float]:
+        vbn = result.artifact
+        if vbn is None:
+            raise ValueError("VBN backend missing fitted model for inference")
+
+        n_samples = int(kwargs.get("n_samples", self.inf_n_samples))
+        batch_size = int(kwargs.get("batch_size", 256))
+        batch_size = max(1, batch_size)
+        reward_support = np.asarray(reward_support, dtype=np.int64)
+
+        pmf = np.zeros((len(evidence_df), len(reward_support)), dtype=np.float64)
+        if len(evidence_df) == 0:
+            return pmf
+
+        evidence_cols = list(evidence_df.columns)
+        infer_weights = self.inf_method.lower() != "monte_carlo_marginalization"
+
+        t = 0
+        for start in range(0, len(evidence_df), batch_size):
+            end = min(start + batch_size, len(evidence_df))
+            batch = evidence_df.iloc[start:end]
+            evidence = {col: batch[col].to_numpy() for col in evidence_cols}
+            query = {"target": "reward", "evidence": evidence}
+            with torch.no_grad():
+                ttt = time.time()
+                weights, samples = vbn.infer_posterior(query, n_samples=n_samples)
+                t += time.time() - ttt
+            weights_np = weights.detach().cpu().numpy()
+            samples_np = samples.detach().cpu().numpy()
+            if not infer_weights:
+                weights_np = np.ones_like(weights_np, dtype=np.float64)
+            pmf[start:end] = weighted_samples_to_pmf(
+                samples_np, weights_np, reward_support
+            )
+
+        return pmf, t
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+
+def initialize_logs(
+    evaluated_backends: Sequence[RewardBackend],
+    metrics: Sequence[str] = ("kl", "js", "ws", "fit_time"),
+    track_ground_truth_time: bool = False,
+) -> Dict[str, Dict[str, List[float]]]:
+    evaluated_names = [b.name for b in evaluated_backends]
+
+    logs: Dict[str, Dict[str, List[float]]] = {
+        metric: {name: [] for name in evaluated_names} for metric in metrics
+    }
+
+    if track_ground_truth_time:
+        logs["ground_truth_time"] = []
+
+    return logs
+
+
+def append_metric(
+    logs: Dict[str, Dict[str, List[float]]],
+    metric_name: str,
+    algo_name: str,
+    value: float,
+) -> None:
+    logs[metric_name][algo_name].append(value)
+
+
+def append_fit_time(
+    logs: Dict[str, Dict[str, List[float]]], result: BackendResult
+) -> None:
+    append_metric(logs, "fit_time", result.name, result.fit_time)
+
+
+def append_comparison_metrics(
+    logs: Dict[str, Dict[str, List[float]]],
+    algo_name: str,
+    metrics_dict: Dict[str, float],
+) -> None:
+    for metric_name, value in metrics_dict.items():
+        logs[metric_name][algo_name].append(value)
+
+
+# ============================================================
+# Plotting
+# ============================================================
+
+
+def plot_metrics_grid(
+    cards: Sequence[int],
+    logs: Dict[str, Dict[str, List[float]]],
+    metrics: Sequence[str],
+    title: str = "",
+    out_path: str = None,
+) -> None:
+    n_metrics = len(metrics)
+    n_cols = 2
+    n_rows = int(np.ceil(n_metrics / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, dpi=500, figsize=(10, 3 * n_rows))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    axes = axes.reshape(-1)
+
+    for ax, metric in zip(axes, metrics):
+        for algo, values in logs[metric].items():
+            ax.plot(cards, values, marker="o", label=algo)
+        ax.set_xlabel("cardinality")
+        ax.set_ylabel(metric)
+        ax.set_title(metric)
+        ax.grid(True)
+        ax.legend(loc="best")
+
+    for ax in axes[n_metrics:]:
+        ax.axis("off")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    if out_path is not None:
+        plt.savefig(out_path)
+    plt.show()
+
+
+# ============================================================
+# Experiment
+# ============================================================
+
+
+def run_single_experiment(
+    n_states: int,
+    n_actions: int,
+    exp_cfg: ExperimentConfig,
+    evaluated_backends: Sequence[RewardBackend],
+) -> Tuple[Dict[str, Dict[str, List[float]]], Dict[str, Dict[str, List[float]]]]:
+
+    logs = initialize_logs(evaluated_backends, metrics=exp_cfg.metrics)
+    inference_logs = initialize_logs(
+        evaluated_backends, metrics=exp_cfg.inference_metrics
+    )
+
+    for card in tqdm(exp_cfg.cards, desc=f"#states={n_states}, #actions={n_actions}"):
+        dag = get_rl_dag(n_states, n_actions)
+
+        data_cfg = DataConfig(
+            card=card,
+            n_samples_df=exp_cfg.n_samples_df,
+            n_states=n_states,
+            n_actions=n_actions,
+            mode=exp_cfg.mode,
+            seed=exp_cfg.seed,
+        )
+        df = define_df(data_cfg)
+
+        reward_support = get_reward_support(df, card=card)
+
+        ground_truth_backend = GroundTruthBackend(
+            n_states=n_states,
+            n_actions=n_actions,
+            card=card,
+            mode=exp_cfg.mode,
+            n_mc_samples=exp_cfg.n_mc_ground_truth,
+            seed=exp_cfg.seed,
+        )
+        ground_truth = ground_truth_backend.fit_reward_pmf(
+            dag, df, reward_support=reward_support
+        )
+        validate_backend_result(ground_truth, reward_support)
+
+        inference_queries = sample_inference_queries(
+            df,
+            n_states=n_states,
+            n_actions=n_actions,
+            n_queries=exp_cfg.n_inference_queries,
+            seed=exp_cfg.inference_seed,
+            include_actions=True,
+        )
+        n_mc_inference = (
+            exp_cfg.n_mc_ground_truth
+            if exp_cfg.n_mc_inference_ground_truth is None
+            else exp_cfg.n_mc_inference_ground_truth
+        )
+        gt_inference_support, gt_inference_pmf = estimate_ground_truth_inference_pmf(
+            inference_queries,
+            n_states=n_states,
+            n_actions=n_actions,
+            card=card,
+            mode=exp_cfg.mode,
+            n_mc_samples=n_mc_inference,
+            seed=exp_cfg.inference_seed + 10_000 + card,
+        )
+        if not np.array_equal(gt_inference_support, reward_support):
+            raise ValueError(
+                "Ground truth inference support mismatch: "
+                f"{gt_inference_support} vs {reward_support}"
+            )
+        validate_pmf(gt_inference_pmf, "ground_truth_inference")
+
+        for backend in evaluated_backends:
+            result = backend.fit_reward_pmf(dag, df, reward_support=reward_support)
+            validate_backend_result(result, reward_support)
+            append_fit_time(logs, result)
+
+            if not ground_truth.parents_df.equals(result.parents_df):
+                raise ValueError(
+                    f"Parents mismatch between {ground_truth.name} and {result.name}"
+                )
+
+            metrics_dict = compare_reward_cpds(
+                reference_pmf=ground_truth.pmf,
+                candidate_pmf=result.pmf,
+                support=reward_support,
+            )
+            append_comparison_metrics(logs, result.name, metrics_dict)
+
+            inferred_pmf, inference_time = backend.infer_reward_posterior(
+                result,
+                inference_queries,
+                reward_support,
+                n_samples=exp_cfg.vbn_inference_n_samples,
+                batch_size=exp_cfg.vbn_inference_batch_size,
+            )
+            validate_pmf(inferred_pmf, f"{result.name}_inference")
+            inference_metrics = compare_reward_cpds(
+                reference_pmf=gt_inference_pmf,
+                candidate_pmf=inferred_pmf,
+                support=reward_support,
+            )
+            append_comparison_metrics(inference_logs, result.name, inference_metrics)
+            append_metric(inference_logs, "inference_time", result.name, inference_time)
+
+        del df
+
+    return logs, inference_logs
+
+
+def run_experiments(exp_cfg: ExperimentConfig) -> None:
+    evaluated_backends = [
+        PgmpyBackend(),
+        VBNBackend(
+            cpd_name="kde",
+            inf_method=exp_cfg.vbn_inference_method,
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+        ),
+    ]
+
+    for n_states in exp_cfg.n_states_list:
+        for n_actions in exp_cfg.n_actions_list:
+            cpd_logs, inference_logs = run_single_experiment(
+                n_states=n_states,
+                n_actions=n_actions,
+                exp_cfg=exp_cfg,
+                evaluated_backends=evaluated_backends,
+            )
+
+            prefix = f"#states: {n_states}, #actions: {n_actions}"
+            plot_metrics_grid(
+                cards=exp_cfg.cards,
+                logs=cpd_logs,
+                metrics=exp_cfg.metrics,
+                title=f"{prefix} - CPD metrics",
+                out_path="stress_test/cpd.png",
+            )
+            plot_metrics_grid(
+                cards=exp_cfg.cards,
+                logs=inference_logs,
+                metrics=exp_cfg.inference_metrics,
+                title=f"{prefix} - Inference metrics",
+                out_path="stress_test/inference.png",
+            )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+    exp_cfg = ExperimentConfig(
+        n_samples_df=32000,
+        mode="linear",
+    )
+    run_experiments(exp_cfg)
+
+    # TODO: 1) update and save logs every time 2) plot separated 3) device vbn

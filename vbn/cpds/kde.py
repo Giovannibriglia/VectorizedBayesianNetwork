@@ -36,6 +36,7 @@ class KDECPD(BaseCPD):
         )
         self.max_points = int(max_points)
         self.min_scale = float(min_scale)
+        self._chunk_size = 512
         self._parents: Optional[torch.Tensor] = None
         self._targets: Optional[torch.Tensor] = None
 
@@ -64,11 +65,23 @@ class KDECPD(BaseCPD):
         if self._targets is None:
             raise RuntimeError("KDECPD is not fitted yet.")
 
+    def _limit_points(
+        self, parents: torch.Tensor, targets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n = targets.shape[0]
+        if n <= self.max_points:
+            return parents, targets
+        idx = torch.randperm(n, device=targets.device)[: self.max_points]
+        return parents[idx], targets[idx]
+
     def fit(self, parents: Optional[torch.Tensor], x: torch.Tensor, **kwargs) -> None:
         if parents is None:
             parents = torch.zeros(x.shape[0], 0, device=self.device)
-        self._parents = ensure_2d(parents)
-        self._targets = ensure_2d(x)
+        parents = ensure_2d(parents)
+        targets = ensure_2d(x)
+        parents, targets = self._limit_points(parents, targets)
+        self._parents = parents
+        self._targets = targets
         if self._parents.shape[0] != self._targets.shape[0]:
             raise ValueError("parents and x must have the same number of rows")
 
@@ -83,14 +96,14 @@ class KDECPD(BaseCPD):
             self._parents = parents
             self._targets = x
             return
-        self._parents = torch.cat([self._parents, parents], dim=0)
-        self._targets = torch.cat([self._targets, x], dim=0)
-        if self._targets.shape[0] > self.max_points:
-            self._parents = self._parents[-self.max_points :]
-            self._targets = self._targets[-self.max_points :]
+        parents_all = torch.cat([self._parents, parents], dim=0)
+        targets_all = torch.cat([self._targets, x], dim=0)
+        parents_all, targets_all = self._limit_points(parents_all, targets_all)
+        self._parents = parents_all
+        self._targets = targets_all
 
     def _kernel_log_prob(self, diff: torch.Tensor, bandwidth: float) -> torch.Tensor:
-        scale = bandwidth + self.min_scale
+        scale = max(float(bandwidth), 1e-3) + self.min_scale
         return -0.5 * (
             (diff / scale) ** 2 + math.log(2 * math.pi) + 2 * math.log(scale)
         )
@@ -106,45 +119,64 @@ class KDECPD(BaseCPD):
         targets = self._targets
         b, s, dx = x.shape
         n = targets.shape[0]
-        diff_y = x.unsqueeze(2) - targets.view(1, 1, n, dx)
-        log_ky = self._kernel_log_prob(diff_y, self.bandwidth).sum(dim=-1)  # [B,S,N]
+        flat_x = x.reshape(b * s, dx)
+        flat_parents = None
+        if self.input_dim != 0:
+            if parents is None:
+                raise ValueError("parents cannot be None when input_dim > 0")
+            parents = broadcast_samples(parents, s)
+            flat_parents = parents.reshape(b * s, self.input_dim)
 
-        if self.input_dim == 0:
-            log_prob = torch.logsumexp(log_ky, dim=2) - math.log(n)
-            return log_prob
-
-        if parents is None:
-            raise ValueError("parents cannot be None when input_dim > 0")
-        parents = broadcast_samples(parents, s)
-        diff_p = parents.unsqueeze(2) - self._parents.view(1, 1, n, self.input_dim)
-        log_kp = self._kernel_log_prob(diff_p, self.parent_bandwidth).sum(dim=-1)
-        log_weights = log_kp
-        log_prob = torch.logsumexp(log_weights + log_ky, dim=2) - torch.logsumexp(
-            log_weights, dim=2
-        )
+        chunks = []
+        for start in range(0, flat_x.shape[0], self._chunk_size):
+            end = min(start + self._chunk_size, flat_x.shape[0])
+            x_chunk = flat_x[start:end]
+            diff_y = x_chunk.unsqueeze(1) - targets.unsqueeze(0)
+            log_ky = self._kernel_log_prob(diff_y, self.bandwidth).sum(dim=-1)
+            if self.input_dim == 0:
+                log_prob_chunk = torch.logsumexp(log_ky, dim=1) - math.log(float(n))
+            else:
+                parents_chunk = flat_parents[start:end]
+                diff_p = parents_chunk.unsqueeze(1) - self._parents.unsqueeze(0)
+                log_kp = self._kernel_log_prob(diff_p, self.parent_bandwidth).sum(
+                    dim=-1
+                )
+                log_prob_chunk = torch.logsumexp(
+                    log_kp + log_ky, dim=1
+                ) - torch.logsumexp(log_kp, dim=1)
+            chunks.append(log_prob_chunk)
+        log_prob = torch.cat(chunks, dim=0).reshape(b, s)
         return log_prob
 
     def sample(self, parents: Optional[torch.Tensor], n_samples: int) -> torch.Tensor:
         self._check_fitted()
         targets = self._targets
         n = targets.shape[0]
-        if self.input_dim == 0:
-            b = 1 if parents is None else parents.shape[0]
-            weights = torch.full((b, n_samples, n), 1.0 / n, device=self.device)
-        else:
+        b = 1 if parents is None else parents.shape[0]
+        flat_out = torch.empty(
+            b * n_samples, self.output_dim, device=targets.device, dtype=targets.dtype
+        )
+        flat_parents = None
+        if self.input_dim != 0:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")
             parents = broadcast_samples(parents, n_samples)
-            diff_p = parents.unsqueeze(2) - self._parents.view(1, 1, n, self.input_dim)
-            log_kp = self._kernel_log_prob(diff_p, self.parent_bandwidth).sum(dim=-1)
-            weights = torch.softmax(log_kp, dim=-1)
-        b, s, _ = weights.shape
-        idx = torch.multinomial(weights.reshape(b * s, n), num_samples=1).reshape(b, s)
-        idx_exp = idx.unsqueeze(-1).expand(-1, -1, self.output_dim)
-        selected = torch.gather(
-            targets.unsqueeze(0).unsqueeze(0).expand(b, s, -1, -1),
-            dim=2,
-            index=idx_exp.unsqueeze(2),
-        ).squeeze(2)
-        noise = torch.randn_like(selected) * (self.bandwidth + self.min_scale)
-        return selected + noise
+            flat_parents = parents.reshape(b * n_samples, self.input_dim)
+
+        bw = max(float(self.bandwidth), 1e-3)
+        for start in range(0, flat_out.shape[0], self._chunk_size):
+            end = min(start + self._chunk_size, flat_out.shape[0])
+            if self.input_dim == 0:
+                idx = torch.randint(0, n, (end - start,), device=targets.device)
+            else:
+                parents_chunk = flat_parents[start:end]
+                diff_p = parents_chunk.unsqueeze(1) - self._parents.unsqueeze(0)
+                log_kp = self._kernel_log_prob(diff_p, self.parent_bandwidth).sum(
+                    dim=-1
+                )
+                weights = torch.softmax(log_kp, dim=-1)
+                idx = torch.multinomial(weights, num_samples=1).squeeze(-1)
+            selected = targets[idx]
+            noise = torch.randn_like(selected) * (bw + self.min_scale)
+            flat_out[start:end] = selected + noise
+        return flat_out.reshape(b, n_samples, self.output_dim)

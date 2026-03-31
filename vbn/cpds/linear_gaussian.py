@@ -81,29 +81,49 @@ class LinearGaussianCPD(BaseCPD):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if parents.shape[0] == 0:
             raise ValueError("Cannot fit LinearGaussianCPD with zero rows")
+        if self.input_dim == 0:
+            mean = x.mean(dim=0)
+            std = x.std(dim=0, unbiased=False).clamp_min(1e-6)
+            weight = torch.zeros(0, self.output_dim, device=self.device, dtype=x.dtype)
+            bias = mean
+            var = std**2
+            return weight, bias, var
+
         n = parents.shape[0]
         ones = torch.ones(n, 1, device=self.device, dtype=x.dtype)
         x_aug = torch.cat([parents, ones], dim=1)
-        xtx = x_aug.T @ x_aug
         reg = float(ridge)
         if reg < 0:
             raise ValueError("ridge must be >= 0")
-        eye = torch.eye(xtx.shape[0], device=self.device, dtype=x.dtype)
-        eye[-1, -1] = 0.0  # Do not penalize the bias term.
-        xtx_reg = xtx + reg * eye
-        xty = x_aug.T @ x
-        try:
-            w_aug = torch.linalg.solve(xtx_reg, xty)
-        except RuntimeError:
-            w_aug = torch.linalg.pinv(xtx_reg) @ xty
+        if reg > 0:
+            eye = torch.eye(self.input_dim, device=self.device, dtype=x.dtype)
+            reg_block = torch.cat(
+                [
+                    math.sqrt(reg) * eye,
+                    torch.zeros(self.input_dim, 1, device=self.device, dtype=x.dtype),
+                ],
+                dim=1,
+            )
+            x_reg = torch.cat([x_aug, reg_block], dim=0)
+            y_reg = torch.cat(
+                [
+                    x,
+                    torch.zeros(
+                        self.input_dim, x.shape[1], device=self.device, dtype=x.dtype
+                    ),
+                ],
+                dim=0,
+            )
+        else:
+            x_reg = x_aug
+            y_reg = x
 
-        weight = w_aug[:-1]
-        bias = w_aug[-1]
-        resid = x - x_aug @ w_aug
-        var = (resid**2).mean(dim=0)
-        min_var = float(self.min_scale) ** 2
-        var = torch.clamp(var, min=min_var)
-        return weight, bias, var
+        theta = torch.linalg.lstsq(x_reg, y_reg).solution
+        weight = theta[:-1]
+        bias = theta[-1]
+        residual = x - x_aug @ theta
+        sigma2 = residual.var(dim=0).clamp_min(1e-6)
+        return weight, bias, sigma2
 
     def fit(
         self,
@@ -123,6 +143,8 @@ class LinearGaussianCPD(BaseCPD):
         self._weight.copy_(weight)
         self._bias.copy_(bias)
         self._var.copy_(var)
+        self.theta = torch.cat([weight, bias.unsqueeze(0)], dim=0)
+        self.sigma = torch.sqrt(var)
 
     def update(
         self,

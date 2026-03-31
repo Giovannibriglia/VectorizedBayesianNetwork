@@ -1,5 +1,5 @@
 name: softmax_nn
-n_classes: 10
+n_classes: 8
 hidden_dims: [32, 32]
 activation: relu
 label_smoothing: 0.0
@@ -7,7 +7,7 @@ min_bin_width: 1e-12
 binning: "quantile"
 within_bin: "triangular"
 fit:
-  epochs: 50
+  epochs: 100
   batch_size: 4096
   lr: 1e-3
   weight_decay: 0.0

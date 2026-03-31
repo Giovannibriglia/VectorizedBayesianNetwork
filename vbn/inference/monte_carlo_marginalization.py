@@ -1,59 +1,92 @@
 from __future__ import annotations
 
-from typing import Dict
-
 import torch
 
 from vbn.core.base import Query
 from vbn.core.registry import register_inference
-from vbn.core.utils import ensure_2d
+from vbn.inference._core import get_inference_state, prepare_fixed_values, resolve_dtype
 from vbn.utils import infer_batch_size
-from vbn.utils.interventions import get_fixed_value, is_intervened
-
-
-def _concat_parent_samples(
-    samples: Dict[str, torch.Tensor], parents: list[str]
-) -> torch.Tensor | None:
-    if not parents:
-        return None
-    return torch.cat([samples[p] for p in parents], dim=-1)
-
-
-def _ancestral_sample(vbn, query: Query, n_samples: int) -> Dict[str, torch.Tensor]:
-    b = infer_batch_size(query.evidence, query.do)
-    samples: Dict[str, torch.Tensor] = {}
-    for node in vbn.dag.topological_order():
-        fixed = get_fixed_value(node, query)
-        if fixed is not None:
-            value = ensure_2d(fixed).to(vbn.device)
-            value = value.unsqueeze(1).expand(b, n_samples, -1)
-        else:
-            parents = vbn.dag.parents(node)
-            if parents:
-                parent_tensor = torch.cat([samples[p] for p in parents], dim=-1)
-            else:
-                parent_tensor = torch.zeros(b, 0, device=vbn.device)
-            value = vbn.nodes[node].sample(parent_tensor, n_samples)
-        samples[node] = value
-    return samples
+from vbn.utils.interventions import is_intervened
 
 
 @register_inference("monte_carlo_marginalization")
 class MonteCarloMarginalization:
     def __init__(self, n_samples: int = 200, **kwargs) -> None:
         self.n_samples = int(n_samples)
+        self._cache = {}
 
     def infer_posterior(self, vbn, query: Query, **kwargs):
         n_samples = int(kwargs.get("n_samples", self.n_samples))
-        samples = _ancestral_sample(vbn, query, n_samples)
-        target_samples = samples[query.target]
+        b = infer_batch_size(query.evidence, query.do)
+        state = get_inference_state(vbn, query, self._cache)
+        device = vbn.device
+        dtype = resolve_dtype(vbn, query)
+
+        fixed_values = prepare_fixed_values(query, state, device, dtype)
+        target_idx = state.target_idx
+        target_slice = state.node_slices[target_idx]
+        target_cpd = vbn.nodes[state.topo_order[target_idx]]
+
+        parents_idx = state.parent_idx[target_idx]
+        parents_observed = all(fixed_values[p] is not None for p in parents_idx)
+
         if is_intervened(query.target, query):
-            pdf = torch.ones(
-                target_samples.shape[0], target_samples.shape[1], device=vbn.device
-            )
-        else:
-            parents = vbn.dag.parents(query.target)
-            parent_tensor = _concat_parent_samples(samples, parents)
-            log_prob = vbn.nodes[query.target].log_prob(target_samples, parent_tensor)
+            target_value = fixed_values[target_idx]
+            target_samples = target_value.unsqueeze(1).expand(b, n_samples, -1)
+            pdf = torch.ones(b, n_samples, device=device, dtype=dtype)
+            return pdf, target_samples
+
+        if parents_observed:
+            if parents_idx:
+                parent_tensor = torch.cat(
+                    [
+                        fixed_values[p].unsqueeze(1).expand(b, n_samples, -1)
+                        for p in parents_idx
+                    ],
+                    dim=-1,
+                )
+            else:
+                parent_tensor = None
+            if fixed_values[target_idx] is not None:
+                target_samples = (
+                    fixed_values[target_idx].unsqueeze(1).expand(b, n_samples, -1)
+                )
+            else:
+                target_samples = target_cpd.sample(parent_tensor, n_samples)
+            log_prob = target_cpd.log_prob(target_samples, parent_tensor)
             pdf = torch.exp(log_prob)
+            return pdf, target_samples
+
+        samples = torch.zeros(b, n_samples, state.total_dim, device=device, dtype=dtype)
+        nodes = state.topo_order
+        cpds = [vbn.nodes[node] for node in nodes]
+
+        for idx, node in enumerate(nodes):
+            node_slice = state.node_slices[idx]
+            fixed = fixed_values[idx]
+            if fixed is not None:
+                value = fixed.unsqueeze(1).expand(b, n_samples, -1)
+                samples[..., node_slice] = value
+                continue
+            parent_slices = state.parent_slices[idx]
+            if parent_slices:
+                parent_tensor = torch.cat(
+                    [samples[..., sl] for sl in parent_slices], dim=-1
+                )
+            else:
+                parent_tensor = None
+            samples[..., node_slice] = cpds[idx].sample(parent_tensor, n_samples)
+
+        target_samples = samples[..., target_slice]
+        log_prob = target_cpd.log_prob(
+            target_samples,
+            (
+                torch.cat(
+                    [samples[..., sl] for sl in state.parent_slices[target_idx]], dim=-1
+                )
+                if state.parent_slices[target_idx]
+                else None
+            ),
+        )
+        pdf = torch.exp(log_prob)
         return pdf, target_samples

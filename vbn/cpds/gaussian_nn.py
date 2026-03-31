@@ -10,6 +10,7 @@ from vbn.config_cast import coerce_numbers, UPDATE_SCHEMA
 from vbn.core.base import BaseCPD
 from vbn.core.registry import register_cpd
 from vbn.core.utils import broadcast_samples, ensure_2d, flatten_samples
+from vbn.cpds.utils import safe_softplus
 
 
 def _build_mlp(
@@ -50,9 +51,16 @@ class GaussianNNCPD(BaseCPD):
         super().__init__(
             input_dim=input_dim, output_dim=output_dim, device=device, seed=seed
         )
+        self.n_parents = self.input_dim
         self.hidden_dims = tuple(int(h) for h in hidden_dims)
         self.activation = str(activation)
         self.min_scale = float(min_scale)
+        self.register_buffer("mean_x", torch.zeros(self.input_dim, device=self.device))
+        self.register_buffer("std_x", torch.ones(self.input_dim, device=self.device))
+        self.register_buffer("mean_y", torch.zeros(self.output_dim, device=self.device))
+        self.register_buffer("std_y", torch.ones(self.output_dim, device=self.device))
+        self.register_buffer("_stats_ready", torch.tensor(False, device=self.device))
+        self._root_dist: Optional[torch.distributions.Normal] = None
         if self.input_dim == 0:
             self._loc = nn.Parameter(torch.zeros(self.output_dim, device=self.device))
             self._log_scale = nn.Parameter(
@@ -79,6 +87,37 @@ class GaussianNNCPD(BaseCPD):
             parents = torch.zeros(x.shape[0], 0, device=self.device)
         return ensure_2d(parents), ensure_2d(x)
 
+    def _update_standardization(self, parents: torch.Tensor, x: torch.Tensor) -> None:
+        if parents.numel() == 0:
+            mean_x = torch.zeros(self.input_dim, device=self.device, dtype=x.dtype)
+            std_x = torch.ones(self.input_dim, device=self.device, dtype=x.dtype)
+        else:
+            mean_x = parents.mean(dim=0)
+            std_x = parents.std(dim=0, unbiased=False).clamp_min(1e-6)
+        mean_y = x.mean(dim=0)
+        std_y = x.std(dim=0, unbiased=False).clamp_min(1e-6)
+        self.mean_x.copy_(mean_x.to(self.mean_x.device, dtype=self.mean_x.dtype))
+        self.std_x.copy_(std_x.to(self.std_x.device, dtype=self.std_x.dtype))
+        self.mean_y.copy_(mean_y.to(self.mean_y.device, dtype=self.mean_y.dtype))
+        self.std_y.copy_(std_y.to(self.std_y.device, dtype=self.std_y.dtype))
+        self._stats_ready.fill_(True)
+
+    def _normalize_parents(self, parents: torch.Tensor) -> torch.Tensor:
+        if self.input_dim == 0:
+            return parents
+        mean_x = self.mean_x.to(device=parents.device, dtype=parents.dtype).view(
+            1, 1, -1
+        )
+        std_x = self.std_x.to(device=parents.device, dtype=parents.dtype).view(1, 1, -1)
+        return (parents - mean_x) / std_x
+
+    def _denormalize_loc_scale(
+        self, loc: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mean_y = self.mean_y.to(device=loc.device, dtype=loc.dtype).view(1, 1, -1)
+        std_y = self.std_y.to(device=loc.device, dtype=loc.dtype).view(1, 1, -1)
+        return loc * std_y + mean_y, scale * std_y
+
     def _train_loop(
         self,
         parents: Optional[torch.Tensor],
@@ -99,6 +138,7 @@ class GaussianNNCPD(BaseCPD):
             params["n_steps"] = n_steps
         params = coerce_numbers(params, UPDATE_SCHEMA | {"epochs": int})
         parents, x = self._prepare_training_tensors(parents, x)
+        self._update_standardization(parents, x)
         epochs = params["epochs"]
         lr = params["lr"]
         batch_size = params["batch_size"]
@@ -166,31 +206,42 @@ class GaussianNNCPD(BaseCPD):
         self, parents: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.input_dim == 0:
-            loc = self._loc
-            scale = torch.nn.functional.softplus(self._log_scale) + self.min_scale
+            loc = self._loc.view(1, 1, -1)
+            scale = safe_softplus(self._log_scale, min_val=self.min_scale).view(
+                1, 1, -1
+            )
+            loc, scale = self._denormalize_loc_scale(loc, scale)
+            self._root_dist = torch.distributions.Normal(
+                loc.squeeze(0).squeeze(0), scale.squeeze(0).squeeze(0)
+            )
             return loc, scale
 
         if parents is None:
             raise ValueError("parents cannot be None when input_dim > 0")
         if parents.dim() == 2:
             parents = parents.unsqueeze(1)
+        parents = self._normalize_parents(parents)
         flat, b, s = flatten_samples(parents)
         out = self.net(flat)
         out = out.reshape(b, s, self.output_dim * 2)
         loc = out[..., : self.output_dim]
         log_scale = out[..., self.output_dim :]
-        scale = torch.nn.functional.softplus(log_scale) + self.min_scale
+        scale = safe_softplus(log_scale, min_val=self.min_scale)
+        loc, scale = self._denormalize_loc_scale(loc, scale)
         return loc, scale
 
     def sample(self, parents: Optional[torch.Tensor], n_samples: int) -> torch.Tensor:
         if self.input_dim == 0:
             b = 1 if parents is None else parents.shape[0]
-            loc = self._loc.view(1, 1, -1).expand(b, n_samples, -1)
-            scale = (
-                (torch.nn.functional.softplus(self._log_scale) + self.min_scale)
-                .view(1, 1, -1)
-                .expand(b, n_samples, -1)
+            loc = self._loc.view(1, 1, -1)
+            scale = safe_softplus(self._log_scale, min_val=self.min_scale).view(
+                1, 1, -1
             )
+            loc, scale = self._denormalize_loc_scale(loc, scale)
+            self._root_dist = torch.distributions.Normal(
+                loc.squeeze(0).squeeze(0), scale.squeeze(0).squeeze(0)
+            )
+            return self._root_dist.sample((b, n_samples))
         else:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")
@@ -207,13 +258,15 @@ class GaussianNNCPD(BaseCPD):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         if self.input_dim == 0:
-            b, s, _ = x.shape
-            loc = self._loc.view(1, 1, -1).expand(b, s, -1)
-            scale = (
-                (torch.nn.functional.softplus(self._log_scale) + self.min_scale)
-                .view(1, 1, -1)
-                .expand(b, s, -1)
+            loc = self._loc.view(1, 1, -1)
+            scale = safe_softplus(self._log_scale, min_val=self.min_scale).view(
+                1, 1, -1
             )
+            loc, scale = self._denormalize_loc_scale(loc, scale)
+            self._root_dist = torch.distributions.Normal(
+                loc.squeeze(0).squeeze(0), scale.squeeze(0).squeeze(0)
+            )
+            return self._root_dist.log_prob(x).sum(dim=-1)
         else:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")

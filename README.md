@@ -133,6 +133,17 @@ new_df = df.sample(64)
 vbn.update(new_df, update_method="online_sgd")
 ```
 
+## CPD Access
+```python
+handle = vbn.get_cpd("feature_2")
+print(handle.summary())
+
+cond = handle.conditional({"feature_0": [0.2], "feature_1": [-0.1]})
+print(cond)
+
+samples = handle.conditional_samples({"feature_0": [0.2], "feature_1": [-0.1]}, n_samples=256)
+```
+
 ## Per-CPD Training Hyperparameters
 Training hyperparameters are defined per CPD under `fit` and `update`. The learning config is orchestration-only.
 

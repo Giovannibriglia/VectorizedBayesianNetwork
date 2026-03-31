@@ -1,22 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict
-
 import torch
 
 from vbn.core.base import Query
 from vbn.core.registry import register_inference
-from vbn.core.utils import ensure_2d
+from vbn.inference._core import get_inference_state, prepare_fixed_values, resolve_dtype
 from vbn.utils import infer_batch_size
-from vbn.utils.interventions import get_fixed_value
-
-
-def _concat_parent_samples(
-    samples: Dict[str, torch.Tensor], parents: list[str]
-) -> torch.Tensor | None:
-    if not parents:
-        return None
-    return torch.cat([samples[p] for p in parents], dim=-1)
 
 
 @register_inference("likelihood_weighting")
@@ -38,32 +27,53 @@ class LikelihoodWeighting:
         eps = float(kwargs.get("eps", self.eps))
 
         b = infer_batch_size(query.evidence, query.do)
-        samples: Dict[str, torch.Tensor] = {}
-        log_weights = torch.zeros(b, n_samples, device=vbn.device)
+        if not hasattr(self, "_cache"):
+            self._cache = {}
+        state = get_inference_state(vbn, query, self._cache)
+        device = vbn.device
+        dtype = resolve_dtype(vbn, query)
 
-        for node in vbn.dag.topological_order():
-            parents = vbn.dag.parents(node)
-            parent_tensor = _concat_parent_samples(samples, parents)
-            fixed = get_fixed_value(node, query)
+        samples = torch.zeros(b, n_samples, state.total_dim, device=device, dtype=dtype)
+        log_weights = torch.zeros(b, n_samples, device=device, dtype=dtype)
+        fixed_values = prepare_fixed_values(query, state, device, dtype, clamp_obs=True)
+        nodes = state.topo_order
+        cpds = [vbn.nodes[node] for node in nodes]
+
+        for idx, node in enumerate(nodes):
+            node_slice = state.node_slices[idx]
+            fixed = fixed_values[idx]
             if fixed is not None:
-                fixed_value = ensure_2d(fixed).to(vbn.device)
-                fixed_value = fixed_value.unsqueeze(1).expand(b, n_samples, -1)
-                samples[node] = fixed_value
-                if node in query.evidence:
-                    # Evidence contributes likelihood; do-interventions do not.
-                    cpd = vbn.nodes[node]
+                fixed_value = fixed.unsqueeze(1).expand(b, n_samples, -1)
+                samples[..., node_slice] = fixed_value
+                if state.evidence_mask[idx]:
+                    parent_slices = state.parent_slices[idx]
+                    if parent_slices:
+                        parent_tensor = torch.cat(
+                            [samples[..., sl] for sl in parent_slices], dim=-1
+                        )
+                    else:
+                        parent_tensor = None
+                    cpd = cpds[idx]
                     if not hasattr(cpd, "log_prob") or not callable(cpd.log_prob):
                         raise NotImplementedError(
                             f"CPD for node '{node}' does not implement log_prob."
                         )
                     log_weights = log_weights + cpd.log_prob(fixed_value, parent_tensor)
-            else:
-                samples[node] = vbn.nodes[node].sample(parent_tensor, n_samples)
+                continue
 
-        target_samples = samples[query.target]
+            parent_slices = state.parent_slices[idx]
+            if parent_slices:
+                parent_tensor = torch.cat(
+                    [samples[..., sl] for sl in parent_slices], dim=-1
+                )
+            else:
+                parent_tensor = None
+            samples[..., node_slice] = cpds[idx].sample(parent_tensor, n_samples)
+
+        target_samples = samples[..., state.node_slices[state.target_idx]]
 
         if normalize:
-            weights = torch.softmax(log_weights, dim=-1)
+            weights = torch.softmax(log_weights, dim=1)
         else:
             # Stabilize exponentiation while keeping unnormalized scale.
             log_weights = log_weights - log_weights.max(dim=-1, keepdim=True).values

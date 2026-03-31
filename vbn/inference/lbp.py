@@ -4,11 +4,8 @@ import torch
 
 from vbn.core.base import Query
 from vbn.core.registry import register_inference
-from vbn.core.utils import ensure_2d
 from vbn.inference.importance_sampling import ImportanceSampling
 from vbn.inference.monte_carlo_marginalization import MonteCarloMarginalization
-from vbn.utils import infer_batch_size
-from vbn.utils.interventions import is_intervened
 
 
 @register_inference("lbp")
@@ -40,9 +37,10 @@ class LoopyBeliefPropagation:
         n_samples = int(kwargs.get("n_samples", self.n_samples))
         n_iters = int(kwargs.get("n_iters", self.n_iters))
         damping = float(kwargs.get("damping", self.damping))
+        tol = float(kwargs.get("tol", 1e-4))
         eps = 1e-12
 
-        b = infer_batch_size(query.evidence, query.do)
+        # b = infer_batch_size(query.evidence, query.do)
         if self.fallback == "monte_carlo_marginalization":
             pdf, target_samples = self._mcm.infer_posterior(
                 vbn, query, n_samples=n_samples
@@ -52,28 +50,19 @@ class LoopyBeliefPropagation:
             weights, target_samples = self._is.infer_posterior(
                 vbn, query, n_samples=n_samples
             )
-
-        if is_intervened(query.target, query):
-            target_samples = (
-                ensure_2d(query.do[query.target])
-                .to(vbn.device)
-                .unsqueeze(1)
-                .expand(b, n_samples, -1)
-            )
-        elif query.target in query.evidence:
-            target_samples = (
-                ensure_2d(query.evidence[query.target])
-                .to(vbn.device)
-                .unsqueeze(1)
-                .expand(b, n_samples, -1)
-            )
-
+        converged = False
         for _ in range(max(n_iters, 0)):
             w_new = torch.clamp(weights, min=eps)
-            w_new = w_new**1.05
             w_new = w_new / (w_new.sum(dim=-1, keepdim=True) + eps)
+            msg = damping * w_new + (1.0 - damping) * weights
+            msg = msg / (msg.sum(dim=-1, keepdim=True) + eps)
+            delta = (msg - weights).abs().max().item()
+            weights = msg
+            if delta < tol:
+                converged = True
+                break
 
-            weights = (1.0 - damping) * weights + damping * w_new
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + eps)
+        if not converged:
+            return self._is.infer_posterior(vbn, query, n_samples=n_samples)
 
         return weights.detach(), target_samples.detach()

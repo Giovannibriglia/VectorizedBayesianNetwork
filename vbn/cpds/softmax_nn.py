@@ -84,6 +84,7 @@ class SoftmaxNNCPD(BaseCPD):
         self.class_weighting = str(class_weighting).lower().strip()
         self.debug = bool(debug)
         self.debug_every = int(debug_every)
+        self.temperature = 1.0
         if self.n_classes <= 0:
             raise ValueError("n_classes must be >= 1")
         if self.binning not in _BINNING_IDS:
@@ -145,6 +146,11 @@ class SoftmaxNNCPD(BaseCPD):
             ),
         )
         self.register_buffer("_bins_ready", torch.tensor(False, device=self.device))
+        self.register_buffer(
+            "_root_log_probs",
+            torch.zeros(self.output_dim, self.n_classes, device=self.device),
+        )
+        self.register_buffer("_root_ready", torch.tensor(False, device=self.device))
 
         self._optimizer: Optional[torch.optim.Optimizer] = None
 
@@ -167,6 +173,9 @@ class SoftmaxNNCPD(BaseCPD):
 
     def _bins_initialized(self) -> bool:
         return bool(self._bins_ready.item())
+
+    def _root_initialized(self) -> bool:
+        return bool(self._root_ready.item())
 
     def _ensure_bins_ready(self) -> None:
         if not self._bins_initialized():
@@ -405,6 +414,9 @@ class SoftmaxNNCPD(BaseCPD):
         params = coerce_numbers(params, UPDATE_SCHEMA | {"epochs": int})
         parents, x_flat = self._prepare_training_tensors(parents, x)
         self._update_bins_from_data(x_flat, allow_expand=allow_expand, force=force_bins)
+        if self.input_dim == 0:
+            self._update_root_from_data(x_flat)
+            return
         epochs = params["epochs"]
         lr = params["lr"]
         batch_size = params["batch_size"]
@@ -430,9 +442,7 @@ class SoftmaxNNCPD(BaseCPD):
             counts = torch.bincount(t_all, minlength=self.n_classes).float()
             weights = counts.sum() / counts.clamp_min(1.0)
             weights = weights / weights.mean().clamp_min(1e-12)
-        loss_fn = nn.CrossEntropyLoss(
-            weight=weights, label_smoothing=self.label_smoothing
-        )
+        eps = float(self.label_smoothing)
         steps = int(n_steps) if n_steps is not None else int(epochs)
         global_step = 0
         for _ in range(steps):
@@ -460,16 +470,25 @@ class SoftmaxNNCPD(BaseCPD):
                         batch_x.shape[0],
                         self.output_dim,
                     ), f"targets shape {tuple(targets.shape)}"
-                logits_flat = logits.reshape(-1, self.n_classes)
-                targets_flat = targets.reshape(-1)
-                loss = loss_fn(logits_flat, targets_flat)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                target_one_hot = torch.nn.functional.one_hot(
+                    targets, num_classes=self.n_classes
+                ).float()
+                if eps > 0:
+                    target_one_hot = (1.0 - eps) * target_one_hot + eps / float(
+                        self.n_classes
+                    )
+                if weights is not None:
+                    weight_view = weights.view(1, 1, -1)
+                    log_probs = log_probs * weight_view
+                loss = -(target_one_hot * log_probs).sum(dim=-1).mean()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 if self.debug and self.debug_every > 0:
                     if global_step % self.debug_every == 0:
                         with torch.no_grad():
-                            t = targets_flat
+                            t = targets.reshape(-1)
                             counts = torch.bincount(t, minlength=self.n_classes).float()
                             probs = counts / counts.sum().clamp_min(1.0)
                             pred = logits.argmax(dim=-1).reshape(-1)
@@ -544,7 +563,7 @@ class SoftmaxNNCPD(BaseCPD):
         flat, b, s = flatten_samples(parents)
         out = self.net(flat)
         out = out.reshape(b, s, self.output_dim, self.n_classes)
-        return out
+        return out / float(self.temperature)
 
     def _gather_bin_edges(
         self, indices: torch.Tensor
@@ -593,9 +612,16 @@ class SoftmaxNNCPD(BaseCPD):
         self._ensure_bins_ready()
         if self.input_dim == 0:
             b = 1 if parents is None else parents.shape[0]
-            logits = self._logits.view(1, 1, self.output_dim, self.n_classes).expand(
-                b, n_samples, -1, -1
-            )
+            if self._root_initialized():
+                logits = self._root_log_probs.view(
+                    1, 1, self.output_dim, self.n_classes
+                ).expand(b, n_samples, -1, -1)
+                logits = torch.log_softmax(logits / float(self.temperature), dim=-1)
+            else:
+                logits = self._logits.view(
+                    1, 1, self.output_dim, self.n_classes
+                ).expand(b, n_samples, -1, -1)
+                logits = logits / float(self.temperature)
         else:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")
@@ -648,9 +674,16 @@ class SoftmaxNNCPD(BaseCPD):
             x = x.unsqueeze(1)
         if self.input_dim == 0:
             b, s, _ = x.shape
-            logits = self._logits.view(1, 1, self.output_dim, self.n_classes).expand(
-                b, s, -1, -1
-            )
+            if self._root_initialized():
+                logits = self._root_log_probs.view(
+                    1, 1, self.output_dim, self.n_classes
+                ).expand(b, s, -1, -1)
+                logits = torch.log_softmax(logits / float(self.temperature), dim=-1)
+            else:
+                logits = self._logits.view(
+                    1, 1, self.output_dim, self.n_classes
+                ).expand(b, s, -1, -1)
+                logits = logits / float(self.temperature)
         else:
             if parents is None:
                 raise ValueError("parents cannot be None when input_dim > 0")
@@ -703,6 +736,24 @@ class SoftmaxNNCPD(BaseCPD):
             log_within = torch.where(mask, log_within, torch.zeros_like(log_within))
 
         return (log_bin + log_within).sum(dim=-1)
+
+    def _update_root_from_data(self, x_flat: torch.Tensor) -> None:
+        targets = self._x_to_bin(x_flat).long()
+        if targets.dim() == 3 and targets.shape[1] == 1:
+            targets = targets.squeeze(1)
+        target_one_hot = torch.nn.functional.one_hot(
+            targets, num_classes=self.n_classes
+        ).float()
+        counts = target_one_hot.sum(dim=0)
+        probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+        eps = float(self.label_smoothing)
+        if eps > 0:
+            probs = (1.0 - eps) * probs + eps / float(self.n_classes)
+        log_probs = torch.log(probs.clamp_min(1e-12))
+        self._root_log_probs.copy_(
+            log_probs.to(self._root_log_probs.device, dtype=self._root_log_probs.dtype)
+        )
+        self._root_ready.fill_(True)
 
     def debug_mode(self) -> dict:
         return {

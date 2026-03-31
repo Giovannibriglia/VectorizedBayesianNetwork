@@ -97,3 +97,32 @@ def to_plain_dict(conf) -> dict:
         f"Unsupported config type '{type(conf).__name__}'. "
         "Expected dict, ConfigItem, dataclass, or pydantic model."
     )
+
+
+def to_serializable(obj, *, max_tensor_elems: int = 2048):
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, torch.device):
+        return str(obj)
+    if isinstance(obj, torch.dtype):
+        return str(obj)
+    if isinstance(obj, torch.Tensor):
+        t = obj.detach()
+        numel = int(t.numel())
+        if numel <= max_tensor_elems:
+            return t.cpu().tolist()
+        return {
+            "type": "tensor",
+            "shape": list(t.shape),
+            "dtype": str(t.dtype),
+            "device": str(t.device),
+            "numel": numel,
+        }
+    if isinstance(obj, dict):
+        return {
+            str(k): to_serializable(v, max_tensor_elems=max_tensor_elems)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        return [to_serializable(v, max_tensor_elems=max_tensor_elems) for v in obj]
+    return str(obj)
