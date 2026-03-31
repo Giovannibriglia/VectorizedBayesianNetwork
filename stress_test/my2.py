@@ -1,6 +1,10 @@
+import json
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+import warnings
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -29,18 +33,96 @@ class ExperimentConfig:
     n_samples_df: int = 32000
     n_states_list: Sequence[int] = (1,)
     n_actions_list: Sequence[int] = (1,)
-    cards: Sequence[int] = (10, 20, 50, 100, 200, 500, 1000)
+    cards: Sequence[int] = (10, 20, 50)  # , 100, 200, 500, 1000
     mode: str = "linear"
     seed: int = 42
     n_mc_ground_truth: int = 20000
     n_mc_inference_ground_truth: Optional[int] = None
-    n_inference_queries: int = 32
+    n_inference_queries: int = 512
     inference_seed: int = 123
     vbn_inference_method: str = "monte_carlo_marginalization"
     vbn_inference_n_samples: int = 1024
-    vbn_inference_batch_size: int = 32
+    vbn_inference_batch_size: int = 512
+    vbn_device: str = "auto"
+    out_dir: str = "stress_test/out"
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time")
-    inference_metrics: Sequence[str] = ("kl", "js", "ws", "inference_time")
+    inference_metrics: Sequence[str] = (
+        "kl",
+        "js",
+        "ws",
+        "inference_time",
+        "mse",
+        "mae",
+        "r2",
+    )
+
+
+# ============================================================
+# Device helpers
+# ============================================================
+
+
+def resolve_torch_device(device_str: str) -> torch.device:
+    if device_str is None:
+        device_str = "auto"
+    if isinstance(device_str, torch.device):
+        return device_str
+
+    key = str(device_str).strip().lower()
+    if key == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if key.startswith("cuda") and not torch.cuda.is_available():
+        warnings.warn(
+            "CUDA requested but unavailable; falling back to CPU.",
+            RuntimeWarning,
+        )
+        return torch.device("cpu")
+
+    try:
+        return torch.device(device_str)
+    except Exception as exc:
+        raise ValueError(f"Invalid torch device '{device_str}'.") from exc
+
+
+def to_device_tensor(
+    values: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    ensure_2d: bool = False,
+) -> torch.Tensor:
+    if isinstance(values, torch.Tensor):
+        tensor = values.to(device=device, dtype=dtype)
+    else:
+        tensor = torch.tensor(values, device=device, dtype=dtype)
+
+    if ensure_2d:
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(-1)
+        elif tensor.dim() != 2:
+            raise ValueError(f"Expected 1D or 2D tensor, got shape {tensor.shape}")
+
+    return tensor
+
+
+def build_vbn_evidence_tensors(
+    evidence: pd.DataFrame | Dict[str, Any],
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.long,
+) -> Dict[str, torch.Tensor]:
+    if isinstance(evidence, pd.DataFrame):
+        items = {col: evidence[col].to_numpy() for col in evidence.columns}
+    elif isinstance(evidence, dict):
+        items = evidence
+    else:
+        raise TypeError("evidence must be a pandas DataFrame or a dict")
+
+    return {
+        key: to_device_tensor(values, device=device, dtype=dtype, ensure_2d=True)
+        for key, values in items.items()
+    }
 
 
 # ============================================================
@@ -97,11 +179,66 @@ def compare_reward_cpds(
             f"PMF shape mismatch: reference {reference_pmf.shape}, candidate {candidate_pmf.shape}"
         )
 
+    if reference_pmf.size == 0:
+        return {"kl": float("nan"), "js": float("nan"), "ws": float("nan")}
+
     return {
         "kl": float(kl_divergence(reference_pmf, candidate_pmf).mean()),
         "js": float(js_divergence_normalized(reference_pmf, candidate_pmf).mean()),
         "ws": float(wasserstein_1d(reference_pmf, candidate_pmf, support).mean()),
     }
+
+
+def posterior_mode_from_pmf(pmf: np.ndarray, support: np.ndarray) -> np.ndarray:
+    pmf = np.asarray(pmf)
+    support = np.asarray(support)
+    if pmf.ndim != 2:
+        raise ValueError(f"PMF must be 2D, got shape {pmf.shape}")
+    if support.ndim != 1:
+        raise ValueError(f"Support must be 1D, got shape {support.shape}")
+    indices = np.argmax(pmf, axis=1)
+    return support[indices]
+
+
+def compute_regression_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    if y_true.shape != y_pred.shape:
+        raise ValueError(
+            f"y_true/y_pred shape mismatch: {y_true.shape} vs {y_pred.shape}"
+        )
+
+    diff = y_true - y_pred
+    mse = float(np.mean(diff**2))
+    mae = float(np.mean(np.abs(diff)))
+
+    ss_res = float(np.sum(diff**2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    if ss_tot == 0.0:
+        r2 = 1.0 if ss_res == 0.0 else 0.0
+    else:
+        r2 = 1.0 - ss_res / ss_tot
+
+    return {"mse": mse, "mae": mae, "r2": float(r2)}
+
+
+def compare_posterior_point_predictions(
+    reference_pmf: np.ndarray,
+    candidate_pmf: np.ndarray,
+    support: np.ndarray,
+) -> Dict[str, float]:
+    if reference_pmf.shape != candidate_pmf.shape:
+        raise ValueError(
+            f"PMF shape mismatch: reference {reference_pmf.shape}, candidate {candidate_pmf.shape}"
+        )
+    if reference_pmf.size == 0:
+        return {"mse": float("nan"), "mae": float("nan"), "r2": float("nan")}
+
+    y_true = posterior_mode_from_pmf(reference_pmf, support)
+    y_pred = posterior_mode_from_pmf(candidate_pmf, support)
+    return compute_regression_metrics(y_true, y_pred)
 
 
 def validate_pmf(pmf: np.ndarray, name: str, atol: float = 1e-6) -> None:
@@ -112,6 +249,8 @@ def validate_pmf(pmf: np.ndarray, name: str, atol: float = 1e-6) -> None:
     if (pmf < -atol).any():
         raise ValueError(f"{name} PMF contains negative entries below {-atol}")
     row_sums = pmf.sum(axis=1)
+    if row_sums.size == 0:
+        return
     if not np.allclose(row_sums, 1.0, atol=atol):
         raise ValueError(
             f"{name} PMF rows do not sum to 1. "
@@ -564,17 +703,20 @@ def vbn_reward_pmf(
 
     parents_tensor = torch.cat(
         [
-            torch.tensor(
-                parents_df[p].values, device=device, dtype=torch.long
-            ).unsqueeze(1)
+            to_device_tensor(
+                parents_df[p].values,
+                device=device,
+                dtype=torch.long,
+                ensure_2d=True,
+            )
             for p in handle.parents
         ],
         dim=-1,
     )  # [B, Dp]
 
-    reward_vals = torch.tensor(reward_support, device=device, dtype=torch.long).view(
-        1, -1, 1
-    )
+    reward_vals = to_device_tensor(
+        reward_support, device=device, dtype=torch.long, ensure_2d=False
+    ).view(1, -1, 1)
     b, k = parents_tensor.shape[0], reward_vals.shape[1]
 
     parents_grid = parents_tensor.unsqueeze(1).expand(b, k, -1)  # [B, K, Dp]
@@ -751,7 +893,7 @@ class PgmpyBackend(RewardBackend):
         pmf = np.zeros((len(evidence_df), len(reward_support)), dtype=np.float64)
         evidence_cols = list(evidence_df.columns)
 
-        t = 0
+        t = 0.0
         for i, row in enumerate(evidence_df.itertuples(index=False, name=None)):
             evidence = {col: int(val) for col, val in zip(evidence_cols, row)}
             ttt = time.time()
@@ -778,6 +920,7 @@ class VBNBackend(RewardBackend):
     inf_method: str = "monte_carlo_marginalization"
     inf_n_samples: int = 512
     seed: int = 42
+    device: torch.device = torch.device("cpu")
 
     @property
     def name(self) -> str:
@@ -791,7 +934,7 @@ class VBNBackend(RewardBackend):
     ) -> BackendResult:
         from vbn import defaults, VBN
 
-        vbn = VBN(dag, seed=self.seed)
+        vbn = VBN(dag, seed=self.seed, device=self.device)
         fit_conf = {"batch_size": max(1, int(len(df) / 4))}
 
         vbn.set_learning_method(
@@ -846,16 +989,18 @@ class VBNBackend(RewardBackend):
 
         pmf = np.zeros((len(evidence_df), len(reward_support)), dtype=np.float64)
         if len(evidence_df) == 0:
-            return pmf
+            return pmf, 0.0
 
         evidence_cols = list(evidence_df.columns)
         infer_weights = self.inf_method.lower() != "monte_carlo_marginalization"
 
-        t = 0
+        t = 0.0
         for start in range(0, len(evidence_df), batch_size):
             end = min(start + batch_size, len(evidence_df))
             batch = evidence_df.iloc[start:end]
-            evidence = {col: batch[col].to_numpy() for col in evidence_cols}
+            evidence = build_vbn_evidence_tensors(
+                batch[evidence_cols], device=vbn.device, dtype=torch.long
+            )
             query = {"target": "reward", "evidence": evidence}
             with torch.no_grad():
                 ttt = time.time()
@@ -873,49 +1018,169 @@ class VBNBackend(RewardBackend):
 
 
 # ============================================================
-# Logging
+# Logging and persistence
 # ============================================================
+
+
+def to_jsonable(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, torch.device):
+        return str(obj)
+    if isinstance(obj, torch.dtype):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if dataclass_isinstance(obj):
+        return to_jsonable(asdict(obj))
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    return str(obj)
+
+
+def dataclass_isinstance(obj: Any) -> bool:
+    return hasattr(obj, "__dataclass_fields__")
+
+
+def make_benchmark_dir(out_dir: str, timestamp: Optional[str] = None) -> Path:
+    root = Path(out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bench_dir = root / f"benchmark_{timestamp}"
+    bench_dir.mkdir(parents=True, exist_ok=False)
+    return bench_dir
+
+
+def save_json(path: Path | str, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(to_jsonable(payload), f, indent=2)
+
+
+def load_json(path: Path | str) -> Any:
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def initialize_logs(
     evaluated_backends: Sequence[RewardBackend],
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time"),
     track_ground_truth_time: bool = False,
-) -> Dict[str, Dict[str, List[float]]]:
+) -> Dict[str, Any]:
     evaluated_names = [b.name for b in evaluated_backends]
-
-    logs: Dict[str, Dict[str, List[float]]] = {
-        metric: {name: [] for name in evaluated_names} for metric in metrics
+    logs: Dict[str, Any] = {
+        "metrics": {
+            metric: {name: [] for name in evaluated_names} for metric in metrics
+        },
+        "backends": evaluated_names,
     }
-
     if track_ground_truth_time:
         logs["ground_truth_time"] = []
-
     return logs
 
 
 def append_metric(
-    logs: Dict[str, Dict[str, List[float]]],
+    logs: Dict[str, Any],
     metric_name: str,
     algo_name: str,
+    card: int,
     value: float,
 ) -> None:
-    logs[metric_name][algo_name].append(value)
+    metrics = logs.setdefault("metrics", {})
+    if metric_name not in metrics:
+        metrics[metric_name] = {name: [] for name in logs.get("backends", [])}
+    if algo_name not in metrics[metric_name]:
+        metrics[metric_name][algo_name] = []
+
+    entries: List[Dict[str, float]] = metrics[metric_name][algo_name]
+    card_val = int(card)
+    value_val = float(value)
+    for entry in entries:
+        if entry.get("card") == card_val:
+            entry["value"] = value_val
+            return
+    entries.append({"card": card_val, "value": value_val})
 
 
-def append_fit_time(
-    logs: Dict[str, Dict[str, List[float]]], result: BackendResult
-) -> None:
-    append_metric(logs, "fit_time", result.name, result.fit_time)
+def append_fit_time(logs: Dict[str, Any], result: BackendResult, card: int) -> None:
+    append_metric(logs, "fit_time", result.name, card, result.fit_time)
 
 
 def append_comparison_metrics(
-    logs: Dict[str, Dict[str, List[float]]],
+    logs: Dict[str, Any],
     algo_name: str,
     metrics_dict: Dict[str, float],
+    card: int,
 ) -> None:
     for metric_name, value in metrics_dict.items():
-        logs[metric_name][algo_name].append(value)
+        append_metric(logs, metric_name, algo_name, card, value)
+
+
+def save_logs(logs: Dict[str, Any], path: Path | str) -> None:
+    save_json(path, logs)
+
+
+def load_logs(path: Path | str) -> Dict[str, Any]:
+    data = load_json(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid log format in {path}")
+    return data
+
+
+def flatten_logs_to_dataframe(logs: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    metrics = logs.get("metrics", {})
+    for metric, by_backend in metrics.items():
+        for backend, entries in by_backend.items():
+            for entry in entries:
+                rows.append(
+                    {
+                        "card": entry.get("card"),
+                        "backend": backend,
+                        "metric": metric,
+                        "value": entry.get("value"),
+                    }
+                )
+    df = pd.DataFrame(rows, columns=["card", "backend", "metric", "value"])
+    if not df.empty:
+        df = df.sort_values(["metric", "backend", "card"]).reset_index(drop=True)
+    return df
+
+
+def save_dataframe_csv(
+    df: pd.DataFrame, path: Path | str, columns: Optional[List[str]] = None
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if df.empty and columns is not None:
+        df = pd.DataFrame(columns=columns)
+    df.to_csv(path, index=False)
+
+
+def persist_benchmark(
+    run_dir: Path, cpd_logs: Dict[str, Any], inference_logs: Dict[str, Any]
+) -> None:
+    save_logs(cpd_logs, run_dir / "cpd_logs.json")
+    save_logs(inference_logs, run_dir / "inference_logs.json")
+    save_dataframe_csv(
+        flatten_logs_to_dataframe(cpd_logs),
+        run_dir / "cpd_metrics.csv",
+        columns=["card", "backend", "metric", "value"],
+    )
+    save_dataframe_csv(
+        flatten_logs_to_dataframe(inference_logs),
+        run_dir / "inference_metrics.csv",
+        columns=["card", "backend", "metric", "value"],
+    )
 
 
 # ============================================================
@@ -924,24 +1189,36 @@ def append_comparison_metrics(
 
 
 def plot_metrics_grid(
-    cards: Sequence[int],
-    logs: Dict[str, Dict[str, List[float]]],
+    logs: Dict[str, Any],
     metrics: Sequence[str],
     title: str = "",
-    out_path: str = None,
+    out_path: Optional[Path | str] = None,
 ) -> None:
     n_metrics = len(metrics)
     n_cols = 2
-    n_rows = int(np.ceil(n_metrics / n_cols))
+    n_rows = int(np.ceil(n_metrics / n_cols)) if n_metrics > 0 else 1
 
     fig, axes = plt.subplots(n_rows, n_cols, dpi=500, figsize=(10, 3 * n_rows))
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
     axes = axes.reshape(-1)
 
+    metrics_map = logs.get("metrics", logs)
+
     for ax, metric in zip(axes, metrics):
-        for algo, values in logs[metric].items():
-            ax.plot(cards, values, marker="o", label=algo)
+        for algo, entries in metrics_map.get(metric, {}).items():
+            if not entries:
+                continue
+            if isinstance(entries[0], dict):
+                cards = np.array([e["card"] for e in entries], dtype=np.float64)
+                values = np.array([e["value"] for e in entries], dtype=np.float64)
+            else:
+                cards = np.arange(len(entries), dtype=np.float64)
+                values = np.array(entries, dtype=np.float64)
+            if cards.size == 0:
+                continue
+            order = np.argsort(cards)
+            ax.plot(cards[order], values[order], marker="o", label=algo)
         ax.set_xlabel("cardinality")
         ax.set_ylabel(metric)
         ax.set_title(metric)
@@ -951,11 +1228,27 @@ def plot_metrics_grid(
     for ax in axes[n_metrics:]:
         ax.axis("off")
 
-    fig.suptitle(title)
-    fig.tight_layout()
+    if title:
+        fig.suptitle(title)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+    else:
+        fig.tight_layout()
+
     if out_path is not None:
-        plt.savefig(out_path)
-    plt.show()
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path)
+    plt.close(fig)
+
+
+def split_inference_metrics(
+    metrics: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    distribution_set = {"kl", "js", "ws", "inference_time"}
+    point_set = {"mse", "mae", "r2"}
+    dist = [m for m in metrics if m in distribution_set]
+    point = [m for m in metrics if m in point_set]
+    return dist, point
 
 
 # ============================================================
@@ -968,12 +1261,17 @@ def run_single_experiment(
     n_actions: int,
     exp_cfg: ExperimentConfig,
     evaluated_backends: Sequence[RewardBackend],
-) -> Tuple[Dict[str, Dict[str, List[float]]], Dict[str, Dict[str, List[float]]]]:
-
-    logs = initialize_logs(evaluated_backends, metrics=exp_cfg.metrics)
+    run_dir: Path,
+    log_meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    cpd_logs = initialize_logs(evaluated_backends, metrics=exp_cfg.metrics)
     inference_logs = initialize_logs(
         evaluated_backends, metrics=exp_cfg.inference_metrics
     )
+    if log_meta:
+        cpd_logs["meta"] = dict(log_meta)
+        inference_logs["meta"] = dict(log_meta)
+    persist_benchmark(run_dir, cpd_logs, inference_logs)
 
     for card in tqdm(exp_cfg.cards, desc=f"#states={n_states}, #actions={n_actions}"):
         dag = get_rl_dag(n_states, n_actions)
@@ -1035,7 +1333,7 @@ def run_single_experiment(
         for backend in evaluated_backends:
             result = backend.fit_reward_pmf(dag, df, reward_support=reward_support)
             validate_backend_result(result, reward_support)
-            append_fit_time(logs, result)
+            append_fit_time(cpd_logs, result, card)
 
             if not ground_truth.parents_df.equals(result.parents_df):
                 raise ValueError(
@@ -1047,7 +1345,8 @@ def run_single_experiment(
                 candidate_pmf=result.pmf,
                 support=reward_support,
             )
-            append_comparison_metrics(logs, result.name, metrics_dict)
+            append_comparison_metrics(cpd_logs, result.name, metrics_dict, card)
+            persist_benchmark(run_dir, cpd_logs, inference_logs)
 
             inferred_pmf, inference_time = backend.infer_reward_posterior(
                 result,
@@ -1062,15 +1361,38 @@ def run_single_experiment(
                 candidate_pmf=inferred_pmf,
                 support=reward_support,
             )
-            append_comparison_metrics(inference_logs, result.name, inference_metrics)
-            append_metric(inference_logs, "inference_time", result.name, inference_time)
+            append_comparison_metrics(
+                inference_logs, result.name, inference_metrics, card
+            )
+            append_metric(
+                inference_logs, "inference_time", result.name, card, inference_time
+            )
+            point_metrics = compare_posterior_point_predictions(
+                reference_pmf=gt_inference_pmf,
+                candidate_pmf=inferred_pmf,
+                support=reward_support,
+            )
+            append_comparison_metrics(inference_logs, result.name, point_metrics, card)
+            persist_benchmark(run_dir, cpd_logs, inference_logs)
 
         del df
 
-    return logs, inference_logs
+    return cpd_logs, inference_logs
 
 
 def run_experiments(exp_cfg: ExperimentConfig) -> None:
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    benchmark_dir = make_benchmark_dir(exp_cfg.out_dir, timestamp=run_timestamp)
+
+    resolved_device = resolve_torch_device(exp_cfg.vbn_device)
+    device_warning = None
+    if (
+        isinstance(exp_cfg.vbn_device, str)
+        and exp_cfg.vbn_device.lower().startswith("cuda")
+        and not torch.cuda.is_available()
+    ):
+        device_warning = "CUDA requested but unavailable; fell back to CPU."
+
     evaluated_backends = [
         PgmpyBackend(),
         VBNBackend(
@@ -1078,33 +1400,87 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
             inf_method=exp_cfg.vbn_inference_method,
             inf_n_samples=exp_cfg.vbn_inference_n_samples,
             seed=exp_cfg.seed,
+            device=resolved_device,
         ),
     ]
 
+    n_runs = len(exp_cfg.n_states_list) * len(exp_cfg.n_actions_list)
+    use_subdirs = n_runs > 1
+
+    top_level_meta = {
+        "timestamp": run_timestamp,
+        "resolved_device": str(resolved_device),
+        "vbn_device_requested": exp_cfg.vbn_device,
+        "vbn_device_warning": device_warning,
+        "n_runs": n_runs,
+        "backends": [b.name for b in evaluated_backends],
+    }
+    save_json(benchmark_dir / "run_metadata.json", top_level_meta)
+
     for n_states in exp_cfg.n_states_list:
         for n_actions in exp_cfg.n_actions_list:
-            cpd_logs, inference_logs = run_single_experiment(
+            run_dir = (
+                benchmark_dir
+                if not use_subdirs
+                else benchmark_dir / f"states_{n_states}_actions_{n_actions}"
+            )
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            config_payload = {
+                "timestamp": run_timestamp,
+                "resolved_device": str(resolved_device),
+                "vbn_device_requested": exp_cfg.vbn_device,
+                "vbn_device_warning": device_warning,
+                "n_states": n_states,
+                "n_actions": n_actions,
+                "backends": [b.name for b in evaluated_backends],
+                "config": asdict(exp_cfg),
+            }
+            save_json(run_dir / "config.json", config_payload)
+
+            run_single_experiment(
                 n_states=n_states,
                 n_actions=n_actions,
                 exp_cfg=exp_cfg,
                 evaluated_backends=evaluated_backends,
+                run_dir=run_dir,
+                log_meta={
+                    "timestamp": run_timestamp,
+                    "resolved_device": str(resolved_device),
+                    "vbn_device_requested": exp_cfg.vbn_device,
+                    "vbn_device_warning": device_warning,
+                    "n_states": n_states,
+                    "n_actions": n_actions,
+                },
             )
 
+            cpd_logs_disk = load_logs(run_dir / "cpd_logs.json")
+            inference_logs_disk = load_logs(run_dir / "inference_logs.json")
+
+            dist_metrics, point_metrics = split_inference_metrics(
+                exp_cfg.inference_metrics
+            )
             prefix = f"#states: {n_states}, #actions: {n_actions}"
+
             plot_metrics_grid(
-                cards=exp_cfg.cards,
-                logs=cpd_logs,
+                logs=cpd_logs_disk,
                 metrics=exp_cfg.metrics,
                 title=f"{prefix} - CPD metrics",
-                out_path="stress_test/cpd.png",
+                out_path=run_dir / "cpd_metrics.png",
             )
             plot_metrics_grid(
-                cards=exp_cfg.cards,
-                logs=inference_logs,
-                metrics=exp_cfg.inference_metrics,
-                title=f"{prefix} - Inference metrics",
-                out_path="stress_test/inference.png",
+                logs=inference_logs_disk,
+                metrics=dist_metrics,
+                title=f"{prefix} - Inference distribution metrics",
+                out_path=run_dir / "inference_distribution_metrics.png",
             )
+            if point_metrics:
+                plot_metrics_grid(
+                    logs=inference_logs_disk,
+                    metrics=point_metrics,
+                    title=f"{prefix} - Inference point metrics",
+                    out_path=run_dir / "inference_point_metrics.png",
+                )
 
 
 # ============================================================
@@ -1117,5 +1493,3 @@ if __name__ == "__main__":
         mode="linear",
     )
     run_experiments(exp_cfg)
-
-    # TODO: 1) update and save logs every time 2) plot separated 3) device vbn
