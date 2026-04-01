@@ -41,16 +41,14 @@ class ExperimentConfig:
     n_samples_df: int = 32000
     n_states_list: Sequence[int] = (1,)
     n_actions_list: Sequence[int] = (1,)
-    cards: Sequence[int] = (10, 20, 50, 100, 200, 500, 1000, 2000, 5000)
+    cards: Sequence[int] = (10, 20, 50, 70, 100, 200, 500, 700, 1000, 2000)
     mode: str = "linear"
     seed: int = 42
     n_mc_ground_truth: int = 20000
-    n_mc_inference_ground_truth: Optional[int] = None
-    n_inference_queries: int = 16
+    n_inference_queries: int = 128
     inference_seed: int = 123
-    vbn_inference_method: str = "monte_carlo_marginalization"
-    vbn_inference_n_samples: int = 1024
-    vbn_inference_batch_size: int = 16
+    vbn_inference_n_samples: int = 512
+    vbn_inference_batch_size: int = 128
     vbn_device: str = "auto"
     out_dir: str = "stress_test/out"
     include_next_state: bool = True
@@ -64,6 +62,8 @@ class ExperimentConfig:
         "mae",
         "r2",
     )
+    aggregation_mode: str = "iqm"  # "mean" or "iqm"
+    spread_mode: Optional[str] = "iqr_std"  # None -> std for mean, iqr_std for iqm
 
 
 # ============================================================
@@ -178,23 +178,116 @@ def wasserstein_1d(p: np.ndarray, q: np.ndarray, support: np.ndarray) -> np.ndar
     return np.sum(np.abs(cdf_p[:, :-1] - cdf_q[:, :-1]) * dx, axis=1)
 
 
+def interquartile_mean(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float("nan")
+    x = np.sort(x)
+    lower = int(np.floor(0.25 * x.size))
+    upper = int(np.ceil(0.75 * x.size))
+    if upper <= lower:
+        return float(np.mean(x))
+    return float(np.mean(x[lower:upper]))
+
+
+def iqr_std(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if x.size <= 1:
+        return 0.0 if x.size == 1 else float("nan")
+    q25, q75 = np.percentile(x, [25.0, 75.0])
+    return float((q75 - q25) / 1.349)
+
+
+def summarize_metric_values(
+    values: np.ndarray,
+    *,
+    aggregation_mode: str = "iqm",
+    spread_mode: Optional[str] = None,
+) -> Dict[str, float]:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            "value": float("nan"),
+            "spread": float("nan"),
+            "lower": float("nan"),
+            "upper": float("nan"),
+            "n": 0,
+        }
+
+    aggregation_key = str(aggregation_mode).strip().lower()
+    if aggregation_key not in {"mean", "iqm"}:
+        raise ValueError(
+            f"Unsupported aggregation_mode '{aggregation_mode}'. Use 'mean' or 'iqm'."
+        )
+
+    if spread_mode is None:
+        spread_key = "std" if aggregation_key == "mean" else "iqr_std"
+    else:
+        spread_key = str(spread_mode).strip().lower()
+
+    if spread_key not in {"std", "iqr_std", "none"}:
+        raise ValueError(
+            f"Unsupported spread_mode '{spread_mode}'. Use 'std', 'iqr_std', or 'none'."
+        )
+
+    center = (
+        float(np.mean(values))
+        if aggregation_key == "mean"
+        else interquartile_mean(values)
+    )
+
+    if spread_key == "std":
+        spread = float(np.std(values))
+    elif spread_key == "iqr_std":
+        spread = iqr_std(values)
+    else:
+        spread = 0.0
+
+    return {
+        "value": center,
+        "spread": float(spread),
+        "lower": float(center - spread),
+        "upper": float(center + spread),
+        "n": int(values.size),
+    }
+
+
 def compare_reward_cpds(
     reference_pmf: np.ndarray,
     candidate_pmf: np.ndarray,
     support: np.ndarray,
-) -> Dict[str, float]:
+    *,
+    aggregation_mode: str = "iqm",
+    spread_mode: Optional[str] = None,
+) -> Dict[str, Dict[str, float]]:
     if reference_pmf.shape != candidate_pmf.shape:
         raise ValueError(
             f"PMF shape mismatch: reference {reference_pmf.shape}, candidate {candidate_pmf.shape}"
         )
 
     if reference_pmf.size == 0:
-        return {"kl": float("nan"), "js": float("nan"), "ws": float("nan")}
+        empty = summarize_metric_values(
+            np.array([], dtype=np.float64),
+            aggregation_mode=aggregation_mode,
+            spread_mode=spread_mode,
+        )
+        return {"kl": dict(empty), "js": dict(empty), "ws": dict(empty)}
 
+    metric_arrays = {
+        "kl": kl_divergence(reference_pmf, candidate_pmf),
+        "js": js_divergence_normalized(reference_pmf, candidate_pmf),
+        "ws": wasserstein_1d(reference_pmf, candidate_pmf, support),
+    }
     return {
-        "kl": float(kl_divergence(reference_pmf, candidate_pmf).mean()),
-        "js": float(js_divergence_normalized(reference_pmf, candidate_pmf).mean()),
-        "ws": float(wasserstein_1d(reference_pmf, candidate_pmf, support).mean()),
+        metric_name: summarize_metric_values(
+            metric_values,
+            aggregation_mode=aggregation_mode,
+            spread_mode=spread_mode,
+        )
+        for metric_name, metric_values in metric_arrays.items()
     }
 
 
@@ -1177,6 +1270,11 @@ def append_metric(
     algo_name: str,
     card: int,
     value: float,
+    *,
+    spread: Optional[float] = None,
+    lower: Optional[float] = None,
+    upper: Optional[float] = None,
+    n: Optional[int] = None,
 ) -> None:
     metrics = logs.setdefault("metrics", {})
     if metric_name not in metrics:
@@ -1186,12 +1284,21 @@ def append_metric(
 
     entries: List[Dict[str, float]] = metrics[metric_name][algo_name]
     card_val = int(card)
-    value_val = float(value)
+    entry_payload: Dict[str, Any] = {"card": card_val, "value": float(value)}
+    if spread is not None:
+        entry_payload["spread"] = float(spread)
+    if lower is not None:
+        entry_payload["lower"] = float(lower)
+    if upper is not None:
+        entry_payload["upper"] = float(upper)
+    if n is not None:
+        entry_payload["n"] = int(n)
+
     for entry in entries:
         if entry.get("card") == card_val:
-            entry["value"] = value_val
+            entry.update(entry_payload)
             return
-    entries.append({"card": card_val, "value": value_val})
+    entries.append(entry_payload)
 
 
 def append_fit_time(logs: Dict[str, Any], result: BackendResult, card: int) -> None:
@@ -1201,11 +1308,24 @@ def append_fit_time(logs: Dict[str, Any], result: BackendResult, card: int) -> N
 def append_comparison_metrics(
     logs: Dict[str, Any],
     algo_name: str,
-    metrics_dict: Dict[str, float],
+    metrics_dict: Dict[str, Any],
     card: int,
 ) -> None:
     for metric_name, value in metrics_dict.items():
-        append_metric(logs, metric_name, algo_name, card, value)
+        if isinstance(value, dict):
+            append_metric(
+                logs,
+                metric_name,
+                algo_name,
+                card,
+                value.get("value", float("nan")),
+                spread=value.get("spread"),
+                lower=value.get("lower"),
+                upper=value.get("upper"),
+                n=value.get("n"),
+            )
+        else:
+            append_metric(logs, metric_name, algo_name, card, value)
 
 
 def save_logs(logs: Dict[str, Any], path: Path | str) -> None:
@@ -1231,9 +1351,16 @@ def flatten_logs_to_dataframe(logs: Dict[str, Any]) -> pd.DataFrame:
                         "backend": backend,
                         "metric": metric,
                         "value": entry.get("value"),
+                        "spread": entry.get("spread"),
+                        "lower": entry.get("lower"),
+                        "upper": entry.get("upper"),
+                        "n": entry.get("n"),
                     }
                 )
-    df = pd.DataFrame(rows, columns=["card", "backend", "metric", "value"])
+    df = pd.DataFrame(
+        rows,
+        columns=["card", "backend", "metric", "value", "spread", "lower", "upper", "n"],
+    )
     if not df.empty:
         df = df.sort_values(["metric", "backend", "card"]).reset_index(drop=True)
     return df
@@ -1257,12 +1384,12 @@ def persist_benchmark(
     save_dataframe_csv(
         flatten_logs_to_dataframe(cpd_logs),
         run_dir / "cpd_metrics.csv",
-        columns=["card", "backend", "metric", "value"],
+        columns=["card", "backend", "metric", "value", "spread", "lower", "upper", "n"],
     )
     save_dataframe_csv(
         flatten_logs_to_dataframe(inference_logs),
         run_dir / "inference_metrics.csv",
-        columns=["card", "backend", "metric", "value"],
+        columns=["card", "backend", "metric", "value", "spread", "lower", "upper", "n"],
     )
 
 
@@ -1276,6 +1403,8 @@ def plot_metrics_grid(
     metrics: Sequence[str],
     title: str = "",
     out_path: Optional[Path | str] = None,
+    *,
+    show_fill_between: bool = True,
 ) -> None:
     n_metrics = len(metrics)
     n_cols = 2
@@ -1292,21 +1421,52 @@ def plot_metrics_grid(
         for algo, entries in metrics_map.get(metric, {}).items():
             if not entries:
                 continue
+            lowers = None
+            uppers = None
             if isinstance(entries[0], dict):
                 cards = np.array([e["card"] for e in entries], dtype=np.float64)
                 values = np.array([e["value"] for e in entries], dtype=np.float64)
+                if show_fill_between:
+                    lower_vals = [e.get("lower") for e in entries]
+                    upper_vals = [e.get("upper") for e in entries]
+                    if any(v is not None for v in lower_vals) and any(
+                        v is not None for v in upper_vals
+                    ):
+                        lowers = np.array(
+                            [np.nan if v is None else float(v) for v in lower_vals],
+                            dtype=np.float64,
+                        )
+                        uppers = np.array(
+                            [np.nan if v is None else float(v) for v in upper_vals],
+                            dtype=np.float64,
+                        )
             else:
                 cards = np.arange(len(entries), dtype=np.float64)
                 values = np.array(entries, dtype=np.float64)
             if cards.size == 0:
                 continue
             order = np.argsort(cards)
-            ax.plot(cards[order], values[order], marker="o", label=algo)
+            cards = cards[order]
+            values = values[order]
+            line = ax.plot(cards, values, marker="o", label=algo)[0]
+            if show_fill_between and lowers is not None and uppers is not None:
+                lowers = lowers[order]
+                uppers = uppers[order]
+                valid = np.isfinite(lowers) & np.isfinite(uppers)
+                if np.any(valid):
+                    ax.fill_between(
+                        cards[valid],
+                        lowers[valid],
+                        uppers[valid],
+                        alpha=0.2,
+                        color=line.get_color(),
+                    )
         ax.set_xlabel("cardinality")
         ax.set_ylabel(metric)
         ax.set_title(metric)
         ax.grid(True)
-        ax.legend(loc="best")
+        if ax == axes[0]:
+            ax.legend(loc="best")
 
     for ax in axes[n_metrics:]:
         ax.axis("off")
@@ -1411,18 +1571,14 @@ def run_single_experiment(
             seed=exp_cfg.inference_seed,
             include_actions=True,
         )
-        n_mc_inference = (
-            exp_cfg.n_mc_ground_truth
-            if exp_cfg.n_mc_inference_ground_truth is None
-            else exp_cfg.n_mc_inference_ground_truth
-        )
+
         gt_inference_support, gt_inference_pmf = estimate_ground_truth_inference_pmf(
             inference_queries,
             n_states=n_states,
             n_actions=n_actions,
             card=card,
             mode=exp_cfg.mode,
-            n_mc_samples=n_mc_inference,
+            n_mc_samples=exp_cfg.n_mc_ground_truth,
             seed=exp_cfg.inference_seed,
         )
         if not np.array_equal(gt_inference_support, reward_support):
@@ -1449,6 +1605,8 @@ def run_single_experiment(
                 reference_pmf=ground_truth.pmf,
                 candidate_pmf=result.pmf,
                 support=reward_support,
+                aggregation_mode=exp_cfg.aggregation_mode,
+                spread_mode=exp_cfg.spread_mode,
             )
             append_comparison_metrics(cpd_logs, cpd_name, metrics_dict, card)
             persist_benchmark(run_dir, cpd_logs, inference_logs)
@@ -1466,6 +1624,8 @@ def run_single_experiment(
                 reference_pmf=gt_inference_pmf,
                 candidate_pmf=inferred_pmf,
                 support=reward_support,
+                aggregation_mode=exp_cfg.aggregation_mode,
+                spread_mode=exp_cfg.spread_mode,
             )
             append_comparison_metrics(
                 inference_logs, inference_name, inference_metrics, card
@@ -1505,6 +1665,8 @@ def run_single_experiment(
                 reference_pmf=ground_truth.pmf,
                 candidate_pmf=result.pmf,
                 support=reward_support,
+                aggregation_mode=exp_cfg.aggregation_mode,
+                spread_mode=exp_cfg.spread_mode,
             )
             append_fit_time(cpd_logs, result, card)
             append_comparison_metrics(cpd_logs, cpd_name, metrics_dict, card)
@@ -1556,6 +1718,8 @@ def run_single_experiment(
 
         del df
 
+    del non_vbn_backends, vbn_groups
+
     return cpd_logs, inference_logs
 
 
@@ -1564,6 +1728,7 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
     benchmark_dir = make_benchmark_dir(exp_cfg.out_dir, timestamp=run_timestamp)
 
     resolved_device = resolve_torch_device(exp_cfg.vbn_device)
+    print("VBN Device: ", resolved_device)
     device_warning = None
     if (
         isinstance(exp_cfg.vbn_device, str)
@@ -1575,7 +1740,7 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
     evaluated_backends = [
         VBNBackend(
             cpd_name="kde",
-            inf_method=exp_cfg.vbn_inference_method,
+            inf_method="monte_carlo_marginalization",
             inf_n_samples=exp_cfg.vbn_inference_n_samples,
             seed=exp_cfg.seed,
             device=resolved_device,
@@ -1603,7 +1768,7 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
         ),
         VBNBackend(
             cpd_name="gaussian_nn",
-            inf_method=exp_cfg.vbn_inference_method,
+            inf_method="monte_carlo_marginalization",
             inf_n_samples=exp_cfg.vbn_inference_n_samples,
             seed=exp_cfg.seed,
             device=resolved_device,
@@ -1698,7 +1863,13 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
             dist_metrics, point_metrics = split_inference_metrics(
                 exp_cfg.inference_metrics
             )
-            prefix = f"#states: {n_states}, #actions: {n_actions}"
+            spread_label = exp_cfg.spread_mode or (
+                "std" if exp_cfg.aggregation_mode == "mean" else "iqr_std"
+            )
+            prefix = (
+                f"#states: {n_states}, #actions: {n_actions}, "
+                f"aggregation: {exp_cfg.aggregation_mode}, spread: {spread_label}"
+            )
 
             plot_metrics_grid(
                 logs=cpd_logs_disk,
@@ -1787,23 +1958,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--n-mc-ground-truth", type=int, default=default_cfg.n_mc_ground_truth
     )
     parser.add_argument(
-        "--n-mc-inference-ground-truth",
-        type=parse_optional_int,
-        default=default_cfg.n_mc_inference_ground_truth,
-        help="Optional int or 'none' to match n-mc-ground-truth.",
-    )
-    parser.add_argument(
         "--n-inference-queries",
         type=int,
         default=default_cfg.n_inference_queries,
     )
     parser.add_argument(
         "--inference-seed", type=int, default=default_cfg.inference_seed
-    )
-    parser.add_argument(
-        "--vbn-inference-method",
-        type=str,
-        default=default_cfg.vbn_inference_method,
     )
     parser.add_argument(
         "--vbn-inference-n-samples",
@@ -1829,6 +1989,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Include next_state nodes and data generation.",
     )
     parser.add_argument(
+        "--aggregation-mode",
+        type=str,
+        default=default_cfg.aggregation_mode,
+        choices=("mean", "iqm"),
+        help="How to aggregate per-query metrics into a single value.",
+    )
+    parser.add_argument(
+        "--spread-mode",
+        type=str,
+        default=default_cfg.spread_mode,
+        choices=("std", "iqr_std", "none"),
+        help="Spread used for fill_between. Default: std for mean, iqr_std for iqm.",
+    )
+    parser.add_argument(
         "--metrics",
         type=parse_str_list,
         default=default_cfg.metrics,
@@ -1852,10 +2026,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         mode=args.mode,
         seed=args.seed,
         n_mc_ground_truth=args.n_mc_ground_truth,
-        n_mc_inference_ground_truth=args.n_mc_inference_ground_truth,
         n_inference_queries=args.n_inference_queries,
         inference_seed=args.inference_seed,
-        vbn_inference_method=args.vbn_inference_method,
         vbn_inference_n_samples=args.vbn_inference_n_samples,
         vbn_inference_batch_size=args.vbn_inference_batch_size,
         vbn_device=args.vbn_device,
@@ -1863,6 +2035,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         include_next_state=args.include_next_state,
         metrics=tuple(args.metrics),
         inference_metrics=tuple(args.inference_metrics),
+        aggregation_mode=args.aggregation_mode,
+        spread_mode=None if args.spread_mode == "none" else args.spread_mode,
     )
 
 

@@ -1,10 +1,9 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
-import numpy as np
-from matplotlib import pyplot as plt
+from run import plot_metrics_grid
 
 
 def load_json(path: Path) -> Any:
@@ -17,58 +16,6 @@ def load_logs(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Invalid log format in {path}")
     return data
-
-
-def plot_metrics_grid(
-    logs: Dict[str, Any],
-    metrics: Sequence[str],
-    title: str = "",
-    out_path: Optional[Path] = None,
-) -> None:
-    n_metrics = len(metrics)
-    n_cols = 2
-    n_rows = int(np.ceil(n_metrics / n_cols)) if n_metrics > 0 else 1
-
-    fig, axes = plt.subplots(n_rows, n_cols, dpi=500, figsize=(10, 3 * n_rows))
-    if not isinstance(axes, np.ndarray):
-        axes = np.array([axes])
-    axes = axes.reshape(-1)
-
-    metrics_map = logs.get("metrics", logs)
-
-    for ax, metric in zip(axes, metrics):
-        for algo, entries in metrics_map.get(metric, {}).items():
-            if not entries:
-                continue
-            if isinstance(entries[0], dict):
-                cards = np.array([e["card"] for e in entries], dtype=np.float64)
-                values = np.array([e["value"] for e in entries], dtype=np.float64)
-            else:
-                cards = np.arange(len(entries), dtype=np.float64)
-                values = np.array(entries, dtype=np.float64)
-            if cards.size == 0:
-                continue
-            order = np.argsort(cards)
-            ax.plot(cards[order], values[order], marker="o", label=algo)
-        ax.set_xlabel("cardinality")
-        ax.set_ylabel(metric)
-        ax.set_title(metric)
-        ax.grid(True)
-        ax.legend(loc="best")
-
-    for ax in axes[n_metrics:]:
-        ax.axis("off")
-
-    if title:
-        fig.suptitle(title)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-    else:
-        fig.tight_layout()
-
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path)
-    plt.close(fig)
 
 
 def split_inference_metrics(metrics: Sequence[str]) -> Tuple[List[str], List[str]]:
@@ -158,7 +105,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Plot stress-test metrics from a saved benchmark directory."
     )
     parser.add_argument(
-        "benchmark_dir",
+        "--benchmark-dir",
         type=str,
         help="Path to benchmark directory (or a directory containing run subfolders).",
     )
