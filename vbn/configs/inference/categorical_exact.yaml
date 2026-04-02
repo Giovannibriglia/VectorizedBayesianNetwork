@@ -1,0 +1,2 @@
+name: categorical_exact
+fallback: likelihood_weighting
