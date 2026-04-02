@@ -31,7 +31,7 @@ def derive_metrics_from_logs(logs: Dict[str, Any]) -> List[str]:
     return list(metrics.keys())
 
 
-def plot_for_run_dir(run_dir: Path) -> None:
+def plot_for_run_dir(run_dir: Path, show_fill_between: bool = True) -> None:
     cpd_logs_path = run_dir / "cpd_logs.json"
     inf_logs_path = run_dir / "inference_logs.json"
     if not cpd_logs_path.exists() or not inf_logs_path.exists():
@@ -69,12 +69,14 @@ def plot_for_run_dir(run_dir: Path) -> None:
         metrics=cpd_metrics,
         title=f"{title_prefix} - CPD metrics",
         out_path=run_dir / "cpd_metrics.png",
+        show_fill_between=show_fill_between,
     )
     plot_metrics_grid(
         logs=inf_logs,
         metrics=dist_metrics,
         title=f"{title_prefix} - Inference distribution metrics",
         out_path=run_dir / "inference_distribution_metrics.png",
+        show_fill_between=show_fill_between,
     )
     if point_metrics:
         plot_metrics_grid(
@@ -82,6 +84,7 @@ def plot_for_run_dir(run_dir: Path) -> None:
             metrics=point_metrics,
             title=f"{title_prefix} - Inference point metrics",
             out_path=run_dir / "inference_point_metrics.png",
+            show_fill_between=show_fill_between,
         )
 
 
@@ -109,6 +112,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         help="Path to benchmark directory (or a directory containing run subfolders).",
     )
+    parser.add_argument(
+        "--show-fill-between",
+        type=str,
+        help="Path to benchmark directory (or a directory containing run subfolders).",
+    )
     return parser
 
 
@@ -126,7 +134,7 @@ def main() -> None:
         )
 
     for run_dir in run_dirs:
-        plot_for_run_dir(run_dir)
+        plot_for_run_dir(run_dir, args.show_fill_between)
 
 
 if __name__ == "__main__":
