@@ -1,0 +1,16 @@
+name: rff_gaussian
+n_features: 256
+lengthscale: 1.0
+ridge: 1e-6
+min_scale: 1e-3
+use_bias: true
+fit:
+  epochs: 1
+  batch_size: 4096
+  lr: 1e-3
+  weight_decay: 0.0
+update:
+  n_steps: 1
+  batch_size: 128
+  lr: 1e-3
+  weight_decay: 0.0

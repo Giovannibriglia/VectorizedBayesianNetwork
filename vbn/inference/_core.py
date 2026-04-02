@@ -34,10 +34,6 @@ def query_signature(vbn, query: Query) -> Tuple:
 
 
 def resolve_dtype(vbn, query: Query) -> torch.dtype:
-    if query.evidence:
-        return next(iter(query.evidence.values())).dtype
-    if query.do:
-        return next(iter(query.do.values())).dtype
     for cpd in vbn.nodes.values():
         for param in cpd.parameters():
             return param.dtype
@@ -50,6 +46,11 @@ def resolve_dtype(vbn, query: Query) -> torch.dtype:
                 for value in state.values():
                     if isinstance(value, torch.Tensor):
                         return value.dtype
+    for mapping in (query.evidence, query.do):
+        if mapping:
+            dtype = next(iter(mapping.values())).dtype
+            if torch.is_floating_point(next(iter(mapping.values()))):
+                return dtype
     return torch.float32
 
 

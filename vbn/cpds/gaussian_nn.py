@@ -126,6 +126,7 @@ class GaussianNNCPD(BaseCPD):
         lr: float = 1e-3,
         batch_size: int = 128,
         weight_decay: float = 0.0,
+        max_grad_norm: Optional[float] = None,
         n_steps: Optional[int] = None,
     ) -> None:
         params = {
@@ -134,6 +135,8 @@ class GaussianNNCPD(BaseCPD):
             "batch_size": batch_size,
             "weight_decay": weight_decay,
         }
+        if max_grad_norm is not None:
+            params["max_grad_norm"] = max_grad_norm
         if n_steps is not None:
             params["n_steps"] = n_steps
         params = coerce_numbers(params, UPDATE_SCHEMA | {"epochs": int})
@@ -144,6 +147,7 @@ class GaussianNNCPD(BaseCPD):
         batch_size = params["batch_size"]
         weight_decay = params["weight_decay"]
         n_steps = params.get("n_steps", n_steps)
+        max_grad_norm = params.get("max_grad_norm", max_grad_norm)
 
         dataset = torch.utils.data.TensorDataset(parents, x)
         loader = torch.utils.data.DataLoader(
@@ -162,6 +166,8 @@ class GaussianNNCPD(BaseCPD):
                 loss = -log_prob.mean()
                 optimizer.zero_grad()
                 loss.backward()
+                if max_grad_norm is not None and max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
                 optimizer.step()
 
     def fit(
@@ -172,6 +178,7 @@ class GaussianNNCPD(BaseCPD):
         lr: float = 1e-3,
         batch_size: int = 128,
         weight_decay: float = 0.0,
+        max_grad_norm: Optional[float] = None,
         **kwargs,
     ) -> None:
         self._train_loop(
@@ -181,6 +188,7 @@ class GaussianNNCPD(BaseCPD):
             lr=lr,
             batch_size=batch_size,
             weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
         )
 
     def update(
@@ -191,6 +199,7 @@ class GaussianNNCPD(BaseCPD):
         n_steps: int = 1,
         batch_size: int = 128,
         weight_decay: float = 0.0,
+        max_grad_norm: Optional[float] = None,
         **kwargs,
     ) -> None:
         self._train_loop(
@@ -200,6 +209,7 @@ class GaussianNNCPD(BaseCPD):
             batch_size=batch_size,
             weight_decay=weight_decay,
             n_steps=n_steps,
+            max_grad_norm=max_grad_norm,
         )
 
     def _params(

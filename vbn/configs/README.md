@@ -81,6 +81,13 @@ Closed-form ridge regression: `Y | X ~ N(XW + b, σ²)` (diagonal).
 - **Eval time:** `O(B · D_x · D_y)` for mean + `O(B · D_y)` for Gaussian log_prob
 - **Sampling time:** `O(B · D_y)` after mean computation
 
+### `rff_gaussian` (Random Fourier Features Gaussian CPD)
+Nonlinear Gaussian CPD via random Fourier features with closed-form ridge fit.
+
+- **Fit time:** `O(M · D_x · F + F³ + M · F · D_y)` where `F = n_features`
+- **Eval time:** `O(B · (D_x · F + F · D_y))`
+- **Sampling time:** `O(B · D_y)` after mean computation
+
 ### `softmax_nn` (Binned categorical CPD)
 Predicts logits over `C` bins/classes.
 
@@ -136,6 +143,18 @@ Samples from a proposal `q(z)` and reweights to approximate `p(z|e)`.
 - **Memory:** `O(Q · S)` for weights + particle storage
 
 > Importance sampling is sensitive to weight degeneracy; effective sample size (ESS) can be far smaller than `S`.
+
+### `categorical_exact`
+Exact categorical posterior when the target is categorical and all its parents are observed.
+
+- **Time:** `O(Q · C)` for softmax + mapping (`C` classes)
+- **Memory:** `O(Q · C)` for the returned pmf representation
+
+### `resampled_importance_sampling`
+Sequential importance resampling (SIR) with ESS-triggered resampling.
+
+- **Time:** `O(Q · S · (topo(N,E) + C_eval))` plus resampling cost `O(Q · S)`
+- **Memory:** `O(Q · S)` for particles/weights
 
 ### SVGP (placeholder, MC fallback)
 Currently treated as MC fallback in complexity. When SVGP is enabled for certain CPDs:

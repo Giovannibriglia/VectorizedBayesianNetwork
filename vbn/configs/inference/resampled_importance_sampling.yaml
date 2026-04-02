@@ -1,0 +1,5 @@
+name: resampled_importance_sampling
+n_samples: 1024
+ess_threshold: 0.5
+resample: true
+clamp_obs: true

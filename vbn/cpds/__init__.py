@@ -6,6 +6,7 @@ from vbn.cpds.gaussian_nn import GaussianNNCPD
 from vbn.cpds.kde import KDECPD
 from vbn.cpds.linear_gaussian import LinearGaussianCPD
 from vbn.cpds.mdn import MDNCPD
+from vbn.cpds.rff_gaussian import RFFGaussianCPD
 from vbn.cpds.softmax_nn import SoftmaxNNCPD
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "KDECPD",
     "LinearGaussianCPD",
     "MDNCPD",
+    "RFFGaussianCPD",
     "SoftmaxNNCPD",
 ]

@@ -52,6 +52,7 @@ class ExperimentConfig:
     vbn_device: str = "auto"
     out_dir: str = "stress_test/out"
     include_next_state: bool = True
+    softmax_max_classes: int = 256
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time")
     inference_metrics: Sequence[str] = (
         "kl",
@@ -1030,6 +1031,7 @@ class VBNBackend(RewardBackend):
     inf_n_samples: int = 512
     seed: int = 42
     device: torch.device = torch.device("cpu")
+    softmax_max_classes: Optional[int] = None
 
     @property
     def name(self) -> str:
@@ -1058,12 +1060,20 @@ class VBNBackend(RewardBackend):
         vbn = VBN(dag, seed=self.seed, device=self.device)
         fit_conf = {"batch_size": max(1, int(len(df) / 4))}
 
+        nodes_cpds: Dict[str, Dict] = {}
+        for feat in dag.nodes:
+            base = defaults.cpd(self.cpd_name)
+            if self.cpd_name == "softmax_nn":
+                n_classes = int(df[feat].nunique())
+                max_classes = self.softmax_max_classes
+                if max_classes is not None and max_classes > 0:
+                    n_classes = min(n_classes, int(max_classes))
+                base = {**base, "n_classes": n_classes}
+            nodes_cpds[feat] = {**base, "fit": dict(fit_conf)}
+
         vbn.set_learning_method(
             method=defaults.learning("node_wise"),
-            nodes_cpds={
-                feat: {**defaults.cpd(self.cpd_name), "fit": dict(fit_conf)}
-                for feat in dag.nodes
-            },
+            nodes_cpds=nodes_cpds,
         )
 
         t0 = time.time()
@@ -1152,7 +1162,9 @@ class VBNBackend(RewardBackend):
 def resolve_effective_vbn_n_samples(
     requested_n_samples: int, reward_support: Sequence[int]
 ) -> int:
-    return int(min(int(requested_n_samples), int(len(reward_support))))
+    support_size = int(len(reward_support))
+    requested = int(requested_n_samples)
+    return int(max(requested, 4 * support_size))
 
 
 def unique_preserve_order(items: Sequence[str]) -> List[str]:
@@ -1736,63 +1748,70 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
         and not torch.cuda.is_available()
     ):
         device_warning = "CUDA requested but unavailable; fell back to CPU."
-
+    """VBNBackend(
+        cpd_name="kde",
+        inf_method="monte_carlo_marginalization",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="kde",
+        inf_method="likelihood_weighting",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="kde",
+        inf_method="lbp",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="kde",
+        inf_method="importance_sampling",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="gaussian_nn",
+        inf_method="monte_carlo_marginalization",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="gaussian_nn",
+        inf_method="likelihood_weighting",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="gaussian_nn",
+        inf_method="lbp",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    ),
+    VBNBackend(
+        cpd_name="gaussian_nn",
+        inf_method="importance_sampling",
+        inf_n_samples=exp_cfg.vbn_inference_n_samples,
+        seed=exp_cfg.seed,
+        device=resolved_device,
+    )""",
     evaluated_backends = [
         VBNBackend(
-            cpd_name="kde",
-            inf_method="monte_carlo_marginalization",
+            cpd_name="softmax_nn",
+            inf_method="categorical_exact",
             inf_n_samples=exp_cfg.vbn_inference_n_samples,
             seed=exp_cfg.seed,
             device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="kde",
-            inf_method="likelihood_weighting",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="kde",
-            inf_method="lbp",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="kde",
-            inf_method="importance_sampling",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="gaussian_nn",
-            inf_method="monte_carlo_marginalization",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="gaussian_nn",
-            inf_method="likelihood_weighting",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="gaussian_nn",
-            inf_method="lbp",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
-        ),
-        VBNBackend(
-            cpd_name="gaussian_nn",
-            inf_method="importance_sampling",
-            inf_n_samples=exp_cfg.vbn_inference_n_samples,
-            seed=exp_cfg.seed,
-            device=resolved_device,
+            softmax_max_classes=exp_cfg.softmax_max_classes,
         ),
         PgmpyBackend(),
     ]
@@ -1989,6 +2008,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Include next_state nodes and data generation.",
     )
     parser.add_argument(
+        "--softmax-max-classes",
+        type=int,
+        default=default_cfg.softmax_max_classes,
+        help="Cap softmax_nn n_classes; 0 disables the cap.",
+    )
+    parser.add_argument(
         "--aggregation-mode",
         type=str,
         default=default_cfg.aggregation_mode,
@@ -2018,6 +2043,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
+    max_classes = int(args.softmax_max_classes)
+    if max_classes <= 0:
+        max_classes = None
     return ExperimentConfig(
         n_samples_df=args.n_samples_df,
         n_states_list=tuple(args.n_states_list),
@@ -2033,6 +2061,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         vbn_device=args.vbn_device,
         out_dir=args.out_dir,
         include_next_state=args.include_next_state,
+        softmax_max_classes=max_classes,
         metrics=tuple(args.metrics),
         inference_metrics=tuple(args.inference_metrics),
         aggregation_mode=args.aggregation_mode,
