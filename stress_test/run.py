@@ -59,6 +59,8 @@ class ExperimentConfig:
     embedded_softmax_embedding_dim: int = 8
     embedded_softmax_hidden_dims: Sequence[int] = (64, 64)
     categorical_table_alpha: float = 1.0
+    categorical_table_alpha_mode: str = "total_mass"
+    categorical_table_prior: str = "global"
     metrics: Sequence[str] = ("kl", "js", "ws", "fit_time")
     inference_metrics: Sequence[str] = (
         "kl",
@@ -1043,6 +1045,8 @@ class VBNBackend(RewardBackend):
     embedded_softmax_embedding_dim: int = 8
     embedded_softmax_hidden_dims: Sequence[int] = (64, 64)
     categorical_table_alpha: float = 1.0
+    categorical_table_alpha_mode: str = "total_mass"
+    categorical_table_prior: str = "global"
 
     @property
     def name(self) -> str:
@@ -1099,7 +1103,12 @@ class VBNBackend(RewardBackend):
                     "class_weighting": str(self.softmax_class_weighting),
                 }
             elif self.cpd_name == "categorical_table":
-                base = {**base, "alpha": float(self.categorical_table_alpha)}
+                base = {
+                    **base,
+                    "alpha": float(self.categorical_table_alpha),
+                    "alpha_mode": str(self.categorical_table_alpha_mode),
+                    "prior": str(self.categorical_table_prior),
+                }
             nodes_cpds[feat] = {**base, "fit": dict(fit_conf)}
 
         vbn.set_learning_method(
@@ -1856,8 +1865,9 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
         seed=exp_cfg.seed,
         device=resolved_device,
     )""",
-    evaluated_backends = [
-        VBNBackend(
+
+    """
+    VBNBackend(
             cpd_name="softmax_nn",
             inf_method="categorical_exact",
             inf_n_samples=exp_cfg.vbn_inference_n_samples,
@@ -1883,6 +1893,10 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
             embedded_softmax_hidden_dims=exp_cfg.embedded_softmax_hidden_dims,
             categorical_table_alpha=exp_cfg.categorical_table_alpha,
         ),
+    """
+
+    evaluated_backends = [
+        PgmpyBackend(),
         VBNBackend(
             cpd_name="categorical_table",
             inf_method="categorical_exact",
@@ -1895,8 +1909,39 @@ def run_experiments(exp_cfg: ExperimentConfig) -> None:
             embedded_softmax_embedding_dim=exp_cfg.embedded_softmax_embedding_dim,
             embedded_softmax_hidden_dims=exp_cfg.embedded_softmax_hidden_dims,
             categorical_table_alpha=exp_cfg.categorical_table_alpha,
+            categorical_table_alpha_mode=exp_cfg.categorical_table_alpha_mode,
+            categorical_table_prior=exp_cfg.categorical_table_prior,
         ),
-        PgmpyBackend(),
+        VBNBackend(
+            cpd_name="categorical_table",
+            inf_method="resampled_importance_sampling",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+            softmax_max_classes=exp_cfg.softmax_max_classes,
+            softmax_label_smoothing=exp_cfg.softmax_label_smoothing,
+            softmax_class_weighting=exp_cfg.softmax_class_weighting,
+            embedded_softmax_embedding_dim=exp_cfg.embedded_softmax_embedding_dim,
+            embedded_softmax_hidden_dims=exp_cfg.embedded_softmax_hidden_dims,
+            categorical_table_alpha=exp_cfg.categorical_table_alpha,
+            categorical_table_alpha_mode=exp_cfg.categorical_table_alpha_mode,
+            categorical_table_prior=exp_cfg.categorical_table_prior,
+        ),
+        VBNBackend(
+            cpd_name="categorical_table",
+            inf_method="resampled_importance_sampling",
+            inf_n_samples=exp_cfg.vbn_inference_n_samples,
+            seed=exp_cfg.seed,
+            device=resolved_device,
+            softmax_max_classes=exp_cfg.softmax_max_classes,
+            softmax_label_smoothing=exp_cfg.softmax_label_smoothing,
+            softmax_class_weighting=exp_cfg.softmax_class_weighting,
+            embedded_softmax_embedding_dim=exp_cfg.embedded_softmax_embedding_dim,
+            embedded_softmax_hidden_dims=exp_cfg.embedded_softmax_hidden_dims,
+            categorical_table_alpha=exp_cfg.categorical_table_alpha,
+            categorical_table_alpha_mode=exp_cfg.categorical_table_alpha_mode,
+            categorical_table_prior=exp_cfg.categorical_table_prior,
+        ),
     ]
     cpd_backend_names = unique_preserve_order(
         [get_backend_cpd_name(b) for b in evaluated_backends]
@@ -2129,7 +2174,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--categorical-table-alpha",
         type=float,
         default=default_cfg.categorical_table_alpha,
-        help="Dirichlet/Laplace smoothing for categorical_table.",
+        help=(
+            "Dirichlet/Laplace smoothing mass for categorical_table. Interpreted per "
+            "class when alpha_mode=per_class, or as total mass when alpha_mode=total_mass."
+        ),
+    )
+    parser.add_argument(
+        "--categorical-table-alpha-mode",
+        type=str,
+        default=default_cfg.categorical_table_alpha_mode,
+        choices=("per_class", "total_mass"),
+        help="Interpretation of categorical_table alpha.",
+    )
+    parser.add_argument(
+        "--categorical-table-prior",
+        type=str,
+        default=default_cfg.categorical_table_prior,
+        choices=("uniform", "global"),
+        help="Base prior for categorical_table smoothing.",
     )
     parser.add_argument(
         "--aggregation-mode",
@@ -2188,6 +2250,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         embedded_softmax_embedding_dim=args.embedded_softmax_embedding_dim,
         embedded_softmax_hidden_dims=tuple(args.embedded_softmax_hidden_dims),
         categorical_table_alpha=args.categorical_table_alpha,
+        categorical_table_alpha_mode=args.categorical_table_alpha_mode,
+        categorical_table_prior=args.categorical_table_prior,
         metrics=tuple(args.metrics),
         inference_metrics=tuple(args.inference_metrics),
         aggregation_mode=args.aggregation_mode,

@@ -32,14 +32,22 @@ class CategoricalTableCPD(BaseCPD):
         seed: Optional[int] = None,
         n_classes: int = 0,
         alpha: float = 1.0,
+        alpha_mode: str = "per_class",
+        prior: str = "uniform",
     ) -> None:
         super().__init__(
             input_dim=input_dim, output_dim=output_dim, device=device, seed=seed
         )
         self.n_classes = int(n_classes)
         self.alpha = float(alpha)
+        self.alpha_mode = str(alpha_mode).lower().strip()
+        self.prior = str(prior).lower().strip()
         if self.alpha < 0:
             raise ValueError("alpha must be >= 0")
+        if self.alpha_mode not in {"per_class", "total_mass"}:
+            raise ValueError("alpha_mode must be 'per_class' or 'total_mass'")
+        if self.prior not in {"uniform", "global"}:
+            raise ValueError("prior must be 'uniform' or 'global'")
 
         self._parent_values: Optional[list[torch.Tensor]] = None
         self._parent_cards: Optional[list[int]] = None
@@ -54,7 +62,12 @@ class CategoricalTableCPD(BaseCPD):
         self.register_buffer("_stats_ready", torch.tensor(False, device=self.device))
 
     def get_init_kwargs(self) -> dict:
-        return {"n_classes": self.n_classes, "alpha": self.alpha}
+        return {
+            "n_classes": self.n_classes,
+            "alpha": self.alpha,
+            "alpha_mode": self.alpha_mode,
+            "prior": self.prior,
+        }
 
     def get_extra_state(self) -> Optional[dict]:
         return {
@@ -192,6 +205,36 @@ class CategoricalTableCPD(BaseCPD):
             target_idx[:, d] = _map_values_to_indices(x_flat[:, d], support)
         return target_idx
 
+    def _prior_probs(
+        self,
+        target_idx: torch.Tensor,
+        class_mask: torch.Tensor,
+        n_classes: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        mask = class_mask.to(dtype=dtype)
+        output_dim = int(class_mask.shape[0])
+        if self.prior == "uniform":
+            probs = mask
+            denom = probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            return probs / denom
+
+        probs = torch.zeros(
+            output_dim, n_classes, device=target_idx.device, dtype=dtype
+        )
+        ones = torch.ones(target_idx.shape[0], device=target_idx.device, dtype=dtype)
+        for d in range(output_dim):
+            probs[d].scatter_add_(0, target_idx[:, d], ones)
+        probs = probs * mask
+        denom = probs.sum(dim=1, keepdim=True)
+        empty = denom.squeeze(-1) <= 1e-12
+        if torch.any(empty):
+            uniform = mask[empty]
+            uniform = uniform / uniform.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            probs[empty] = uniform
+            denom = probs.sum(dim=1, keepdim=True)
+        return probs / denom.clamp_min(1e-12)
+
     def fit(
         self,
         parents: Optional[torch.Tensor],
@@ -220,15 +263,11 @@ class CategoricalTableCPD(BaseCPD):
         parent_state_count = 1
         for card in self._parent_cards or []:
             parent_state_count *= int(card)
-        counts = torch.full(
+        counts = torch.zeros(
             (self.output_dim, parent_state_count, n_classes),
-            float(self.alpha),
             device=self.device,
             dtype=x_flat.dtype,
         )
-        if class_mask.numel() > 0:
-            invalid = ~class_mask.to(device=counts.device)
-            counts = counts.masked_fill(invalid.unsqueeze(1), 0.0)
 
         parent_idx = self._parents_to_index(parents)
         target_idx = self._targets_to_index(x_flat)
@@ -237,6 +276,20 @@ class CategoricalTableCPD(BaseCPD):
             flat = parent_idx * n_classes + target_idx[:, d]
             counts_d = counts[d].view(-1)
             counts_d.scatter_add_(0, flat, ones)
+
+        if self.alpha > 0:
+            prior_probs = self._prior_probs(
+                target_idx, class_mask, n_classes, counts.dtype
+            )
+            if self.alpha_mode == "per_class":
+                prior_mass = float(self.alpha) * float(n_classes)
+            else:
+                prior_mass = float(self.alpha)
+            counts = counts + prior_mass * prior_probs.unsqueeze(1)
+
+        if class_mask.numel() > 0:
+            invalid = ~class_mask.to(device=counts.device)
+            counts = counts.masked_fill(invalid.unsqueeze(1), 0.0)
 
         self._counts = counts
         self._stats_ready.fill_(True)

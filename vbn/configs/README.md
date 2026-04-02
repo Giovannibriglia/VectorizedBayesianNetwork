@@ -87,6 +87,9 @@ Exact categorical conditional tables with Dirichlet/Laplace smoothing.
 - **Fit time:** `O(M · D_x)` to build counts (plus table allocation)
 - **Eval time:** `O(B · D_x)` for lookup + normalization
 - **Sampling time:** `O(B · D_y)` via categorical draw
+- **Smoothing controls:** `alpha_mode=per_class` treats `alpha` as per-class mass, while
+  `alpha_mode=total_mass` keeps total prior mass fixed as cardinality grows. `prior`
+  can be `uniform` or `global` (empirical marginal).
 
 ### `categorical_embedded_softmax` (Embedded Categorical CPD)
 Embeddings for discrete parents feeding a softmax classifier.

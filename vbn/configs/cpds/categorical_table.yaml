@@ -1,6 +1,8 @@
 name: categorical_table
 n_classes: 0
 alpha: 1.0
+alpha_mode: total_mass
+prior: global
 fit:
   epochs: 1
   batch_size: 4096
