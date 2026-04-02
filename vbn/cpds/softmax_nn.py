@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vbn.config_cast import coerce_numbers, UPDATE_SCHEMA
@@ -212,6 +213,8 @@ class SoftmaxNNCPD(BaseCPD):
             raise ValueError(
                 f"Expected parents with 2D or 3D shape, got {tuple(parents.shape)}"
             )
+        parents = parents.to(device=self.device, dtype=x_flat.dtype)
+        x_flat = x_flat.to(device=self.device)
         return parents, x_flat
 
     def _compute_data_min_max(
@@ -474,18 +477,26 @@ class SoftmaxNNCPD(BaseCPD):
                         batch_x.shape[0],
                         self.output_dim,
                     ), f"targets shape {tuple(targets.shape)}"
-                log_probs = torch.log_softmax(logits, dim=-1)
-                target_one_hot = torch.nn.functional.one_hot(
-                    targets, num_classes=self.n_classes
-                ).float()
-                if eps > 0:
-                    target_one_hot = (1.0 - eps) * target_one_hot + eps / float(
-                        self.n_classes
+                if weights is None:
+                    logits_flat = logits.reshape(-1, self.n_classes)
+                    targets_flat = targets.reshape(-1)
+                    loss = F.cross_entropy(
+                        logits_flat,
+                        targets_flat,
+                        label_smoothing=eps,
                     )
-                if weights is not None:
+                else:
+                    log_probs = torch.log_softmax(logits, dim=-1)
+                    target_one_hot = torch.nn.functional.one_hot(
+                        targets, num_classes=self.n_classes
+                    ).float()
+                    if eps > 0:
+                        target_one_hot = (1.0 - eps) * target_one_hot + eps / float(
+                            self.n_classes
+                        )
                     weight_view = weights.view(1, 1, -1)
                     log_probs = log_probs * weight_view
-                loss = -(target_one_hot * log_probs).sum(dim=-1).mean()
+                    loss = -(target_one_hot * log_probs).sum(dim=-1).mean()
                 optimizer.zero_grad()
                 loss.backward()
                 if max_grad_norm is not None and max_grad_norm > 0:
