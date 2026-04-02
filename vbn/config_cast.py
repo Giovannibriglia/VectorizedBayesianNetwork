@@ -110,6 +110,7 @@ UPDATE_SCHEMA = {
     "n_steps": int,
     "batch_size": int,
     "weight_decay": float,
+    "max_grad_norm": float,
 }
 
 CPD_SCHEMAS = {
@@ -141,5 +142,12 @@ CPD_SCHEMAS = {
     "linear_gaussian": {
         "ridge": float,
         "min_scale": float,
+    },
+    "rff_gaussian": {
+        "n_features": int,
+        "lengthscale": float,
+        "ridge": float,
+        "min_scale": float,
+        "use_bias": bool,
     },
 }
