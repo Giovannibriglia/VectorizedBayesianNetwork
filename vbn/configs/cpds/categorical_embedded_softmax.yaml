@@ -1,0 +1,17 @@
+name: categorical_embedded_softmax
+n_classes: 0
+embedding_dim: 8
+hidden_dims: [64, 64]
+activation: relu
+label_smoothing: 0.0
+class_weighting: none
+fit:
+  epochs: 50
+  batch_size: 4096
+  lr: 1e-3
+  weight_decay: 0.0
+update:
+  n_steps: 1
+  batch_size: 128
+  lr: 1e-3
+  weight_decay: 0.0

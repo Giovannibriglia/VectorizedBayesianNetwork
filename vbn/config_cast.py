@@ -150,4 +150,15 @@ CPD_SCHEMAS = {
         "min_scale": float,
         "use_bias": bool,
     },
+    "categorical_table": {
+        "n_classes": int,
+        "alpha": float,
+    },
+    "categorical_embedded_softmax": {
+        "n_classes": int,
+        "embedding_dim": int,
+        "hidden_dims": list_of(int),
+        "label_smoothing": float,
+        "max_grad_norm": float,
+    },
 }

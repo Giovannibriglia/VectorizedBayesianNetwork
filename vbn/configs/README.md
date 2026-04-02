@@ -81,6 +81,20 @@ Closed-form ridge regression: `Y | X ~ N(XW + b, σ²)` (diagonal).
 - **Eval time:** `O(B · D_x · D_y)` for mean + `O(B · D_y)` for Gaussian log_prob
 - **Sampling time:** `O(B · D_y)` after mean computation
 
+### `categorical_table` (Tabular Categorical CPD)
+Exact categorical conditional tables with Dirichlet/Laplace smoothing.
+
+- **Fit time:** `O(M · D_x)` to build counts (plus table allocation)
+- **Eval time:** `O(B · D_x)` for lookup + normalization
+- **Sampling time:** `O(B · D_y)` via categorical draw
+
+### `categorical_embedded_softmax` (Embedded Categorical CPD)
+Embeddings for discrete parents feeding a softmax classifier.
+
+- **Fit time:** `O(T · B · (D_x · E + H · E + H · C))` where `E` is embedding dim
+- **Eval time:** `O(B · (D_x · E + H · E + H · C))`
+- **Sampling time:** `O(B · C)` for categorical sampling
+
 ### `rff_gaussian` (Random Fourier Features Gaussian CPD)
 Nonlinear Gaussian CPD via random Fourier features with closed-form ridge fit.
 

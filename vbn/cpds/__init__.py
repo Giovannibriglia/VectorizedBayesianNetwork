@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from vbn.core.registry import CPD_REGISTRY
 from vbn.cpds.base_cpd import BaseCPD, CPDOutput
+from vbn.cpds.categorical_embedded_softmax import CategoricalEmbeddedSoftmaxCPD
+from vbn.cpds.categorical_table import CategoricalTableCPD
 from vbn.cpds.gaussian_nn import GaussianNNCPD
 from vbn.cpds.kde import KDECPD
 from vbn.cpds.linear_gaussian import LinearGaussianCPD
@@ -13,6 +15,8 @@ __all__ = [
     "BaseCPD",
     "CPDOutput",
     "CPD_REGISTRY",
+    "CategoricalEmbeddedSoftmaxCPD",
+    "CategoricalTableCPD",
     "GaussianNNCPD",
     "KDECPD",
     "LinearGaussianCPD",

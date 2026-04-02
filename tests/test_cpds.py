@@ -14,8 +14,12 @@ def test_cpds_registry_suite():
     bar = tqdm(list(CPD_REGISTRY.items()), desc="CPDs", disable=bool(os.getenv("CI")))
     for name, cpd_cls in bar:
         bar.set_description(f"Testing CPD: {name}")
-        parents = torch.randn(batch, in_dim, device=device)
-        x = torch.randn(batch, out_dim, device=device)
+        if name in {"categorical_table", "categorical_embedded_softmax"}:
+            parents = torch.randint(0, 4, (batch, in_dim), device=device).float()
+            x = torch.randint(0, 4, (batch, out_dim), device=device).float()
+        else:
+            parents = torch.randn(batch, in_dim, device=device)
+            x = torch.randn(batch, out_dim, device=device)
         cpd = cpd_cls(input_dim=in_dim, output_dim=out_dim, device=device)
 
         cpd.fit(parents, x, epochs=1, batch_size=4)

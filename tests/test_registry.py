@@ -10,6 +10,8 @@ from vbn.core.registry import (
 
 def test_registries_have_defaults():
     assert "softmax_nn" in CPD_REGISTRY
+    assert "categorical_table" in CPD_REGISTRY
+    assert "categorical_embedded_softmax" in CPD_REGISTRY
     assert "gaussian_nn" in CPD_REGISTRY
     assert "kde" in CPD_REGISTRY
     assert "mdn" in CPD_REGISTRY

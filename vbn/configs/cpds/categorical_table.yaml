@@ -1,0 +1,13 @@
+name: categorical_table
+n_classes: 0
+alpha: 1.0
+fit:
+  epochs: 1
+  batch_size: 4096
+  lr: 1e-3
+  weight_decay: 0.0
+update:
+  n_steps: 1
+  batch_size: 128
+  lr: 1e-3
+  weight_decay: 0.0
