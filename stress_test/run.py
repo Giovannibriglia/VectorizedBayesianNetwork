@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import sys
 import time
@@ -1684,6 +1685,11 @@ def run_single_experiment(
                 inference_logs, inference_name, point_metrics, card
             )
             persist_benchmark(run_dir, cpd_logs, inference_logs)
+            if result.artifact is not None and str(
+                getattr(result.artifact, "device", "")
+            ).startswith("cuda"):
+                torch.cuda.empty_cache()
+            del inferred_pmf, inference_metrics, point_metrics, metrics_dict, result
 
         for key, group in vbn_groups.items():
             train_backend = group[0]
@@ -1713,6 +1719,7 @@ def run_single_experiment(
             append_fit_time(cpd_logs, result, card)
             append_comparison_metrics(cpd_logs, cpd_name, metrics_dict, card)
             persist_benchmark(run_dir, cpd_logs, inference_logs)
+            del metrics_dict
 
             for inf_backend in group:
                 inference_name = inf_backend.inference_result_name
@@ -1749,6 +1756,7 @@ def run_single_experiment(
                     inference_logs, inference_name, point_metrics, card
                 )
                 persist_benchmark(run_dir, cpd_logs, inference_logs)
+                del inferred_pmf, inference_metrics, point_metrics
 
             if key in training_cache:
                 del training_cache[key]
@@ -1759,6 +1767,20 @@ def run_single_experiment(
             del result
 
         del df
+        # Release per-card intermediates to avoid carrying state across cards.
+        del inference_queries
+        del ground_truth
+        del ground_truth_backend
+        del gt_inference_pmf
+        del gt_inference_support
+        del reward_support
+        del dag
+        del data_cfg
+        training_cache.clear()
+        del training_cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     del non_vbn_backends, vbn_groups
 
