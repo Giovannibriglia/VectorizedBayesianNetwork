@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover - best-effort fallback
         return iterable
 
 
+from benchmarking.bundles import BenchmarkBundle
 from benchmarking.utils import (
     ensure_dir,
     get_dataset_metadata_dir_generated,
@@ -26,17 +27,31 @@ class BaseDataDownloader(ABC):
     name: str
     test_datasets: list[str] | None = None
 
-    def __init__(self, root_path: Path, seed: int = 42, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        root_path: Path,
+        seed: int = 42,
+        *,
+        bundle: BenchmarkBundle | None = None,
+        **kwargs: Any,
+    ) -> None:
         self.root_path = Path(root_path).resolve()
         self.seed = int(seed)
+        self.bundle = bundle
         if not getattr(self, "name", None):
             raise ValueError("Downloader class must define a non-empty 'name'.")
-        self.datasets_dir = ensure_dir(
-            get_generator_datasets_dir(self.root_path, self.name)
-        )
-        self.generated_metadata_dir = ensure_dir(
-            get_generator_metadata_dir_generated(self.root_path, self.name)
-        )
+        if self.bundle is not None:
+            self.datasets_dir = ensure_dir(self.bundle.paths.datasets / self.name)
+            self.generated_metadata_dir = ensure_dir(
+                self.bundle.paths.root / "metadata"
+            )
+        else:
+            self.datasets_dir = ensure_dir(
+                get_generator_datasets_dir(self.root_path, self.name)
+            )
+            self.generated_metadata_dir = ensure_dir(
+                get_generator_metadata_dir_generated(self.root_path, self.name)
+            )
 
     @abstractmethod
     def download(
@@ -47,8 +62,8 @@ class BaseDataDownloader(ABC):
     ) -> None:
         """
         Main download method.
-        Must create dataset artifacts under benchmarking/data/datasets/<generator>/<problem>/
-        and write generated metadata under benchmarking/data/metadata/<generator>/.
+        Must create dataset artifacts under the bundle datasets/<generator>/<problem>/.
+        When no bundle is provided, falls back to the legacy benchmarking/data/datasets layout.
         """
 
     def dataset_id(self, dataset_name: str) -> str:
@@ -73,6 +88,14 @@ class BaseDataDownloader(ABC):
     def save_metadata(self, metadata: dict, filename: str | None = None) -> Path:
         if "timestamp" not in metadata:
             metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
+        if self.bundle is not None:
+            # Attach download metadata into bundle spec/config
+            self.bundle.update_seeds({"download": int(self.seed)})
+            config = dict(self.bundle.spec.config)
+            config["download"] = metadata
+            self.bundle._replace_spec(config=config)
+            self.bundle.save_metadata()
+            return self.bundle.paths.metadata
         name = filename or f"{self.name}.json"
         metadata_path = self.generated_metadata_dir / name
         write_json(metadata_path, metadata)
@@ -86,9 +109,15 @@ class BaseDataDownloader(ABC):
     def write_dataset_metadata(
         self, dataset_id: str, filename: str, payload: dict
     ) -> Path:
-        metadata_dir = ensure_dir(
-            get_dataset_metadata_dir_generated(self.root_path, self.name, dataset_id)
-        )
-        path = metadata_dir / filename
+        if self.bundle is not None:
+            dataset_dir = ensure_dir(self.datasets_dir / dataset_id)
+            path = dataset_dir / filename
+        else:
+            metadata_dir = ensure_dir(
+                get_dataset_metadata_dir_generated(
+                    self.root_path, self.name, dataset_id
+                )
+            )
+            path = metadata_dir / filename
         write_json(path, payload)
         return path

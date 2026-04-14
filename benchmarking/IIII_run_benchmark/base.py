@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 from vbn.utils.device_logging import log_device
 
+from benchmarking.bundles import BenchmarkBundle
 from benchmarking.models import get_benchmark_model
 from benchmarking.models.config import apply_overrides, config_hash
 from benchmarking.models.presets import get_preset_config
@@ -25,6 +27,7 @@ from benchmarking.utils_errors import (
     ErrorSummary,
     render_error_summary_md,
 )
+from benchmarking.utils_logging import setup_logging
 
 
 @dataclass(frozen=True)
@@ -231,6 +234,7 @@ class BaseBenchmarkRunner(ABC):
         self,
         *,
         root: Path,
+        bundle: BenchmarkBundle,
         seed: int,
         mode: str,
         models: list[str],
@@ -242,10 +246,12 @@ class BaseBenchmarkRunner(ABC):
         store_full_query: bool = False,
         progress: bool = True,
         batch_size_queries: int = 1,
+        log_level: str = "INFO",
     ) -> None:
         if not getattr(self, "generator", None):
             raise ValueError("Benchmark runner must define 'generator'.")
         self.root = Path(root).resolve()
+        self.bundle = bundle
         self.seed = int(seed)
         resolved_mode = str(mode).strip().lower()
         if resolved_mode not in {"cpds", "inference"}:
@@ -264,7 +270,16 @@ class BaseBenchmarkRunner(ABC):
         self.batch_size_queries = int(batch_size_queries)
         if self.batch_size_queries < 1:
             raise ValueError("batch_size_queries must be >= 1")
+        self.log_level = str(log_level).upper()
         self.logger = logging.getLogger(__name__)
+        if self.bundle.spec.generator != self.generator:
+            raise ValueError(
+                f"Bundle generator mismatch: {self.bundle.spec.generator} != {self.generator}"
+            )
+        if self.bundle.spec.mode != self.mode:
+            raise ValueError(
+                f"Bundle mode mismatch: {self.bundle.spec.mode} != {self.mode}"
+            )
 
     def _resolve_model_device(self, model) -> object | None:
         device = getattr(model, "device", None)
@@ -294,8 +309,7 @@ class BaseBenchmarkRunner(ABC):
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_root = ensure_dir(get_generator_out_dir(self.root, self.generator))
         run_dir = ensure_dir(out_root / f"benchmark_{self.mode}_{timestamp}")
-        ensure_dir(run_dir / "cpds")
-        ensure_dir(run_dir / "inference")
+        ensure_dir(run_dir / "results")
         ensure_dir(run_dir / "logs")
         ensure_dir(run_dir / "configs")
         ensure_dir(run_dir / "errors")
@@ -306,12 +320,29 @@ class BaseBenchmarkRunner(ABC):
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return f"sha256:{digest}"
 
+    def _git_commit(self) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self.root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            return None
+        return None
+
     def _write_run_metadata(
         self,
         run_dir: Path,
         *,
         timestamp: str,
         datasets_run: list[str],
+        counts: dict[str, Any] | None = None,
+        git_commit: str | None = None,
     ) -> None:
         backends: list[str] = []
         preset_names: list[str] = []
@@ -336,15 +367,24 @@ class BaseBenchmarkRunner(ABC):
             "timestamp": timestamp,
             "generator": self.generator,
             "seed": int(self.seed),
-            "preset_backend": unique_backends[0] if unique_backends else None,
-            "preset_name": unique_presets[0] if unique_presets else None,
+            "bundle_dir": str(self.bundle.paths.root),
             "datasets_run": list(datasets_run),
             "models": model_entries,
         }
+        if counts is not None:
+            payload["counts"] = counts
+        if git_commit:
+            payload["git_commit"] = git_commit
+        if self.bundle.spec.seeds:
+            payload["bundle_seeds"] = dict(self.bundle.spec.seeds)
         if len(unique_backends) > 1:
             payload["preset_backends"] = unique_backends
         if len(unique_presets) > 1:
             payload["preset_names"] = unique_presets
+        if unique_backends:
+            payload["preset_backend"] = unique_backends[0]
+        if unique_presets:
+            payload["preset_name"] = unique_presets[0]
         write_json(run_dir / "run_metadata.json", payload)
 
     def _safe_model_tag(self, name: str) -> str:
@@ -527,56 +567,28 @@ class BaseBenchmarkRunner(ABC):
             snapshot["config_hash"] = model_config_hashes[model_name]
             snapshot["run_key"] = config.run_key()
             write_json(configs_dir / f"{model_tag}.json", snapshot)
+
         run_id = run_dir.name
         timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_path = run_dir / "logs" / "run.log"
-
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
-        for handler in list(root_logger.handlers):
-            root_logger.removeHandler(handler)
-
-        fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(fmt)
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(fmt)
-        root_logger.addHandler(file_handler)
-        root_logger.addHandler(console_handler)
-
-        def _flush_logs() -> None:
-            for handler in root_logger.handlers:
-                try:
-                    handler.flush()
-                except Exception:
-                    pass
-
+        setup_logging(level=self.log_level, log_path=log_path)
         self.logger = logging.getLogger(f"benchmark.{self.generator}")
-        self.logger.info("Logging to %s", log_path)
-        _flush_logs()
 
-        self.logger.info("Benchmark output: %s", run_dir)
-        self.logger.info("Benchmark mode: %s", self.mode)
-        log_device(self.logger, phase="benchmark_start", once_key="benchmark_start")
         problem_dirs = self.list_problem_dirs()
         if self.max_problems is not None:
             problem_dirs = problem_dirs[: int(self.max_problems)]
         total_problems = len(problem_dirs)
-        self._write_run_metadata(
-            run_dir,
-            timestamp=run_timestamp,
-            datasets_run=[p.name for p in problem_dirs],
-        )
+
         self.logger.info(
-            "Run config: generator=%s seed=%s models=%s problems=%s",
+            "Benchmark run: bundle=%s mode=%s generator=%s models=%s problems=%s out=%s",
+            self.bundle.paths.root,
+            self.mode,
             self.generator,
-            self.seed,
             ",".join(self.models),
             total_problems,
+            run_dir,
         )
-        model_files: Dict[str, dict] = {}
+
         model_stats: Dict[str, dict] = {}
         error_summary = ErrorSummary()
         summary: dict = {
@@ -593,15 +605,10 @@ class BaseBenchmarkRunner(ABC):
         run_cpds = self.mode == "cpds"
         run_inference = self.mode == "inference"
         stage_map = self._stage_for_mode()
+        results_root = ensure_dir(run_dir / "results")
+        problem_counts: dict[str, dict[str, int]] = {}
 
         for model_name in self.models:
-            model_tag = self._safe_model_tag(model_name)
-            cpd_path = run_dir / "cpds" / f"{model_tag}.jsonl"
-            inf_path = run_dir / "inference" / f"{model_tag}.jsonl"
-            model_files[model_name] = {
-                "cpd": cpd_path.open("w", encoding="utf-8"),
-                "inf": inf_path.open("w", encoding="utf-8"),
-            }
             model_stats[model_name] = {
                 "problems": {"ok": 0, "skipped": 0, "error": 0},
                 "queries": {
@@ -615,63 +622,171 @@ class BaseBenchmarkRunner(ABC):
                 "inference": _StreamingStats(),
             }
 
-        try:
-            for idx, dataset_dir in enumerate(problem_dirs, start=1):
-                load_result = self.load_problem_assets(dataset_dir)
-                problem = load_result.problem
-                if load_result.skipped or load_result.assets is None:
-                    for model_name in self.models:
-                        model_stats[model_name]["problems"]["skipped"] += 1
-                    self.logger.info(
-                        "Skipping problem %s (%s/%s): %s",
-                        problem,
-                        idx,
-                        len(problem_dirs),
-                        load_result.reason,
-                    )
-                    _flush_logs()
-                    continue
+        def _model_meta_placeholder(
+            alias: str,
+            backend: str,
+            config,
+            config_hash_value: str,
+        ) -> dict:
+            if config is None:
+                components = {}
+                config_id = None
+            else:
+                components = {
+                    "learning": {
+                        "name": config.learning.name,
+                        "key": config.learning.key,
+                    },
+                    "cpd": {"name": config.cpd.name, "key": config.cpd.key},
+                    "inference": {
+                        "name": config.inference.name,
+                        "key": config.inference.key,
+                    },
+                }
+                config_id = config.config_id
+            return {
+                "alias": alias,
+                "backend": backend,
+                "name": backend,
+                "version": None,
+                "family": "unknown",
+                "kwargs_hash": self._hash_kwargs(),
+                "config_id": config_id,
+                "config_hash": config_hash_value,
+                "components": components,
+            }
 
-                assets = load_result.assets
-                dag = assets.dag
-                n_nodes = int(dag.number_of_nodes())
-                n_edges = int(dag.number_of_edges())
-                cpd_queries = assets.queries.get("cpd_queries", []) if run_cpds else []
-                inf_queries = (
-                    assets.queries.get("inference_queries", []) if run_inference else []
-                )
-                gt_meta = assets.queries.get("ground_truth")
-                if isinstance(gt_meta, dict):
-                    ground_truth_sources[problem] = dict(gt_meta)
-                self.logger.info(
-                    "Starting problem %s (%s/%s)",
+        def _write_failure_records(
+            handle,
+            *,
+            queries: list[dict],
+            qtype: str,
+            model_meta: dict,
+            problem_meta: dict,
+            run_meta: dict,
+            error_type: str,
+            error_msg: str,
+            error_stage: str,
+        ) -> int:
+            info = classify_error(error_type, error_msg)
+            is_oom = info["is_oom"]
+            error_signature = info["error_signature"]
+            for q_index, query in enumerate(queries):
+                record = {
+                    "mode": self.mode,
+                    "run": run_meta,
+                    "model": model_meta,
+                    "problem": problem_meta,
+                    "query": self._compact_query(
+                        query, qtype, q_index, problem_meta["id"]
+                    ),
+                    "result": {
+                        "ok": False,
+                        "error_type": error_type,
+                        "error_msg": error_msg,
+                        "error_stage": error_stage,
+                        "is_oom": is_oom,
+                        "error_signature": error_signature,
+                        "timing_ms": 0.0,
+                        "output": None,
+                    },
+                }
+                if qtype == "inference":
+                    record["batching"] = {
+                        "enabled": False,
+                        "batch_size": 1,
+                        "skeleton_id": (query.get("evidence") or {}).get("skeleton_id")
+                        or query.get("skeleton_id"),
+                    }
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            return len(queries)
+
+        problem_iter = (
+            tqdm(problem_dirs, desc="Problems", unit="problem")
+            if self.progress
+            else problem_dirs
+        )
+        for idx, dataset_dir in enumerate(problem_iter, start=1):
+            load_result = self.load_problem_assets(dataset_dir)
+            problem = load_result.problem
+            if load_result.skipped or load_result.assets is None:
+                for model_name in self.models:
+                    model_stats[model_name]["problems"]["skipped"] += 1
+                self.logger.warning(
+                    "Skipping problem %s (%s/%s): %s",
                     problem,
                     idx,
-                    len(problem_dirs),
+                    total_problems,
+                    load_result.reason,
                 )
-                self.logger.info("DAG size: |V|=%s |E|=%s", n_nodes, n_edges)
-                self.logger.info("Data shape: %s", assets.data_df.shape)
-                self.logger.info("#CPD queries: %s", len(cpd_queries))
-                self.logger.info("#Inference queries: %s", len(inf_queries))
-                _flush_logs()
+                continue
 
-                for model_name in self.models:
-                    model_start = time.perf_counter()
-                    ok_cpd = 0
-                    err_cpd = 0
-                    ok_inf = 0
-                    err_inf = 0
-                    cpd_err_logged = 0
-                    inf_err_logged = 0
-                    max_logged_query_errors = 5
-                    cpd_timing_sum = 0.0
-                    inf_timing_sum = 0.0
+            assets = load_result.assets
+            dag = assets.dag
+            n_nodes = int(dag.number_of_nodes())
+            n_edges = int(dag.number_of_edges())
+            cpd_queries = assets.queries.get("cpd_queries", []) if run_cpds else []
+            inf_queries = (
+                assets.queries.get("inference_queries", []) if run_inference else []
+            )
+            problem_counts[problem] = {
+                "cpd": int(len(cpd_queries)),
+                "inference": int(len(inf_queries)),
+                "total": int(len(cpd_queries) + len(inf_queries)),
+            }
+            gt_meta = assets.queries.get("ground_truth")
+            if isinstance(gt_meta, dict):
+                ground_truth_sources[problem] = dict(gt_meta)
 
+            self.logger.info(
+                "Problem %s (%s/%s): nodes=%s edges=%s cpd=%s inf=%s",
+                problem,
+                idx,
+                total_problems,
+                n_nodes,
+                n_edges,
+                len(cpd_queries),
+                len(inf_queries),
+            )
+
+            problem_results_dir = ensure_dir(results_root / problem)
+            model_iter = (
+                tqdm(self.models, desc=f"{problem} models", unit="model", leave=False)
+                if self.progress
+                else self.models
+            )
+
+            for model_name in model_iter:
+                model_start = time.perf_counter()
+                ok_cpd = err_cpd = ok_inf = err_inf = 0
+                cpd_timing_sum = 0.0
+                inf_timing_sum = 0.0
+                cpd_err_logged = 0
+                inf_err_logged = 0
+                max_logged_query_errors = 3
+
+                base_model = self._base_model_name(model_name)
+                model_config = model_configs[model_name]
+                model_config_hash = model_config_hashes[model_name]
+                model_meta: dict
+                result_path = (
+                    problem_results_dir / f"{self._safe_model_tag(model_name)}.jsonl"
+                )
+
+                run_meta = {
+                    "generator": self.generator,
+                    "seed": int(self.seed),
+                    "timestamp_utc": timestamp_utc,
+                    "run_id": run_id,
+                    "mode": self.mode,
+                    "progress": bool(self.progress),
+                }
+                problem_meta = self._problem_info(problem, assets.dag)
+
+                with result_path.open("w", encoding="utf-8") as handle:
                     try:
-                        base_model = self._base_model_name(model_name)
                         model_cls = get_benchmark_model(base_model)
-                        model_config = model_configs[model_name]
-                        model_config_hash = model_config_hashes[model_name]
                         model = model_cls(
                             dag=assets.dag,
                             seed=self.seed,
@@ -679,19 +794,14 @@ class BaseBenchmarkRunner(ABC):
                             benchmark_config=model_config,
                             **self.model_kwargs,
                         )
-                        self.logger.info(
-                            "[%s] Model init ok. benchmark_config=%s",
-                            model_name,
-                            getattr(model, "benchmark_config", None),
-                        )
-                        self.logger.info(
-                            "[%s] Debug=%s",
-                            model_name,
-                            getattr(model, "_debug", None),
+                        model_meta = self._model_info(
+                            model,
+                            config=model_config,
+                            config_hash_value=model_config_hash,
+                            alias=model_name,
+                            backend=base_model,
                         )
                     except Exception as exc:
-                        reason = f"Model init failed: {type(exc).__name__}: {exc}"
-                        self.logger.info("[%s] %s", model_name, reason)
                         info = classify_error(type(exc).__name__, str(exc))
                         error_summary.add(
                             model=model_name,
@@ -703,34 +813,46 @@ class BaseBenchmarkRunner(ABC):
                             is_oom=info["is_oom"],
                         )
                         model_stats[model_name]["problems"]["error"] += 1
-                        _flush_logs()
+                        model_meta = _model_meta_placeholder(
+                            model_name, base_model, model_config, model_config_hash
+                        )
+                        if run_cpds:
+                            err_cpd += _write_failure_records(
+                                handle,
+                                queries=cpd_queries,
+                                qtype="cpd",
+                                model_meta=model_meta,
+                                problem_meta=problem_meta,
+                                run_meta=run_meta,
+                                error_type=type(exc).__name__,
+                                error_msg=str(exc),
+                                error_stage="model_init",
+                            )
+                        if run_inference:
+                            err_inf += _write_failure_records(
+                                handle,
+                                queries=inf_queries,
+                                qtype="inference",
+                                model_meta=model_meta,
+                                problem_meta=problem_meta,
+                                run_meta=run_meta,
+                                error_type=type(exc).__name__,
+                                error_msg=str(exc),
+                                error_stage="model_init",
+                            )
+                        model_stats[model_name]["queries"]["cpd"]["error"] += err_cpd
+                        model_stats[model_name]["queries"]["inference"][
+                            "error"
+                        ] += err_inf
                         continue
 
                     try:
                         model_device = self._resolve_model_device(model)
-                        self.logger.info(
-                            "[vbn] Model=%s Method=learning:%s cpd:%s inference:%s Phase=fit_start",
-                            model_name,
-                            model_config.learning.name,
-                            model_config.cpd.name,
-                            model_config.inference.name,
-                        )
                         log_device(self.logger, phase="fit_start", device=model_device)
-                        self.logger.info("[%s] Fit start", model_name)
-                        _flush_logs()
-                        _, fit_ms = timed_call(
+                        _, _ = timed_call(
                             model.fit, assets.data_df, progress=self.progress
                         )
-                        self.logger.info("[%s] Fit done in %.3f ms", model_name, fit_ms)
-                        _flush_logs()
                     except Exception as exc:
-                        self.logger.exception(
-                            "[%s] Fit failed for problem=%s",
-                            model_name,
-                            problem,
-                        )
-                        reason = f"Fit failed: {type(exc).__name__}: {exc}"
-                        self.logger.info("[%s] %s", model_name, reason)
                         info = classify_error(type(exc).__name__, str(exc))
                         error_summary.add(
                             model=model_name,
@@ -742,332 +864,356 @@ class BaseBenchmarkRunner(ABC):
                             is_oom=info["is_oom"],
                         )
                         model_stats[model_name]["problems"]["error"] += 1
-                        model_files[model_name]["cpd"].flush()
-                        model_files[model_name]["inf"].flush()
-                        _flush_logs()
+                        if run_cpds:
+                            err_cpd += _write_failure_records(
+                                handle,
+                                queries=cpd_queries,
+                                qtype="cpd",
+                                model_meta=model_meta,
+                                problem_meta=problem_meta,
+                                run_meta=run_meta,
+                                error_type=type(exc).__name__,
+                                error_msg=str(exc),
+                                error_stage="fit",
+                            )
+                        if run_inference:
+                            err_inf += _write_failure_records(
+                                handle,
+                                queries=inf_queries,
+                                qtype="inference",
+                                model_meta=model_meta,
+                                problem_meta=problem_meta,
+                                run_meta=run_meta,
+                                error_type=type(exc).__name__,
+                                error_msg=str(exc),
+                                error_stage="fit",
+                            )
+                        model_stats[model_name]["queries"]["cpd"]["error"] += err_cpd
+                        model_stats[model_name]["queries"]["inference"][
+                            "error"
+                        ] += err_inf
                         continue
 
-                    run_meta = {
-                        "generator": self.generator,
-                        "seed": int(self.seed),
-                        "timestamp_utc": timestamp_utc,
-                        "run_id": run_id,
-                        "mode": self.mode,
-                        "progress": bool(self.progress),
-                    }
-                    model_meta = self._model_info(
-                        model,
-                        config=model_config,
-                        config_hash_value=model_config_hash,
-                        alias=model_name,
-                        backend=base_model,
-                    )
-                    problem_meta = self._problem_info(problem, assets.dag)
-
-                    self.logger.info(
-                        "[%s] CPD start: n=%s", model_name, len(cpd_queries)
-                    )
-                    _flush_logs()
-                    cpd_desc = f"{self.generator}/{problem} | {model_name} | CPD"
-                    cpd_bar = (
-                        tqdm(cpd_queries, desc=cpd_desc, leave=False)
-                        if self.progress
-                        else None
-                    )
-                    cpd_iter = cpd_bar if cpd_bar is not None else cpd_queries
-                    for q_index, query in enumerate(cpd_iter):
-                        start = time.perf_counter()
-                        response = {}
-                        try:
-                            response = model.answer_cpd_query(query)
-                            response = dict(response or {})
-                            ok = bool(response.get("ok"))
-                            error_msg = response.get("error")
-                            error_type = None if not error_msg else "ModelError"
-                            output = self._normalize_output(response.get("result"))
-                        except Exception as exc:
-                            if cpd_err_logged < max_logged_query_errors:
-                                self.logger.exception(
-                                    "[%s] CPD query error problem=%s idx=%s target=%s evidence_vars=%s",
-                                    model_name,
-                                    problem,
-                                    q_index,
-                                    query.get("target"),
-                                    (query.get("evidence") or {}).get("vars")
-                                    or query.get("evidence_vars"),
-                                )
-                                cpd_err_logged += 1
-                            ok = False
-                            error_type = type(exc).__name__
-                            error_msg = str(exc)
-                            output = None
-                        if error_msg is not None and not isinstance(error_msg, str):
-                            error_msg = str(error_msg)
-                        if not ok and not error_type:
-                            error_type = "ModelError"
-                        error_stage = stage_map["query"]
-                        is_oom = None
-                        error_signature = None
-                        if not ok and (error_msg or error_type):
-                            info = classify_error(error_type, error_msg)
-                            is_oom = info["is_oom"]
-                            error_signature = info["error_signature"]
-                            error_summary.add(
-                                model=model_name,
-                                problem=problem,
-                                error_type=error_type,
-                                error_signature=error_signature,
-                                error_stage=error_stage,
-                                error_msg=error_msg,
-                                is_oom=is_oom,
+                    if run_cpds:
+                        cpd_bar = (
+                            tqdm(
+                                cpd_queries,
+                                desc=f"{problem} | {model_name} | CPD",
+                                leave=False,
                             )
-                        if (
-                            not ok
-                            and error_msg
-                            and cpd_err_logged < max_logged_query_errors
-                        ):
-                            debug_payload = None
-                            if isinstance(response, dict):
-                                debug_payload = (
-                                    response.get("result", {}) if response else None
-                                )
-                            if (
-                                isinstance(debug_payload, dict)
-                                and "debug" in debug_payload
-                            ):
-                                self.logger.error(
-                                    "[%s] CPD debug payload: %s",
-                                    model_name,
-                                    debug_payload.get("debug"),
-                                )
-                                cpd_err_logged += 1
-                        elapsed = (time.perf_counter() - start) * 1000.0
-                        cpd_timing_sum += elapsed
-                        if ok:
-                            ok_cpd += 1
-                        else:
-                            err_cpd += 1
-                        model_stats[model_name]["_timing"]["cpd"].add(float(elapsed))
-
-                        record = {
-                            "mode": self.mode,
-                            "run": run_meta,
-                            "model": model_meta,
-                            "problem": problem_meta,
-                            "query": self._compact_query(
-                                query, "cpd", q_index, problem
-                            ),
-                            "result": {
-                                "ok": bool(ok),
-                                "error_type": error_type,
-                                "error_msg": error_msg,
-                                "error_stage": error_stage if not ok else None,
-                                "is_oom": is_oom if not ok else None,
-                                "error_signature": error_signature if not ok else None,
-                                "timing_ms": float(elapsed),
-                                "output": output,
-                            },
-                        }
-                        model_files[model_name]["cpd"].write(
-                            json.dumps(record, sort_keys=True) + "\n"
+                            if self.progress
+                            else None
                         )
-                        model_files[model_name]["cpd"].flush()
-
-                        avg_ms = cpd_timing_sum / max(1, ok_cpd + err_cpd)
-                        if cpd_bar is not None:
-                            cpd_bar.set_postfix(
-                                ok=ok_cpd, err=err_cpd, avg=f"{avg_ms:.2f}"
-                            )
-                        if not ok and error_msg:
-                            message = (
-                                f"{self.generator}/{problem} [{model_name}] CPD query "
-                                f"{q_index} error: {error_type}: {error_msg}"
-                            )
-                            if cpd_bar is not None:
-                                tqdm.write(message)
-                            else:
-                                self.logger.warning(message)
-                    if cpd_bar is not None:
-                        cpd_bar.close()
-                    self.logger.info(
-                        "[%s] CPDs done: ok=%s err=%s avg=%.2fms",
-                        model_name,
-                        ok_cpd,
-                        err_cpd,
-                        cpd_timing_sum / max(1, ok_cpd + err_cpd),
-                    )
-                    _flush_logs()
-
-                    inf_desc = f"{self.generator}/{problem} | {model_name} | Inference"
-                    self.logger.info(
-                        "[vbn] Model=%s Method=learning:%s cpd:%s inference:%s Phase=inference_start",
-                        model_name,
-                        model_config.learning.name,
-                        model_config.cpd.name,
-                        model_config.inference.name,
-                    )
-                    log_device(
-                        self.logger, phase="inference_start", device=model_device
-                    )
-                    self.logger.info(
-                        "[%s] Inference start: n=%s", model_name, len(inf_queries)
-                    )
-                    _flush_logs()
-                    inf_bar = (
-                        tqdm(total=len(inf_queries), desc=inf_desc, leave=False)
-                        if self.progress
-                        else None
-                    )
-                    batch_size_queries = int(getattr(self, "batch_size_queries", 1))
-                    if batch_size_queries > 1:
-                        self.logger.info(
-                            "[%s] Inference batching: batch_size_queries=%s supported=%s",
-                            model_name,
-                            batch_size_queries,
-                            bool(
-                                getattr(
-                                    model, "supports_batched_inference_queries", False
-                                )
-                            ),
-                        )
-                        _flush_logs()
-                    self.logger.info(
-                        "[vbn] Model=%s Method=learning:%s cpd:%s inference:%s Phase=query_answering_start",
-                        model_name,
-                        model_config.learning.name,
-                        model_config.cpd.name,
-                        model_config.inference.name,
-                    )
-                    log_device(
-                        self.logger,
-                        phase="query_answering_start",
-                        device=model_device,
-                    )
-                    for chunk in _iter_inference_batches(
-                        inf_queries,
-                        batch_size_queries,
-                        default_dataset_id=problem,
-                    ):
-                        if not chunk:
-                            continue
-                        batch_queries = [query for _, query in chunk]
-                        use_batch = _should_use_batched_inference(
-                            model, batch_size_queries, len(batch_queries)
-                        )
-                        if use_batch:
+                        cpd_iter = cpd_bar if cpd_bar is not None else cpd_queries
+                        for q_index, query in enumerate(cpd_iter):
                             start = time.perf_counter()
-                            responses: list[dict] | None = None
-                            batch_error: Exception | None = None
+                            response = {}
                             try:
-                                responses = _execute_inference_chunk(
-                                    model,
-                                    batch_queries,
-                                    batch_size=batch_size_queries,
-                                )
-                                if len(responses) != len(batch_queries):
-                                    raise ValueError(
-                                        "Batched inference returned unexpected response count"
-                                    )
+                                response = model.answer_cpd_query(query)
+                                response = dict(response or {})
+                                ok = bool(response.get("ok"))
+                                error_msg = response.get("error")
+                                error_type = None if not error_msg else "ModelError"
+                                output = self._normalize_output(response.get("result"))
                             except Exception as exc:
-                                batch_error = exc
-                                responses = None
-                            elapsed = (time.perf_counter() - start) * 1000.0
-                            per_query_ms = elapsed / max(1, len(batch_queries))
-                            if batch_error is not None:
-                                if inf_err_logged < max_logged_query_errors:
-                                    self.logger.exception(
-                                        "[%s] Inference batch error problem=%s target=%s batch_size=%s",
+                                if (
+                                    self.logger.isEnabledFor(logging.DEBUG)
+                                    and cpd_err_logged < max_logged_query_errors
+                                ):
+                                    self.logger.debug(
+                                        "CPD query error model=%s problem=%s idx=%s: %s",
                                         model_name,
                                         problem,
-                                        (
-                                            batch_queries[0].get("target")
-                                            if batch_queries
-                                            else None
-                                        ),
-                                        len(batch_queries),
+                                        q_index,
+                                        exc,
                                     )
-                                    inf_err_logged += 1
-                                for q_index, query in chunk:
-                                    error_type = type(batch_error).__name__
-                                    error_msg = str(batch_error)
-                                    if error_msg is not None and not isinstance(
-                                        error_msg, str
-                                    ):
-                                        error_msg = str(error_msg)
-                                    ok = False
-                                    output = None
-                                    error_stage = stage_map["batch"]
-                                    info = classify_error(error_type, error_msg)
-                                    is_oom = info["is_oom"]
-                                    error_signature = info["error_signature"]
-                                    error_summary.add(
-                                        model=model_name,
-                                        problem=problem,
-                                        error_type=error_type,
-                                        error_signature=error_signature,
-                                        error_stage=error_stage,
-                                        error_msg=error_msg,
-                                        is_oom=is_oom,
-                                    )
-                                    inf_timing_sum += per_query_ms
-                                    err_inf += 1
-                                    model_stats[model_name]["_timing"]["inference"].add(
-                                        float(per_query_ms)
-                                    )
-                                    skeleton_id = (query.get("evidence") or {}).get(
-                                        "skeleton_id"
-                                    ) or query.get("skeleton_id")
-                                    record = {
-                                        "mode": self.mode,
-                                        "run": run_meta,
-                                        "model": model_meta,
-                                        "problem": problem_meta,
-                                        "query": self._compact_query(
-                                            query, "inference", q_index, problem
-                                        ),
-                                        "result": {
-                                            "ok": bool(ok),
-                                            "error_type": error_type,
-                                            "error_msg": error_msg,
-                                            "error_stage": error_stage,
-                                            "is_oom": is_oom,
-                                            "error_signature": error_signature,
-                                            "timing_ms": float(per_query_ms),
-                                            "output": output,
-                                        },
-                                        "batching": {
-                                            "enabled": True,
-                                            "batch_size": int(len(batch_queries)),
-                                            "skeleton_id": skeleton_id,
-                                        },
-                                    }
-                                    model_files[model_name]["inf"].write(
-                                        json.dumps(record, sort_keys=True) + "\n"
-                                    )
-                                    model_files[model_name]["inf"].flush()
-                                    if not ok and error_msg:
-                                        message = (
-                                            f"{self.generator}/{problem} [{model_name}] Inference query "
-                                            f"{q_index} error: {error_type}: {error_msg}"
-                                        )
-                                        if inf_bar is not None:
-                                            tqdm.write(message)
-                                        else:
-                                            self.logger.warning(message)
+                                    cpd_err_logged += 1
+                                ok = False
+                                error_type = type(exc).__name__
+                                error_msg = str(exc)
+                                output = None
+                            if error_msg is not None and not isinstance(error_msg, str):
+                                error_msg = str(error_msg)
+                            if not ok and not error_type:
+                                error_type = "ModelError"
+                            error_stage = stage_map["query"]
+                            is_oom = None
+                            error_signature = None
+                            if not ok and (error_msg or error_type):
+                                info = classify_error(error_type, error_msg)
+                                is_oom = info["is_oom"]
+                                error_signature = info["error_signature"]
+                                error_summary.add(
+                                    model=model_name,
+                                    problem=problem,
+                                    error_type=error_type,
+                                    error_signature=error_signature,
+                                    error_stage=error_stage,
+                                    error_msg=error_msg,
+                                    is_oom=is_oom,
+                                )
+                            elapsed = (time.perf_counter() - start) * 1000.0
+                            cpd_timing_sum += elapsed
+                            if ok:
+                                ok_cpd += 1
                             else:
-                                for (q_index, query), response in zip(
-                                    chunk, responses or []
-                                ):
-                                    if isinstance(response, dict):
-                                        response = dict(response or {})
-                                    else:
-                                        response = {}
-                                    ok = bool(response.get("ok"))
-                                    error_msg = response.get("error")
-                                    error_type = None if not error_msg else "ModelError"
-                                    output = self._normalize_output(
-                                        response.get("result")
+                                err_cpd += 1
+                            model_stats[model_name]["_timing"]["cpd"].add(
+                                float(elapsed)
+                            )
+
+                            record = {
+                                "mode": self.mode,
+                                "run": run_meta,
+                                "model": model_meta,
+                                "problem": problem_meta,
+                                "query": self._compact_query(
+                                    query, "cpd", q_index, problem
+                                ),
+                                "result": {
+                                    "ok": bool(ok),
+                                    "error_type": error_type,
+                                    "error_msg": error_msg,
+                                    "error_stage": error_stage if not ok else None,
+                                    "is_oom": is_oom if not ok else None,
+                                    "error_signature": (
+                                        error_signature if not ok else None
+                                    ),
+                                    "timing_ms": float(elapsed),
+                                    "output": output,
+                                },
+                            }
+                            handle.write(json.dumps(record, sort_keys=True) + "\n")
+                            if cpd_bar is not None:
+                                avg_ms = cpd_timing_sum / max(1, ok_cpd + err_cpd)
+                                cpd_bar.set_postfix(
+                                    ok=ok_cpd, err=err_cpd, avg=f"{avg_ms:.2f}"
+                                )
+                        if cpd_bar is not None:
+                            cpd_bar.close()
+
+                    if run_inference:
+                        inf_bar = (
+                            tqdm(
+                                total=len(inf_queries),
+                                desc=f"{problem} | {model_name} | Inference",
+                                leave=False,
+                            )
+                            if self.progress
+                            else None
+                        )
+                        batch_size_queries = int(getattr(self, "batch_size_queries", 1))
+                        for chunk in _iter_inference_batches(
+                            inf_queries,
+                            batch_size_queries,
+                            default_dataset_id=problem,
+                        ):
+                            if not chunk:
+                                continue
+                            batch_queries = [query for _, query in chunk]
+                            use_batch = _should_use_batched_inference(
+                                model, batch_size_queries, len(batch_queries)
+                            )
+                            if use_batch:
+                                start = time.perf_counter()
+                                responses: list[dict] | None = None
+                                batch_error: Exception | None = None
+                                try:
+                                    responses = _execute_inference_chunk(
+                                        model,
+                                        batch_queries,
+                                        batch_size=batch_size_queries,
                                     )
+                                    if len(responses) != len(batch_queries):
+                                        raise ValueError(
+                                            "Batched inference returned unexpected response count"
+                                        )
+                                except Exception as exc:
+                                    batch_error = exc
+                                    responses = None
+                                elapsed = (time.perf_counter() - start) * 1000.0
+                                per_query_ms = elapsed / max(1, len(batch_queries))
+                                if batch_error is not None:
+                                    if (
+                                        self.logger.isEnabledFor(logging.DEBUG)
+                                        and inf_err_logged < max_logged_query_errors
+                                    ):
+                                        self.logger.debug(
+                                            "Inference batch error model=%s problem=%s: %s",
+                                            model_name,
+                                            problem,
+                                            batch_error,
+                                        )
+                                        inf_err_logged += 1
+                                    for q_index, query in chunk:
+                                        error_type = type(batch_error).__name__
+                                        error_msg = str(batch_error)
+                                        if error_msg is not None and not isinstance(
+                                            error_msg, str
+                                        ):
+                                            error_msg = str(error_msg)
+                                        ok = False
+                                        output = None
+                                        error_stage = stage_map["batch"]
+                                        info = classify_error(error_type, error_msg)
+                                        is_oom = info["is_oom"]
+                                        error_signature = info["error_signature"]
+                                        error_summary.add(
+                                            model=model_name,
+                                            problem=problem,
+                                            error_type=error_type,
+                                            error_signature=error_signature,
+                                            error_stage=error_stage,
+                                            error_msg=error_msg,
+                                            is_oom=is_oom,
+                                        )
+                                        inf_timing_sum += per_query_ms
+                                        err_inf += 1
+                                        model_stats[model_name]["_timing"][
+                                            "inference"
+                                        ].add(float(per_query_ms))
+                                        skeleton_id = (query.get("evidence") or {}).get(
+                                            "skeleton_id"
+                                        ) or query.get("skeleton_id")
+                                        record = {
+                                            "mode": self.mode,
+                                            "run": run_meta,
+                                            "model": model_meta,
+                                            "problem": problem_meta,
+                                            "query": self._compact_query(
+                                                query, "inference", q_index, problem
+                                            ),
+                                            "result": {
+                                                "ok": bool(ok),
+                                                "error_type": error_type,
+                                                "error_msg": error_msg,
+                                                "error_stage": error_stage,
+                                                "is_oom": is_oom,
+                                                "error_signature": error_signature,
+                                                "timing_ms": float(per_query_ms),
+                                                "output": output,
+                                            },
+                                            "batching": {
+                                                "enabled": True,
+                                                "batch_size": int(len(batch_queries)),
+                                                "skeleton_id": skeleton_id,
+                                            },
+                                        }
+                                        handle.write(
+                                            json.dumps(record, sort_keys=True) + "\n"
+                                        )
+                                else:
+                                    for (q_index, query), response in zip(
+                                        chunk, responses or []
+                                    ):
+                                        if isinstance(response, dict):
+                                            response = dict(response or {})
+                                        else:
+                                            response = {}
+                                        ok = bool(response.get("ok"))
+                                        error_msg = response.get("error")
+                                        error_type = (
+                                            None if not error_msg else "ModelError"
+                                        )
+                                        output = self._normalize_output(
+                                            response.get("result")
+                                        )
+                                        if error_msg is not None and not isinstance(
+                                            error_msg, str
+                                        ):
+                                            error_msg = str(error_msg)
+                                        if not ok and not error_type:
+                                            error_type = "ModelError"
+                                        error_stage = stage_map["query"]
+                                        is_oom = None
+                                        error_signature = None
+                                        if not ok and (error_msg or error_type):
+                                            info = classify_error(error_type, error_msg)
+                                            is_oom = info["is_oom"]
+                                            error_signature = info["error_signature"]
+                                            error_summary.add(
+                                                model=model_name,
+                                                problem=problem,
+                                                error_type=error_type,
+                                                error_signature=error_signature,
+                                                error_stage=error_stage,
+                                                error_msg=error_msg,
+                                                is_oom=is_oom,
+                                            )
+                                        inf_timing_sum += per_query_ms
+                                        if ok:
+                                            ok_inf += 1
+                                        else:
+                                            err_inf += 1
+                                        model_stats[model_name]["_timing"][
+                                            "inference"
+                                        ].add(float(per_query_ms))
+                                        skeleton_id = (query.get("evidence") or {}).get(
+                                            "skeleton_id"
+                                        ) or query.get("skeleton_id")
+                                        record = {
+                                            "mode": self.mode,
+                                            "run": run_meta,
+                                            "model": model_meta,
+                                            "problem": problem_meta,
+                                            "query": self._compact_query(
+                                                query, "inference", q_index, problem
+                                            ),
+                                            "result": {
+                                                "ok": bool(ok),
+                                                "error_type": error_type,
+                                                "error_msg": error_msg,
+                                                "error_stage": (
+                                                    error_stage if not ok else None
+                                                ),
+                                                "is_oom": is_oom if not ok else None,
+                                                "error_signature": (
+                                                    error_signature if not ok else None
+                                                ),
+                                                "timing_ms": float(per_query_ms),
+                                                "output": output,
+                                            },
+                                            "batching": {
+                                                "enabled": True,
+                                                "batch_size": int(len(batch_queries)),
+                                                "skeleton_id": skeleton_id,
+                                            },
+                                        }
+                                        handle.write(
+                                            json.dumps(record, sort_keys=True) + "\n"
+                                        )
+                            else:
+                                for q_index, query in chunk:
+                                    start = time.perf_counter()
+                                    response = {}
+                                    try:
+                                        response = model.answer_inference_query(query)
+                                        response = dict(response or {})
+                                        ok = bool(response.get("ok"))
+                                        error_msg = response.get("error")
+                                        error_type = (
+                                            None if not error_msg else "ModelError"
+                                        )
+                                        output = self._normalize_output(
+                                            response.get("result")
+                                        )
+                                    except Exception as exc:
+                                        if (
+                                            self.logger.isEnabledFor(logging.DEBUG)
+                                            and inf_err_logged < max_logged_query_errors
+                                        ):
+                                            self.logger.debug(
+                                                "Inference query error model=%s problem=%s idx=%s: %s",
+                                                model_name,
+                                                problem,
+                                                q_index,
+                                                exc,
+                                            )
+                                            inf_err_logged += 1
+                                        ok = False
+                                        error_type = type(exc).__name__
+                                        error_msg = str(exc)
+                                        output = None
                                     if error_msg is not None and not isinstance(
                                         error_msg, str
                                     ):
@@ -1090,35 +1236,14 @@ class BaseBenchmarkRunner(ABC):
                                             error_msg=error_msg,
                                             is_oom=is_oom,
                                         )
-                                    if (
-                                        not ok
-                                        and error_msg
-                                        and inf_err_logged < max_logged_query_errors
-                                    ):
-                                        debug_payload = None
-                                        if isinstance(response, dict):
-                                            debug_payload = (
-                                                response.get("result", {})
-                                                if response
-                                                else None
-                                            )
-                                        if (
-                                            isinstance(debug_payload, dict)
-                                            and "debug" in debug_payload
-                                        ):
-                                            self.logger.error(
-                                                "[%s] Inference debug payload: %s",
-                                                model_name,
-                                                debug_payload.get("debug"),
-                                            )
-                                            inf_err_logged += 1
-                                    inf_timing_sum += per_query_ms
+                                    elapsed = (time.perf_counter() - start) * 1000.0
+                                    inf_timing_sum += elapsed
                                     if ok:
                                         ok_inf += 1
                                     else:
                                         err_inf += 1
                                     model_stats[model_name]["_timing"]["inference"].add(
-                                        float(per_query_ms)
+                                        float(elapsed)
                                     )
 
                                     skeleton_id = (query.get("evidence") or {}).get(
@@ -1143,176 +1268,26 @@ class BaseBenchmarkRunner(ABC):
                                             "error_signature": (
                                                 error_signature if not ok else None
                                             ),
-                                            "timing_ms": float(per_query_ms),
+                                            "timing_ms": float(elapsed),
                                             "output": output,
                                         },
                                         "batching": {
-                                            "enabled": True,
-                                            "batch_size": int(len(batch_queries)),
+                                            "enabled": False,
+                                            "batch_size": 1,
                                             "skeleton_id": skeleton_id,
                                         },
                                     }
-                                    model_files[model_name]["inf"].write(
+                                    handle.write(
                                         json.dumps(record, sort_keys=True) + "\n"
                                     )
-                                    model_files[model_name]["inf"].flush()
-                                    if not ok and error_msg:
-                                        message = (
-                                            f"{self.generator}/{problem} [{model_name}] Inference query "
-                                            f"{q_index} error: {error_type}: {error_msg}"
-                                        )
-                                        if inf_bar is not None:
-                                            tqdm.write(message)
-                                        else:
-                                            self.logger.warning(message)
-                            avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
                             if inf_bar is not None:
+                                avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
                                 inf_bar.update(len(chunk))
                                 inf_bar.set_postfix(
                                     ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}"
                                 )
-                        else:
-                            for q_index, query in chunk:
-                                start = time.perf_counter()
-                                response = {}
-                                try:
-                                    response = model.answer_inference_query(query)
-                                    response = dict(response or {})
-                                    ok = bool(response.get("ok"))
-                                    error_msg = response.get("error")
-                                    error_type = None if not error_msg else "ModelError"
-                                    output = self._normalize_output(
-                                        response.get("result")
-                                    )
-                                except Exception as exc:
-                                    if inf_err_logged < max_logged_query_errors:
-                                        self.logger.exception(
-                                            "[%s] Inference query error problem=%s idx=%s target=%s evidence_vars=%s",
-                                            model_name,
-                                            problem,
-                                            q_index,
-                                            query.get("target"),
-                                            (query.get("evidence") or {}).get("vars")
-                                            or query.get("evidence_vars"),
-                                        )
-                                        inf_err_logged += 1
-                                    ok = False
-                                    error_type = type(exc).__name__
-                                    error_msg = str(exc)
-                                    output = None
-                                if error_msg is not None and not isinstance(
-                                    error_msg, str
-                                ):
-                                    error_msg = str(error_msg)
-                                if not ok and not error_type:
-                                    error_type = "ModelError"
-                                error_stage = stage_map["query"]
-                                is_oom = None
-                                error_signature = None
-                                if not ok and (error_msg or error_type):
-                                    info = classify_error(error_type, error_msg)
-                                    is_oom = info["is_oom"]
-                                    error_signature = info["error_signature"]
-                                    error_summary.add(
-                                        model=model_name,
-                                        problem=problem,
-                                        error_type=error_type,
-                                        error_signature=error_signature,
-                                        error_stage=error_stage,
-                                        error_msg=error_msg,
-                                        is_oom=is_oom,
-                                    )
-                                if (
-                                    not ok
-                                    and error_msg
-                                    and inf_err_logged < max_logged_query_errors
-                                ):
-                                    debug_payload = None
-                                    if isinstance(response, dict):
-                                        debug_payload = (
-                                            response.get("result", {})
-                                            if response
-                                            else None
-                                        )
-                                    if (
-                                        isinstance(debug_payload, dict)
-                                        and "debug" in debug_payload
-                                    ):
-                                        self.logger.error(
-                                            "[%s] Inference debug payload: %s",
-                                            model_name,
-                                            debug_payload.get("debug"),
-                                        )
-                                        inf_err_logged += 1
-                                elapsed = (time.perf_counter() - start) * 1000.0
-                                inf_timing_sum += elapsed
-                                if ok:
-                                    ok_inf += 1
-                                else:
-                                    err_inf += 1
-                                model_stats[model_name]["_timing"]["inference"].add(
-                                    float(elapsed)
-                                )
-
-                                skeleton_id = (query.get("evidence") or {}).get(
-                                    "skeleton_id"
-                                ) or query.get("skeleton_id")
-                                record = {
-                                    "mode": self.mode,
-                                    "run": run_meta,
-                                    "model": model_meta,
-                                    "problem": problem_meta,
-                                    "query": self._compact_query(
-                                        query, "inference", q_index, problem
-                                    ),
-                                    "result": {
-                                        "ok": bool(ok),
-                                        "error_type": error_type,
-                                        "error_msg": error_msg,
-                                        "error_stage": error_stage if not ok else None,
-                                        "is_oom": is_oom if not ok else None,
-                                        "error_signature": (
-                                            error_signature if not ok else None
-                                        ),
-                                        "timing_ms": float(elapsed),
-                                        "output": output,
-                                    },
-                                    "batching": {
-                                        "enabled": False,
-                                        "batch_size": 1,
-                                        "skeleton_id": skeleton_id,
-                                    },
-                                }
-                                model_files[model_name]["inf"].write(
-                                    json.dumps(record, sort_keys=True) + "\n"
-                                )
-                                model_files[model_name]["inf"].flush()
-
-                                avg_ms = inf_timing_sum / max(1, ok_inf + err_inf)
-                                if inf_bar is not None:
-                                    inf_bar.update(1)
-                                    inf_bar.set_postfix(
-                                        ok=ok_inf, err=err_inf, avg=f"{avg_ms:.2f}"
-                                    )
-                                if not ok and error_msg:
-                                    message = (
-                                        f"{self.generator}/{problem} [{model_name}] Inference query "
-                                        f"{q_index} error: {error_type}: {error_msg}"
-                                    )
-                                    if inf_bar is not None:
-                                        tqdm.write(message)
-                                    else:
-                                        self.logger.warning(message)
-                    if inf_bar is not None:
-                        inf_bar.close()
-                    self.logger.info(
-                        "[%s] Inference done: ok=%s err=%s avg=%.2fms",
-                        model_name,
-                        ok_inf,
-                        err_inf,
-                        inf_timing_sum / max(1, ok_inf + err_inf),
-                    )
-                    _flush_logs()
+                        if inf_bar is not None:
+                            inf_bar.close()
 
                     total_ms = (time.perf_counter() - model_start) * 1000.0
                     model_stats[model_name]["problems"]["ok"] += 1
@@ -1324,66 +1299,58 @@ class BaseBenchmarkRunner(ABC):
                         float(total_ms)
                     )
 
-                    model_files[model_name]["cpd"].flush()
-                    model_files[model_name]["inf"].flush()
+            del assets
+            gc.collect()
 
-                del assets
-                gc.collect()
-
-            for model_name in self.models:
-                model_files[model_name]["cpd"].close()
-                model_files[model_name]["inf"].close()
-                stats = model_stats[model_name]
-                timing = stats.pop("_timing")
-                cpd_summary = timing["cpd"].summary()
-                inf_summary = timing["inference"].summary()
-                stats["queries"]["cpd"].update(
-                    {
-                        "avg_ms": cpd_summary["avg_ms"],
-                        "median_ms": cpd_summary["median_ms"],
-                    }
-                )
-                stats["queries"]["inference"].update(
-                    {
-                        "avg_ms": inf_summary["avg_ms"],
-                        "median_ms": inf_summary["median_ms"],
-                    }
-                )
-                stats["timing_ms"]["total_ms"] = float(
-                    sum(stats["timing_ms"]["per_problem"].values())
-                    if stats["timing_ms"]["per_problem"]
-                    else 0.0
-                )
-                summary["models"][model_name] = stats
-
-            if ground_truth_sources:
-                summary["ground_truth"] = ground_truth_sources
-                write_json(run_dir / "ground_truth_sources.json", ground_truth_sources)
-
-            summary_path = run_dir / "summary.json"
-            write_json(summary_path, summary)
-
-            errors_payload = error_summary.to_dict()
-            write_json(run_dir / "errors" / "errors_summary.json", errors_payload)
-            (run_dir / "errors" / "errors_summary.md").write_text(
-                render_error_summary_md(errors_payload)
+        for model_name in self.models:
+            stats = model_stats[model_name]
+            timing = stats.pop("_timing")
+            cpd_summary = timing["cpd"].summary()
+            inf_summary = timing["inference"].summary()
+            stats["queries"]["cpd"].update(
+                {
+                    "avg_ms": cpd_summary["avg_ms"],
+                    "median_ms": cpd_summary["median_ms"],
+                }
             )
-            return run_dir
-        finally:
-            for model_name, files in model_files.items():
-                for handle in files.values():
-                    try:
-                        handle.flush()
-                        handle.close()
-                    except Exception:
-                        pass
-            for handler in list(root_logger.handlers):
-                try:
-                    handler.flush()
-                    handler.close()
-                except Exception:
-                    pass
-                try:
-                    root_logger.removeHandler(handler)
-                except Exception:
-                    pass
+            stats["queries"]["inference"].update(
+                {
+                    "avg_ms": inf_summary["avg_ms"],
+                    "median_ms": inf_summary["median_ms"],
+                }
+            )
+            stats["timing_ms"]["total_ms"] = float(
+                sum(stats["timing_ms"]["per_problem"].values())
+                if stats["timing_ms"]["per_problem"]
+                else 0.0
+            )
+            summary["models"][model_name] = stats
+
+        if ground_truth_sources:
+            summary["ground_truth"] = ground_truth_sources
+            write_json(run_dir / "ground_truth_sources.json", ground_truth_sources)
+
+        summary_path = run_dir / "summary.json"
+        write_json(summary_path, summary)
+
+        counts_payload = {
+            "n_problems": int(total_problems),
+            "queries_per_problem": problem_counts,
+            "queries_total": int(
+                sum(entry.get("total", 0) for entry in problem_counts.values())
+            ),
+        }
+        self._write_run_metadata(
+            run_dir,
+            timestamp=run_timestamp,
+            datasets_run=[p.name for p in problem_dirs],
+            counts=counts_payload,
+            git_commit=self._git_commit(),
+        )
+
+        errors_payload = error_summary.to_dict()
+        write_json(run_dir / "errors" / "errors_summary.json", errors_payload)
+        (run_dir / "errors" / "errors_summary.md").write_text(
+            render_error_summary_md(errors_payload)
+        )
+        return run_dir

@@ -8,6 +8,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from benchmarking.bundles import BenchmarkBundle
+
 
 def _bnlearn_module():
     return importlib.import_module("benchmarking.III_data_generation.bnlearn")
@@ -59,17 +61,29 @@ def test_generate_alarm_small(tmp_path: Path) -> None:
     if not src_dataset.exists():
         pytest.skip("alarm dataset not available in repo")
 
-    dst_dataset = tmp_path / "benchmarking/data/datasets/bnlearn/alarm"
+    bundle_root = tmp_path / "benchmarking" / "data" / "benchmarks"
+    bundle = BenchmarkBundle.create(
+        mode="cpds",
+        generator="bnlearn",
+        seed=0,
+        root=bundle_root,
+        bundle_id="benchmark_cpds_test",
+    )
+
+    dst_dataset = bundle.paths.datasets / "bnlearn" / "alarm"
     dst_dataset.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_dataset, dst_dataset)
 
     src_meta = repo_root / "benchmarking/data/metadata/bnlearn/alarm/download.json"
-    dst_meta_dir = tmp_path / "benchmarking/data/metadata/bnlearn/alarm"
-    dst_meta_dir.mkdir(parents=True, exist_ok=True)
     if src_meta.exists():
-        shutil.copy2(src_meta, dst_meta_dir / "download.json")
+        shutil.copy2(src_meta, dst_dataset / "download.json")
 
-    generator = module.BNLearnDataGenerator(root_path=tmp_path, seed=0, n_samples=10)
+    generator = module.BNLearnDataGenerator(
+        root_path=tmp_path,
+        seed=0,
+        n_samples=10,
+        bundle=bundle,
+    )
     outputs = generator.generate_all()
     assert outputs
 
@@ -78,13 +92,11 @@ def test_generate_alarm_small(tmp_path: Path) -> None:
     df = _read_dataset(data_files[0])
     assert len(df) == 10
 
-    domain_path = tmp_path / "benchmarking/data/metadata/bnlearn/alarm/domain.json"
+    domain_path = dst_dataset / "domain.json"
     assert domain_path.exists()
     domain = json.loads(domain_path.read_text())
     expected_cols = set(domain.get("nodes", {}).keys())
     assert set(df.columns) == expected_cols
 
-    gen_meta_path = (
-        tmp_path / "benchmarking/data/metadata/bnlearn/alarm/data_generation.json"
-    )
+    gen_meta_path = dst_dataset / "data_generation.json"
     assert gen_meta_path.exists()

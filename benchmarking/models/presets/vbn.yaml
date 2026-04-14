@@ -5,28 +5,19 @@ cpds:
       kwargs: {}
     cpds:
       default:
-        method: softmax_nn
+        method: categorical_table
         kwargs: {}
 
-  vbn_softmax:
+  vbn_ct:
     learning:
       method: node_wise
       kwargs: {}
     cpds:
       default:
-        method: softmax_nn
+        method: categorical_table
         kwargs: {}
 
-  vbn_gauss:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
-        method: gaussian_nn
-        kwargs: {}
-
-  vbn_linear_gauss:
+  vbn_lg:
     learning:
       method: node_wise
       kwargs: {}
@@ -34,15 +25,6 @@ cpds:
       default:
         method: linear_gaussian
         kwargs: {}
-
-  vbn_kde:
-    learning:
-      method: node_wise
-      kwargs: { }
-    cpds:
-      default:
-        method: kde
-        kwargs: { }
 
 inference:
   default:
@@ -51,80 +33,68 @@ inference:
       kwargs: {}
     cpds:
       default:
-        method: softmax_nn
-        kwargs: {}
-    inference:
-      method: importance_sampling
-      kwargs: {}
-
-  vbn_softmax_is:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
-        method: softmax_nn
-        kwargs: {}
-    inference:
-      method: importance_sampling
-      kwargs: {}
-
-  vbn_softmax_mcm:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
-        method: softmax_nn
-        kwargs: {}
-    inference:
-      method: monte_carlo_marginalization
-      kwargs: {}
-
-  vbn_gauss_is:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
-        method: gaussian_nn
-        kwargs: {}
-    inference:
-      method: importance_sampling
-      kwargs: {}
-
-  vbn_gauss_mcm:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
-        method: gaussian_nn
-        kwargs: {}
-    inference:
-      method: monte_carlo_marginalization
-      kwargs: {}
-
-  vbn_linear_gauss_is:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
-        method: linear_gaussian
-        kwargs: {}
-    inference:
-      method: importance_sampling
-      kwargs: {}
-
-  vbn_linear_gauss_mcm:
-    learning:
-      method: node_wise
-      kwargs: {}
-    cpds:
-      default:
         method: linear_gaussian
         kwargs: {}
     inference:
       method: monte_carlo_marginalization
       kwargs: {}
+
+  vbn_lg_mcm:
+    learning:
+      method: node_wise
+      kwargs: { }
+    cpds:
+      default:
+        method: linear_gaussian
+        kwargs: { }
+    inference:
+      method: monte_carlo_marginalization
+      kwargs: { }
+
+  vbn_ct_ce:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: categorical_table
+        kwargs: {}
+    inference:
+      method: categorical_exact
+      kwargs: {}
+
+  vbn_ct_ris:
+    learning:
+      method: node_wise
+      kwargs: {}
+    cpds:
+      default:
+        method: categorical_table
+        kwargs: {}
+    inference:
+      method: resampled_importance_sampling
+      kwargs: {}
+
+  vbn_lg_rao:
+    learning:
+      method: node_wise
+      kwargs: { }
+    cpds:
+      default:
+        method: linear_gaussian
+        kwargs: { }
+    inference:
+      method: rao_blackwellized_marginalization
+      kwargs: { }
+
+  vbn_lg_exact:
+    learning:
+      method: node_wise
+      kwargs: { }
+    cpds:
+      default:
+        method: linear_gaussian
+        kwargs: { }
+    inference:
+      method: gaussian_exact
+      kwargs: { }

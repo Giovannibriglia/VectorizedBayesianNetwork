@@ -8,6 +8,15 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - best-effort fallback
+
+    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+        return iterable
+
+
+from benchmarking.bundles import BenchmarkBundle
 from benchmarking.utils import (
     ensure_dir,
     get_generator_datasets_dir,
@@ -31,11 +40,13 @@ class BaseQueryGenerator(ABC):
         n_queries_by_type: dict | None = None,
         n_mc: int | None = None,
         generator_kwargs: dict | None = None,
+        bundle: BenchmarkBundle | None = None,
         **kwargs: Any,
     ) -> None:
         self.root_path = Path(root_path).resolve()
         self.seed = int(seed)
         self.mode = self._normalize_mode(mode)
+        self.bundle = bundle
         if not getattr(self, "name", None):
             raise ValueError("Query generator class must define a non-empty 'name'.")
 
@@ -67,15 +78,25 @@ class BaseQueryGenerator(ABC):
         if self.n_mc <= 0:
             raise ValueError("n_mc must be a positive integer")
 
-        self.datasets_dir = ensure_dir(
-            get_generator_datasets_dir(self.root_path, self.name)
-        )
-        self.queries_dir = ensure_dir(
-            get_generator_queries_dir(self.root_path, self.name)
-        )
-        self.generator_log_dir = ensure_dir(
-            get_generator_queries_log_dir(self.root_path, self.name)
-        )
+        if self.bundle is not None:
+            self.datasets_dir = ensure_dir(self.bundle.paths.datasets / self.name)
+            self.queries_dir = ensure_dir(self.bundle.paths.queries / self.name)
+            self.ground_truth_dir = ensure_dir(
+                self.bundle.paths.ground_truth / self.name
+            )
+            self.generator_log_dir = ensure_dir(
+                self.bundle.paths.root / "logs" / "queries" / self.name
+            )
+        else:
+            self.datasets_dir = ensure_dir(
+                get_generator_datasets_dir(self.root_path, self.name)
+            )
+            self.queries_dir = ensure_dir(
+                get_generator_queries_dir(self.root_path, self.name)
+            )
+            self.generator_log_dir = ensure_dir(
+                get_generator_queries_log_dir(self.root_path, self.name)
+            )
 
     @staticmethod
     def _normalize_mode(mode: str | None) -> str:
@@ -160,12 +181,15 @@ class BaseQueryGenerator(ABC):
         logger_name = f"benchmarking.query.{self.name}.{dataset_id}"
         logger = logging.getLogger(logger_name)
         logger.setLevel(logging.INFO)
-        logger.propagate = False
+        logger.propagate = True
         logger.handlers.clear()
-        handler = logging.FileHandler(log_path)
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        try:
+            handler = logging.FileHandler(log_path)
+            formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        except Exception:
+            pass
         return logger
 
     def _queries_path(self, dataset_id: str, mode: str) -> Path:
@@ -183,7 +207,10 @@ class BaseQueryGenerator(ABC):
         return dataset_dir / "queries.json"
 
     def _ground_truth_path(self, dataset_id: str) -> Path:
-        dataset_dir = ensure_dir(self.queries_dir / dataset_id)
+        if hasattr(self, "ground_truth_dir"):
+            dataset_dir = ensure_dir(self.ground_truth_dir / dataset_id)
+        else:
+            dataset_dir = ensure_dir(self.queries_dir / dataset_id)
         return dataset_dir / "ground_truth.jsonl"
 
     def _write_jsonl(self, path: Path, records: list[dict]) -> None:
@@ -196,7 +223,9 @@ class BaseQueryGenerator(ABC):
         outputs: list[Path] = []
         dataset_dirs = self.list_dataset_dirs()
         root_logger = logging.getLogger(__name__)
-        for dataset_dir in dataset_dirs:
+        for dataset_dir in tqdm(
+            dataset_dirs, desc=f"{self.name} queries", unit="dataset"
+        ):
             dataset_id = dataset_dir.name
             logger = self._logger_for(dataset_id)
             dataset_seed = self._stable_seed(dataset_id)
@@ -214,6 +243,9 @@ class BaseQueryGenerator(ABC):
                 logger.info("Skipping dataset %s", dataset_id)
                 root_logger.warning("Skipping dataset %s", dataset_id)
                 continue
+            root_base = (
+                self.bundle.paths.root if self.bundle is not None else self.root_path
+            )
             gt_records = payload.pop("ground_truth_records", None)
             gt_path = payload.pop("ground_truth_path", None)
             gt_status = payload.pop("ground_truth_status", None)
@@ -223,11 +255,7 @@ class BaseQueryGenerator(ABC):
                     Path(gt_path) if gt_path else self._ground_truth_path(dataset_id)
                 )
                 self._write_jsonl(gt_path, list(gt_records))
-                try:
-                    rel_path = gt_path.resolve().relative_to(self.root_path)
-                    gt_path_value = str(rel_path)
-                except Exception:
-                    gt_path_value = str(gt_path)
+                gt_path_value = _rel_path(root_base, gt_path)
                 payload["ground_truth"] = {
                     "source": "query_generation",
                     "path": gt_path_value,
@@ -240,18 +268,12 @@ class BaseQueryGenerator(ABC):
             cpd_queries = list(payload.pop("cpd_queries", []) or [])
             inf_queries = list(payload.pop("inference_queries", []) or [])
 
-            def _rel_path(path: Path) -> str:
-                try:
-                    return str(path.resolve().relative_to(self.root_path))
-                except Exception:
-                    return str(path)
-
             queries_meta: dict[str, dict[str, object]] = {}
             if self.mode in {"cpds", "both"}:
                 cpd_path = self._queries_path(dataset_id, "cpds")
                 self._write_jsonl(cpd_path, cpd_queries)
                 queries_meta["cpds"] = {
-                    "path": _rel_path(cpd_path),
+                    "path": _rel_path(root_base, cpd_path),
                     "count": len(cpd_queries),
                 }
                 logger.info("Wrote CPD queries to %s", cpd_path)
@@ -260,7 +282,7 @@ class BaseQueryGenerator(ABC):
                 inf_path = self._queries_path(dataset_id, "inference")
                 self._write_jsonl(inf_path, inf_queries)
                 queries_meta["inference"] = {
-                    "path": _rel_path(inf_path),
+                    "path": _rel_path(root_base, inf_path),
                     "count": len(inf_queries),
                 }
                 logger.info("Wrote inference queries to %s", inf_path)
@@ -272,6 +294,38 @@ class BaseQueryGenerator(ABC):
             logger.info("Wrote query metadata to %s", meta_path)
             root_logger.info("Wrote query metadata to %s", meta_path)
             outputs.append(meta_path)
+            if self.bundle is not None:
+                rel_queries = _rel_path(
+                    self.bundle.paths.root, self.queries_dir / dataset_id
+                )
+                rel_gt = (
+                    _rel_path(self.bundle.paths.root, gt_path)
+                    if gt_records is not None
+                    else None
+                )
+                rel_meta = _rel_path(self.bundle.paths.root, meta_path)
+                self.bundle.update_artifact(
+                    dataset_id,
+                    {
+                        "queries_dir": rel_queries,
+                        "queries_meta": rel_meta,
+                        "ground_truth": rel_gt,
+                        "queries": queries_meta,
+                    },
+                )
+        if self.bundle is not None:
+            self.bundle.set_dataset_ids([p.name for p in dataset_dirs])
+            self.bundle.set_query_generation(
+                {
+                    "seed": int(self.seed),
+                    "mode": self.mode,
+                    "n_queries_cpds": int(self.n_queries_cpds),
+                    "n_queries_inference": int(self.n_queries_inference),
+                    "n_mc": int(self.n_mc),
+                    "generator_kwargs": dict(self.generator_kwargs),
+                }
+            )
+            self.bundle.save_metadata()
         return outputs
 
     @abstractmethod
@@ -285,3 +339,10 @@ class BaseQueryGenerator(ABC):
         """
         Return a JSON-serializable payload for this dataset, or None to skip.
         """
+
+
+def _rel_path(root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)

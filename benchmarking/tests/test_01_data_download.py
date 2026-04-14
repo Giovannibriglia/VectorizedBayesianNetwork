@@ -8,11 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from benchmarking.paths import (
-    get_generator_datasets_dir,
-    get_generator_metadata_dir_generated,
-    get_static_metadata_dir,
-)
+from benchmarking.bundles import BenchmarkBundle
+from benchmarking.utils import get_static_metadata_dir
 
 BIF_TEMPLATE = """network \"{network}\" {{
 }}
@@ -89,12 +86,20 @@ def test_01_download_data_pipeline(tmp_path: Path) -> None:
     for name in registry:
         root = tmp_path / name
         networks = _prepare_root_for_downloader(name, root)
+        bundle_root = root / "benchmarking" / "data" / "benchmarks"
+        bundle = BenchmarkBundle.create(
+            mode="cpds",
+            generator=name,
+            seed=123,
+            root=bundle_root,
+            bundle_id="benchmark_cpds_test",
+        )
 
         downloader_cls = registry[name]
-        downloader = downloader_cls(root_path=root, seed=123)
+        downloader = downloader_cls(root_path=root, seed=123, bundle=bundle)
         downloader.download(datasets=networks, force=True)
 
-        datasets_dir = get_generator_datasets_dir(root, name)
+        datasets_dir = bundle.paths.datasets / name
         assert datasets_dir.is_dir()
 
         for network in networks:
@@ -102,25 +107,30 @@ def test_01_download_data_pipeline(tmp_path: Path) -> None:
             dataset_dir = datasets_dir / dataset_id
             assert dataset_dir.is_dir()
             assert (dataset_dir / "model.bif").exists()
-            manifest_path = dataset_dir / "dataset.json"
-            assert manifest_path.exists()
-            manifest = json.loads(manifest_path.read_text())
+            assert (dataset_dir / "dataset.json").exists()
+            assert (dataset_dir / "download.json").exists()
+            manifest = json.loads((dataset_dir / "dataset.json").read_text())
             assert manifest["dataset_id"] == dataset_id
 
-        metadata_path = (
-            get_generator_metadata_dir_generated(root, name) / f"{name}.json"
-        )
-        assert metadata_path.exists()
-        metadata = json.loads(metadata_path.read_text())
-        assert metadata["generator"] == name
-        assert metadata["seed"] == 123
-        assert "n_samples" not in metadata
-        assert len(metadata["datasets"]) == len(networks)
+        bundle_meta = json.loads(bundle.paths.metadata.read_text())
+        assert bundle_meta["generator"] == name
+        assert bundle_meta["mode"] == "cpds"
+        assert set(bundle_meta.get("dataset_ids", [])) == set(networks)
+        assert "download" in bundle_meta.get("config", {})
 
 
-def test_01_download_data_cli_rejects_n_samples(
-    monkeypatch: pytest.MonkeyPatch,
+def test_01_download_data_cli_bundle_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    bundle_root = tmp_path / "benchmarks"
+    bundle = BenchmarkBundle.create(
+        mode="cpds",
+        generator="bnlearn",
+        seed=0,
+        root=bundle_root,
+        bundle_id="benchmark_cpds_test",
+    )
+
     module = importlib.import_module("benchmarking.scripts.01_download_data")
     monkeypatch.setattr(
         sys,
@@ -129,8 +139,10 @@ def test_01_download_data_cli_rejects_n_samples(
             "01_download_data.py",
             "--generator",
             "bnlearn",
-            "--n_samples",
-            "10",
+            "--mode",
+            "inference",
+            "--bundle_dir",
+            str(bundle.paths.root),
         ],
     )
     with pytest.raises(SystemExit):

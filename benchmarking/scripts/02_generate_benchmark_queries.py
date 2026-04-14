@@ -4,8 +4,11 @@ import argparse
 import importlib
 import json
 import logging
+from pathlib import Path
 
+from benchmarking.bundles import BenchmarkBundle, find_latest_bundle, resolve_bundle_dir
 from benchmarking.utils import get_project_root
+from benchmarking.utils_logging import setup_logging
 
 
 def _parse_generator_kwargs(raw: str | None) -> dict:
@@ -71,13 +74,18 @@ def main() -> None:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument("--bundle_dir", type=str, default=None)
+    parser.add_argument("--bundle", type=str, default=None)
+    parser.add_argument(
+        "--bundle_root",
+        type=str,
+        default=None,
+        help="Root directory for benchmark bundles (default: benchmarking/data/benchmarks)",
+    )
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    setup_logging(level=args.log_level)
 
     if args.mode == "cpds":
         if args.n_queries_cpds is None:
@@ -94,6 +102,31 @@ def main() -> None:
 
     project_root = get_project_root()
     logging.info("Benchmark root: %s", project_root)
+
+    bundle_root = (
+        Path(args.bundle_root).resolve()
+        if args.bundle_root
+        else project_root / "benchmarking" / "data" / "benchmarks"
+    )
+    bundle_path = resolve_bundle_dir(
+        bundle_dir=args.bundle_dir, bundle_name=args.bundle, bundle_root=bundle_root
+    )
+    if bundle_path is None:
+        bundle_path = find_latest_bundle(
+            bundle_root=bundle_root, mode=args.mode, generator=args.generator
+        )
+        if bundle_path is None:
+            raise SystemExit(
+                f"No bundle found under {bundle_root}. Run 01_download_data first or pass --bundle_dir."
+            )
+    if not bundle_path.exists():
+        raise SystemExit(f"Bundle not found: {bundle_path}")
+    bundle = BenchmarkBundle.load(bundle_path)
+    if bundle.spec.mode != args.mode or bundle.spec.generator != args.generator:
+        raise SystemExit(
+            f"Bundle metadata mismatch. bundle={bundle.paths.root} mode={bundle.spec.mode} generator={bundle.spec.generator}"
+        )
+    logging.info("Resolved bundle: %s", bundle.paths.root)
 
     generator_kwargs = _parse_generator_kwargs(args.generator_kwargs)
     generator_kwargs.update(_parse_kv_pairs(args.kw))
@@ -112,6 +145,7 @@ def main() -> None:
         n_queries_cpds=args.n_queries_cpds,
         n_queries_inference=args.n_queries_inference,
         generator_kwargs=generator_kwargs,
+        bundle=bundle,
     )
 
     dataset_dirs = generator.list_dataset_dirs()

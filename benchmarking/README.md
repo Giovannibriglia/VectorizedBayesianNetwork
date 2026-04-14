@@ -14,376 +14,206 @@ This benchmarking suite compares VBN and other probabilistic graphical model lib
 03_generate_data
         ↓
 04_run_benchmark
+        ↓
+05_report_results
 ```
 
 ---
 
-## 1. Data Download
+## Benchmark Bundles (Authoritative Layout)
 
-**Purpose.** Download and prepare dataset artifacts from registered sources so downstream stages can reuse the same inputs.
+Steps 01–03 create a **benchmark bundle** under `benchmarking/data/benchmarks/`. All datasets, queries, ground truth, and bundle metadata live in that folder.
 
-**Supported sources.** Currently: bnlearn BIF repository and bn.fit (RDS/RDA) artifacts
-for gaussian / CLG networks (no R runtime required; use `pyreadr` and optionally `rds2py`).
+```
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/
+  metadata.json
+  datasets/
+    <generator>/<problem_id>/...
+  queries/
+    <generator>/<problem_id>/cpds.jsonl|inference.jsonl
+    <generator>/<problem_id>/queries.json
+  ground_truth/
+    <generator>/<problem_id>/ground_truth.jsonl
+  logs/
+    queries/...
+    datasets/...
+```
 
-**How to run.**
+`mode` is `cpds` or `inference`. The bundle metadata records generator, seeds, dataset selection, query/data generation parameters, and paths to artifacts.
+
+---
+
+## Last Validated Usage (2026-04-13, Inference)
+
+Latest end-to-end run currently in this repository:
+
+- Bundle: `benchmark_inference_20260407_125322`
+- Run directory: `benchmarking/out/bnlearn/benchmark_inference_20260413_190932`
+- Networks: 31
+- Total queries: 286,720 inference queries
+- Models: `pgmpy:pgmpy_mle_ei`, `pgmpy:pgmpy_bdeu_ei`, `vbn:vbn_ex_gauss_rao`, `vbn:vbn_ex_gauss_exact`, `vbn:vbn_ct_ce`
+
+Reproduce that exact flow:
 
 ```bash
 python -m benchmarking.scripts.01_download_data \
-    --generator bnlearn
+  --generator bnlearn \
+  --mode inference \
+  --seed 42
+
+python -m benchmarking.scripts.02_generate_benchmark_queries \
+  --generator bnlearn \
+  --mode inference \
+  --seed 42 \
+  --n_queries_inference 10240 \
+  --generator-kwargs '{"n_mc": 256}' \
+  --bundle benchmark_inference_20260407_125322
+
+python -m benchmarking.scripts.03_generate_data \
+  --generator bnlearn \
+  --n_samples 4096 \
+  --seed 42 \
+  --bundle benchmark_inference_20260407_125322
+
+python -m benchmarking.scripts.04_run_benchmark \
+  --generator bnlearn \
+  --seed 42 \
+  --mode inference \
+  --bundle benchmark_inference_20260407_125322 \
+  --batch_size_queries 256 \
+  --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,vbn:vbn_ex_gauss_rao,vbn:vbn_ex_gauss_exact,vbn:vbn_ct_ce
+
+python -m benchmarking.scripts.05_report_results \
+  --run_dir benchmarking/out/bnlearn/benchmark_inference_20260413_190932 \
+  --summary_style robust
 ```
-
-**Where data is stored.**
-
-```
-benchmarking/data/datasets/<generator>/<problem>/
-benchmarking/data/metadata/<generator>/<generator>.json
-```
-
-**Metadata locations.**
-
-- Static metadata shipped with the repo lives in `benchmarking/metadata/`.
-- Generated/run metadata lives in `benchmarking/data/metadata/`.
-
-Example output:
-
-```
-benchmarking/data/datasets/bnlearn/asia/
-    model.bif
-    dataset.json
-```
-
-Dataset IDs are the problem/network name (for bnlearn: `<network>`). The generator name is stored separately.
-
-Developer guide for adding new downloaders: `benchmarking/scripts/01_download_data_readme.md`.
-Query generation guide: `benchmarking/scripts/02_generate_benchmark_queries_readme.md`.
-If you have legacy data folders named `<generator>__<problem>`, run `python -m benchmarking.migrate_data_layout`.
-
-**Currently supported datasets (bnlearn).**
-
-- asia (small)
-- alarm (medium)
-- hailfinder (large)
-- andes (very_large)
-- barley (stress)
 
 ---
 
-## 2. Query Generation
+## 1) Data Download
 
-**Purpose.** Generate deterministic benchmark query sets for each dataset under `benchmarking/data/datasets/`.
+**Purpose.** Download and prepare dataset artifacts for a specific generator and store them in a bundle.
 
-**How to run.**
+```bash
+python -m benchmarking.scripts.01_download_data \
+  --generator bnlearn \
+  --mode cpds
+```
+
+Outputs:
+
+```
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/datasets/<generator>/<problem>/
+  model.bif
+  dataset.json
+  download.json
+```
+
+Developer guide: `benchmarking/scripts/01_download_data_readme.md`.
+
+---
+
+## 2) Query Generation
+
+**Purpose.** Generate deterministic benchmark query sets for each dataset in the bundle.
 
 ```bash
 python -m benchmarking.scripts.02_generate_benchmark_queries \
-    --generator bnlearn \
-    --mode cpds \
-    --seed 42 \
-    --n_queries_cpds 64 \
-    --generator-kwargs '{"n_mc": 1}'
+  --generator bnlearn \
+  --mode cpds \
+  --seed 42 \
+  --n_queries_cpds 1024 \
+  --generator-kwargs '{"n_mc": 1}' \
+  --bundle benchmark_cpds_YYYYMMDD_HHMMSS
 ```
 
-For inference queries, switch to `--mode inference` and provide `--n_queries_inference`.
-
-**Where queries are stored.**
+Outputs:
 
 ```
-benchmarking/data/queries/<generator>/<problem>/cpds.jsonl
-benchmarking/data/queries/<generator>/<problem>/inference.jsonl
-benchmarking/data/queries/<generator>/<problem>/queries.json
-benchmarking/data/queries/<generator>/<problem>/ground_truth.jsonl
-benchmarking/data/queries/log/<generator>/<problem>_seed<seed>.log
-benchmarking/data/metadata/<generator>/<problem>/domain.json
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/queries/<generator>/<problem>/
+  cpds.jsonl | inference.jsonl
+  queries.json
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/ground_truth/<generator>/<problem>/ground_truth.jsonl
 ```
 
-Ground truth distributions are computed during query generation and stored once per dataset in `ground_truth.jsonl`. Discrete targets use exact inference (pgmpy). Continuous targets store sample-based ground truth under `gt_samples` with summary stats. The `queries.json` metadata records a pointer under `ground_truth.path` along with a status/reason if GT could not be computed.
-The full query sets are stored in `cpds.jsonl` / `inference.jsonl`.
-
-**Query metadata JSON schema.**
-
-```
-{
-  "dataset_id": "<problem>",
-  "generator": "<name>",
-  "seed": 42,
-  "n_mc": 32,
-  "generator_kwargs": {"n_mc": 32},
-  "n_queries": {"cpds": 64, "inference": 128},
-  "n_skeletons": {"inference": 4},
-  "queries": {
-    "cpds": {"path": ".../cpds.jsonl", "count": 64},
-    "inference": {"path": ".../inference.jsonl", "count": 128}
-  },
-  "coverage": {"cpds": {}, "inference": {}}
-}
-```
-
-**Query JSONL schema (per line).**
-
-```
-{"query_type": "cpd", "target": "X", "evidence_vars": ["A", "B"], "...": "..."}
-{"query_type": "inference", "task": "prediction", "target": "Y", "evidence": {"mode": "on_manifold", "vars": ["A"], "values": {"A": 0}}, "...": "..."}
-```
+Developer guide: `benchmarking/scripts/02_generate_benchmark_queries_readme.md`.
 
 ---
 
-## 3. Learning Data Generation
+## 3) Learning Data Generation
 
-**Purpose.** Generate tabular datasets (i.i.d. samples) for model fitting / CPD learning.
-
-**How to run.**
+**Purpose.** Generate tabular datasets (i.i.d. samples) for model fitting and CPD learning.
 
 ```bash
 python -m benchmarking.scripts.03_generate_data \
-    --generator bnlearn \
-    --n_samples 10240 \
-    --seed 0 \
+  --generator bnlearn \
+  --n_samples 4096 \
+  --seed 42 \
+  --bundle benchmark_cpds_YYYYMMDD_HHMMSS
 ```
 
-**Where data is stored.**
+Outputs:
 
 ```
-benchmarking/data/datasets/<generator>/<problem>/data_<strategy>_n<n_samples>_seed<seed>.(parquet|csv|pkl)
-benchmarking/data/datasets/log/<generator>/<problem>_seed<seed>.log
-benchmarking/data/metadata/<generator>/<problem>/data_generation.json
-benchmarking/data/metadata/<generator>/<problem>/domain.json
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/datasets/<generator>/<problem>/
+  data_<strategy>_n<n_samples>_seed<seed>.(parquet|csv|pkl)
+  data_generation.json
+  domain.json
 ```
 
-**Numeric coding for discrete variables.**
-
-Discrete variables are stored as integer codes. The mapping from state label to code is stored in `domain.json` under each node’s `codes` mapping, and `data_generation.json` records the schema used for each generated file.
+Developer guide: `benchmarking/scripts/03_generate_data_readme.md`.
 
 ---
 
-## 4. Run Benchmark
+## 4) Run Benchmark
 
 **Purpose.** Fit registered models on learning data and run CPD + inference query workloads.
 
-**How to run.**
-
 ```bash
 python -m benchmarking.scripts.04_run_benchmark \
-    --generator bnlearn \
-    --seed 0 \
-    --mode cpds \
-    --models vbn:vbn_linear_gausspgmpy:pgmpy_mle
+  --generator bnlearn \
+  --seed 42 \
+  --mode cpds \
+  --bundle benchmark_cpds_YYYYMMDD_HHMMSS \
+  --models vbn,pgmpy
 ```
 
-### Parameters
-
-- `--generator` (required): dataset generator name (e.g., `bnlearn`).
-- `--seed` (required): seed used for dataset selection and model init.
-- `--mode` (required): `cpds` or `inference`.
-- `--models` (required): comma-separated or repeatable list of models.
-  - Example: `--models vbn,pgmpy` or `--models vbn --models pgmpy`.
-  - To run multiple configs for the same model in one run, use aliases:
-    - `--models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm`
-- `--config` (optional): model config preset selector.
-  - Single value applies to all models (default: `default`).
-  - Or per-model pairs: `model:config_id` (comma-separated).
-- `--config-overrides` (optional): JSON dict of component overrides (learning/cpd/inference).
-  - Keys can be the base model name (apply to all aliases) or the alias name (apply to one).
-- `--model-kwargs` (optional): JSON dict forwarded to model constructors.
-- `--max_problems` (optional): limit number of problems (debugging).
-- `--store_full_query` (optional): store full query payloads in each JSONL record.
-
-**Preset YAMLs**
-
-Presets are defined in backend-specific YAML files:
-
-- `benchmarking/models/presets_vbn.yaml`
-- `benchmarking/models/presets_pgmpy.yaml`
-
-Minimal schemas:
-
-```yaml
-# pgmpy.yaml
-cpds:
-  <preset_name>:
-    cpds:
-      estimator: <string>
-      kwargs: {}
-inference:
-  <preset_name>:
-    cpds:
-      estimator: <string>
-      kwargs: {}
-    inference:
-      method: <string>
-      kwargs: {}
-```
-
-```yaml
-# vbn.yaml
-cpds:
-  <preset_name>:
-    learning:
-      method: <string>
-      kwargs: {}
-    cpds:
-      default:
-        method: <string>
-        kwargs: {}
-      per_node:
-        <node_name>:
-          method: <string>
-          kwargs: {}
-inference:
-  <preset_name>:
-    learning:
-      method: <string>
-      kwargs: {}
-    cpds:
-      default:
-        method: <string>
-        kwargs: {}
-      per_node:
-        <node_name>:
-          method: <string>
-          kwargs: {}
-    inference:
-      method: <string>
-      kwargs: {}
-```
-
-**Config example**
-
-```bash
-python -m benchmarking.scripts.04_run_benchmark \
-    --generator bnlearn \
-    --seed 0 \
-    --mode inference \
-    --models vbn \
-    --config vbn_softmax_is \
-    --config-overrides '{"vbn":{"inference":{"kwargs":{"n_particles":512}}}}'
-```
-
-**Multiple configs in one run**
-
-```bash
-python -m benchmarking.scripts.04_run_benchmark \
-    --generator bnlearn \
-    --seed 0 \
-    --mode cpds \
-    --models vbn:vbn_softmax_is,vbn:vbn_gauss_mcm
-```
-
-**Where outputs are stored.**
+Outputs:
 
 ```
 benchmarking/out/<generator>/benchmark_<mode>_<timestamp>/
-  cpds/<model>.jsonl
-  inference/<model>.jsonl
   run_metadata.json
-  ground_truth_sources.json
-  configs/<model>.json
-  summary.json
-  logs/run.log
+  configs/
+  logs/
+  errors/
+  results/<problem_id>/<method_id>.jsonl
 ```
 
-Each query result includes model metadata (config id + component keys + config hash), the query payload (compact by default), `ok/error`, and `timing_ms`. Results are deterministic given the same seed and model configuration.
+Use `--dry_run` to print the resolved bundle, models, and output dir without running.
+
+Developer guide: `benchmarking/scripts/04_run_benchmark_readme.md`.
 
 ---
 
-## 5. Report Results
+## 5) Report Results
 
-**Purpose.** Join predictions with ground truth and generate summary tables/plots (KL/Wasserstein with robust IQM ± IQR-STD).
-
-**How to run.**
+**Purpose.** Aggregate metrics, success rates, and plots for a benchmark run.
 
 ```bash
 python -m benchmarking.scripts.05_report_results \
-    --run_dir benchmarking/out/<generator>/benchmark_<timestamp>
+  --run_dir benchmarking/out/bnlearn/benchmark_cpds_YYYYMMDD_HHMMSS \
+  --summary_style robust
 ```
 
-**Where outputs are stored.**
+Outputs:
 
 ```
-benchmarking/out/<generator>/benchmark_<timestamp>/report/
-  tables/
-  figures/
-  report.md
+<run_dir>/report/
+  index.md
+  aggregate/...
+  single/<problem_id>/...
 ```
 
-See `benchmarking/scripts/05_report_results_readme.md` for full flag details and plotting outputs.
+Use `--summary_style mean` for mean ± std instead of IQM ± IQRStd.
 
----
-
-## 6. Current Benchmark Results
-
-To be updated after the first full benchmark run.
-
-- Tables and plots will be published here.
-- Comparisons will include VBN vs pgmpy and other baselines.
-- Analysis will highlight speed vs accuracy tradeoffs.
-
----
-
-## Running Benchmarking Tests
-
-Run the benchmarking pipeline tests from the project root:
-
-```bash
-pytest benchmarking/ -vv
-```
-
-Optional (single stage):
-
-```bash
-pytest benchmarking/tests/test_01_data_download.py -vv
-```
-
----
-
-## Folder Layout (Current)
-
-```
-benchmarking/data/
-  datasets/
-    <generator>/<problem>/...
-    log/<generator>/<problem>_seed<seed>.log
-  queries/
-    <generator>/<problem>/cpds.jsonl
-    <generator>/<problem>/inference.jsonl
-    <generator>/<problem>/queries.json
-    log/<generator>/<problem>_seed<seed>.log
-  metadata/
-    <generator>/<problem>/download.json
-    <generator>/<problem>/domain.json
-    <generator>/<problem>/data_generation.json
-benchmarking/out/
-  <generator>/benchmark_<mode>_<timestamp>/...
-```
-
----
-
-## Generator Kwargs
-
-Both query and data generation accept generator-specific keyword arguments:
-
-- Query generation (e.g., Monte Carlo samples):
-
-```bash
-python -m benchmarking.scripts.02_generate_benchmark_queries \
-    --generator bnlearn \
-    --mode inference \
-    --n_queries_inference 128 \
-    --seed 42 \
-    --generator-kwargs '{"n_mc": 32}'
-```
-
-- Data generation (forwarded to the generator implementation):
-
-```bash
-python -m benchmarking.scripts.03_generate_data \
-    --generator bnlearn \
-    --n_samples 50000 \
-    --seed 7 \
-    --generator-kwargs '{"batch_size": 4096}'
-```
-
----
-
-## Why We Use `python -m`
-
-All scripts are executed as modules (e.g., `python -m benchmarking.scripts.01_download_data`) to avoid `PYTHONPATH` and `sys.path` hacks. This makes execution consistent from the repo root and works cleanly with editable installs and CI. Registries remain in place because they provide extensibility: new generators or models can be added without changing core benchmarking code.
+Developer guide: `benchmarking/scripts/05_report_results_readme.md`.

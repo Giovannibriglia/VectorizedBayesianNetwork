@@ -4,8 +4,11 @@ import argparse
 import importlib
 import json
 import logging
+from pathlib import Path
 
+from benchmarking.bundles import BenchmarkBundle, find_latest_bundle, resolve_bundle_dir
 from benchmarking.utils import get_project_root
+from benchmarking.utils_logging import setup_logging
 
 
 def _parse_model_kwargs(raw: str | None) -> dict:
@@ -165,16 +168,51 @@ def main() -> None:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument("--bundle_dir", type=str, default=None)
+    parser.add_argument("--bundle", type=str, default=None)
+    parser.add_argument(
+        "--bundle_root",
+        type=str,
+        default=None,
+        help="Root directory for benchmark bundles (default: benchmarking/data/benchmarks)",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Resolve bundle, models, and output paths; then exit.",
+    )
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    setup_logging(level=args.log_level)
 
     project_root = get_project_root()
     logging.info("Benchmark root: %s", project_root)
+
+    bundle_root = (
+        Path(args.bundle_root).resolve()
+        if args.bundle_root
+        else project_root / "benchmarking" / "data" / "benchmarks"
+    )
+    bundle_path = resolve_bundle_dir(
+        bundle_dir=args.bundle_dir, bundle_name=args.bundle, bundle_root=bundle_root
+    )
+    if bundle_path is None:
+        bundle_path = find_latest_bundle(
+            bundle_root=bundle_root, mode=args.mode, generator=args.generator
+        )
+        if bundle_path is None:
+            raise SystemExit(
+                f"No bundle found under {bundle_root}. Run 01_download_data first or pass --bundle_dir."
+            )
+    if not bundle_path.exists():
+        raise SystemExit(f"Bundle not found: {bundle_path}")
+    bundle = BenchmarkBundle.load(bundle_path)
+    if bundle.spec.mode != args.mode or bundle.spec.generator != args.generator:
+        raise SystemExit(
+            f"Bundle metadata mismatch. bundle={bundle.paths.root} mode={bundle.spec.mode} generator={bundle.spec.generator}"
+        )
+    logging.info("Resolved bundle: %s", bundle.paths.root)
 
     model_kwargs = _parse_model_kwargs(args.model_kwargs)
     model_specs = _parse_model_specs(args.models)
@@ -196,6 +234,7 @@ def main() -> None:
     runner_cls = module.get_benchmark_runner(args.generator)
     runner = runner_cls(
         root=project_root,
+        bundle=bundle,
         seed=args.seed,
         mode=args.mode,
         models=models,
@@ -207,7 +246,18 @@ def main() -> None:
         store_full_query=args.store_full_query,
         progress=args.progress,
         batch_size_queries=args.batch_size_queries,
+        log_level=args.log_level,
     )
+
+    if args.dry_run:
+        problems = bundle.list_problems()
+        if args.max_problems is not None:
+            problems = problems[: int(args.max_problems)]
+        logging.info("Dry run: bundle=%s", bundle.paths.root)
+        logging.info("Dry run: mode=%s generator=%s", args.mode, args.generator)
+        logging.info("Dry run: problems=%s", len(problems))
+        logging.info("Dry run: models=%s", ",".join(models))
+        return
 
     out_dir = runner.run_all()
     logging.info("Benchmark complete. Output: %s", out_dir)

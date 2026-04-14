@@ -9,8 +9,6 @@ import networkx as nx
 from benchmarking import bnlearn_bnfit
 from benchmarking.utils import (
     get_dataset_domain_metadata_path,
-    get_dataset_queries_dir,
-    get_generator_datasets_dir,
     parse_bif_structure,
     read_dataframe,
     read_json,
@@ -35,7 +33,7 @@ class BNLearnBenchmarkRunner(BaseBenchmarkRunner):
     generator = "bnlearn"
 
     def list_problem_dirs(self) -> list[Path]:
-        datasets_dir = get_generator_datasets_dir(self.root, self.generator)
+        datasets_dir = self.bundle.paths.datasets / self.generator
         if not datasets_dir.exists():
             return []
         return sorted([p for p in datasets_dir.iterdir() if p.is_dir()])
@@ -61,9 +59,11 @@ class BNLearnBenchmarkRunner(BaseBenchmarkRunner):
                 reason="Missing model.bif and model.rds/rda",
             )
 
-        domain_path = get_dataset_domain_metadata_path(
-            self.root, self.generator, problem
-        )
+        domain_path = dataset_dir / "domain.json"
+        if not domain_path.exists():
+            domain_path = get_dataset_domain_metadata_path(
+                self.root, self.generator, problem
+            )
         if not domain_path.exists():
             return ProblemLoadResult(
                 problem=problem,
@@ -72,7 +72,7 @@ class BNLearnBenchmarkRunner(BaseBenchmarkRunner):
                 reason="Missing domain.json",
             )
 
-        queries_dir = get_dataset_queries_dir(self.root, self.generator, problem)
+        queries_dir = self.bundle.paths.queries / self.generator / problem
         meta_path = queries_dir / "queries.json"
         cpd_path = queries_dir / "cpds.jsonl"
         inf_path = queries_dir / "inference.jsonl"

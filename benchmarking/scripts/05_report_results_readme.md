@@ -1,225 +1,70 @@
-# 05: Report Results
+# Report Results (Step 05)
 
-This step summarizes a completed benchmark run by joining predictions with ground truth, computing metrics (KL/Wasserstein/JSD), and producing tables and plots sliced by query categories.
-It also reports success rates and error breakdowns using the per-query `ok` fields written during benchmarking.
-It can additionally report metrics over **solvability partitions** that separate queries by which methods solved them.
+This step summarizes a completed benchmark run by joining predictions with ground truth, computing metrics (KL/Wasserstein/JSD), and producing tables and plots. It also reports success rates and error breakdowns using per-query `ok` fields written during benchmarking.
 
----
-
-## CLI Usage
+## CLI
 
 ```bash
 python -m benchmarking.scripts.05_report_results \
-    --run_dir benchmarking/out/<generator>/benchmark_<mode>_<timestamp>
+  --run_dir benchmarking/out/<generator>/benchmark_<mode>_<timestamp> \
+  --summary_style robust
 ```
 
-### Flags
+Key flags:
 
-- `--run_dir` (required): path to a single benchmark run folder.
+- `--run_dir` (required): path to a benchmark run folder.
 - `--out_dir` (optional): output folder (default: `<run_dir>/report`).
-- `--gt_source` (optional): where ground truth comes from (default: `folder`).
-  - `embedded`: use `--gt_key` path in each result record.
-  - `folder`: use `<run_dir>/ground_truth/{cpds,inference}.jsonl` if present, else `ground_truth_sources.json` links (created by step 04).
-  - `compute`: compute exact GT with pgmpy (best-effort; requires evidence values).
-- `--gt_key` (optional): JSON path for embedded GT (default: `result.ground_truth.output.probs`).
-- `--models` (optional): comma-separated filter of model names/config ids.
-- `--max_records` (optional): limit records for debugging.
-- `--eps` (optional): smoothing epsilon for KL (default: `1e-12`).
-- `--include_time` / `--no-include_time`: include time tables and plots (default: enabled).
-- `--include_pareto` / `--no-include_pareto`: include Pareto plots (default: enabled).
-- `--pareto_split` (optional): `none|mode|task|target_category` (default: `none`).
-- `--min_partition_queries` (optional): minimum queries required to emit a subset partition (default: `1`).
-- `--max_subsets` (optional): limit subset partitions to top-K by size (default: all).
-- `--include_all_methods_in_subsets` (optional): include all methods in subset reports (default: false).
+- `--gt_source` (default: `folder`): `embedded|folder|compute`.
+- `--gt_key` (default: `result.ground_truth.output.probs`).
+- `--summary_style` (default: `robust`): `robust` (IQM ± IQRStd) or `mean` (mean ± std).
+- `--include_time` / `--no-include_time`: include time tables/plots.
+- `--include_pareto` / `--no-include_pareto`: include Pareto plots.
+- `--pareto_split`: `none|mode|task|target_category`.
+- `--min_partition_queries`: minimum size for subset partitions.
+- `--max_subsets`: limit subset partitions.
+- `--include_all_methods_in_subsets`: show all methods in subset reports.
 
----
-
-## Outputs
+## Output Structure
 
 ```
 <run_dir>/report/
   index.md
-  all/
-    tables/
-    figures/
-  common/
-    tables/
-    figures/
-  subset_<ensemble_slug>/
-    tables/
-    figures/
-    subset_meta.json
-  ...
-  partition_inventory.csv
-  partition_inventory.md
+  aggregate/
+    partition_inventory.csv
+    partition_inventory.md
+    all/ tables/ figures/
+    common/ tables/ figures/
+    subset_*/ tables/ figures/
+  single/
+    <problem_id>/
+      index.md
+      partition_inventory.csv
+      partition_inventory.md
+      all/ tables/ figures/
+      common/ tables/ figures/
+      subset_*/ tables/ figures/
+  by_category/
+    <category>/
+      index.md
+      partition_inventory.csv
+      partition_inventory.md
+      all/ tables/ figures/
+      common/ tables/ figures/
+      subset_*/ tables/ figures/
 ```
 
-The reporter auto-detects the run mode (`cpds` or `inference`) from `run_metadata.json`
-or the run directory name, and will still emit placeholder tables for missing categories.
+The same solvability partitions (all/common/subset_*) are generated for aggregate, per-problem, and per-network-category views.
+Category folders are derived from `benchmarking/metadata/<generator>.json` (for `bnlearn`, this includes labels like `small`, `medium`, `very_large`, `gaussian_medium`, `clgaussian_small`, etc.).
 
-### Tables
+## Summary Style
 
-All tables include numeric columns per metric (`kl`, `wass`, `jsd`, `jsd_norm`):
+- `robust`: IQM ± IQRStd (current default).
+- `mean`: mean ± std.
 
-- `*_iqm`, `*_iqr_std`, `*_n`
-- `*_iqm_pm_iqrstd`
-- `*_q1`, `*_median`, `*_q3`
-
-Tables produced in `tables/`:
-
-- `overall_by_model.csv`
-- `cpd_by_target_category.csv`
-- `cpd_by_evidence_strategy.csv`
-- `inference_by_target_category.csv`
-- `inference_by_task.csv`
-- `inference_by_evidence_mode.csv`
-- `cpd_by_mb_size.csv` (two-stage aggregation: dataset IQM, then across datasets)
-- `cpd_by_parent_size.csv` (two-stage aggregation)
-- `inference_by_evidence_size.csv`
-- `inference_by_skeleton.csv` (per-skeleton aggregation for MC queries)
-- `overall_time_by_method.csv`
-- `cpd_time_by_target_category.csv`
-- `cpd_time_by_evidence_strategy.csv`
-- `cpd_time_by_mb_size.csv`
-- `cpd_time_by_parent_size.csv`
-- `cpd_time_by_evidence_size.csv`
-- `inference_time_by_target_category.csv`
-- `inference_time_by_task.csv`
-- `inference_time_by_evidence_mode.csv`
-- `inference_time_by_evidence_size.csv`
-
-Success-rate tables (CSV + Markdown):
-
-- `success_rate_by_model.csv`
-- `success_rate_vs_nodes.csv` (binned nodes, line-plot input)
-- `success_rate_vs_edges.csv` (binned edges, line-plot input)
-- `success_rate_vs_evidence_size.csv` (binned evidence size, line-plot input)
-- `success_rate_vs_evidence_size__mode_<mode>.csv` (evidence-size line plot per evidence mode)
-- `success_rate_by_category.csv` (target category)
-- `success_rate_by_evidence_strategy.csv`
-- `success_rate_by_task.csv`
-- `success_rate_by_evidence_mode.csv`
-- `success_rate_by_evidence_size.csv`
-
-Error breakdown tables (CSV + Markdown):
-
-- `top_errors_by_model.csv` (model x mode x error_type)
-- `top_error_signatures.csv` (model x mode x error_signature + example)
-
-Partition inventory tables (CSV + Markdown):
-
-- `partition_inventory.csv`
-- `partition_inventory.md`
-
-### Figures
-
-All plots are saved as PNG in `figures/`:
-
-- **CPD**: KL/Wass/JSD(norm) vs Markov blanket size (one plot per metric, one line per method)
-- **CPD**: KL/Wass/JSD(norm) vs parent set size (one plot per metric, one line per method)
-- **Inference**: KL/Wass/JSD(norm) vs evidence size (one plot per metric per evidence mode, one line per method)
-- **Category bars** (grouped bars per method):
-  - CPD target category (KL/Wass/JSD(norm))
-  - Inference target category (KL/Wass/JSD(norm))
-  - Inference task (KL/Wass/JSD(norm))
-  - Inference evidence mode (KL/Wass/JSD(norm))
-  - CPD time by target/evidence strategy
-  - Inference time by target/task/mode
-  - CPD success rate by target/evidence strategy
-  - Inference success rate by target/task/mode
-- **Success rate vs size**:
-  - CPD/inference success rate vs nodes (binned, line plots)
-  - CPD/inference success rate vs edges (binned, line plots)
-  - Inference success rate vs evidence size (binned, line plots)
-  - Inference success rate vs evidence size per evidence mode (line plots)
-  - Filenames follow the existing metric convention: `cpd_success_rate_vs_n_nodes.png`, `inference_success_rate_vs_n_nodes.png`, etc.
-- **Error type distribution** (stacked bars per model, split by mode)
-
-Efficiency (Pareto) plots:
-
-- `pareto_cpd_kl_vs_time.png`
-- `pareto_cpd_wass_vs_time.png`
-- `pareto_cpd_jsd_norm_vs_time.png`
-- `pareto_inference_kl_vs_time.png`
-- `pareto_inference_wass_vs_time.png`
-- `pareto_inference_jsd_norm_vs_time.png`
-
-Optional stratified plots depend on `--pareto_split`.
-
----
-
-## Ground Truth Alignment
-
-Predictions are joined to GT using:
-
-1. `query.id` (preferred), else
-2. tuple of model-independent query fields:
-   `(problem.id, query.type, query.index, target, category, task, evidence mode/vars, mc_id, skeleton_id)`
-
----
+The selected style affects aggregate tables and plot annotations.
 
 ## Notes
 
-- Ground-truth computation with pgmpy is best-effort and requires evidence values in the stored query payloads.
+- Ground-truth computation with pgmpy (`--gt_source compute`) is best-effort and requires evidence values in the stored query payloads.
 - If GT cannot be resolved for a query, that record is skipped.
-- MB size and parent set size are computed from the dataset DAG once per problem and cached.
-- JSD is computed as `0.5 * KL(P || M) + 0.5 * KL(Q || M)` with `M = (P + Q) / 2` (natural log).
-- Normalized JSD is `jsd_norm = jsd / log(2)` and is in `[0, 1]` (0 best, 1 worst).
-- JSD/JSD norm are computed only for discrete distributions; continuous outputs get `NaN` for these fields.
 - Success rate is `n_ok / n_total` for each slice, based on per-query `result.ok`.
-- Node/edge bins use run-wide quantiles (4 bins by default) computed across all attempts.
-- Run-level error summaries are written during benchmarking to `<run_dir>/errors/errors_summary.json` and `.md`.
-
-Line-plot success-rate tables (`success_rate_vs_*.csv`) include:
-`model`, `mode`, `x_bin_left`, `x_bin_right`, `x_mid`, `success_rate`, `n_attempts`, `n_ok`.
-
-## Solvability Partitions
-
-Partitions are computed per run mode (`cpds` or `inference`) using per-query
-`ok` values across all methods in the run:
-
-- **all**: all queries.
-- **common**: queries solved by every method.
-- **subset_<ensemble_slug>**: queries in ALL but not in COMMON, grouped by the
-  exact solver ensemble.
-- **unsolved**: no method solved (counts only; no reports).
-
-Subsets are defined **only on non-common queries**: each query in `ALL \ COMMON`
-is assigned to a subset by its exact solver ensemble (empty ensembles are ignored).
-The solver-set label (sorted `method_id`s joined by `|`, e.g., `m1|m3`) is recorded
-in `partition_inventory.csv` and `subset_meta.json`.
-
-`partition_inventory.csv` includes `partition_type`, `solver_set`, `n_queries`,
-`share_of_total`, and `share_of_non_common` (for subset partitions).
-
-Folder naming uses a stable ensemble slug:
-
-- sort method IDs in the ensemble
-- slugify each (lowercase, non-alnum → `_`, collapse repeats)
-- join with `__`
-- if the slug exceeds 120 chars, shorten to `subset_<first_two>__<hash8>`
-
-Query identity (`query_key`) is computed to match “the same query” across methods:
-it always includes `query_type` and `problem_id`, prefers `skeleton_id` when present,
-falls back to `query_id` when available, and otherwise uses a composite of stable
-query fields (`target`, `task`, `evidence_mode`, `evidence_strategy`, `evidence_size`,
-`target_set`, `evidence_vars`, etc.).
-
-Partitions are output under `report/<partition_name>/` and include the same
-tables/figures as the main report. Subset partitions are only emitted when
-they contain at least `--min_partition_queries` queries, and `--max_subsets`
-can cap the number of subsets.
-
-By default, subset reports only include methods that are part of the ensemble.
-Use `--include_all_methods_in_subsets` to include all methods in subset reports.
-
-`report/index.md` is a landing page that links to each partition’s tables,
-figures, and subset metadata.
-
-For **common** and **subset** partitions, success-rate tables still reflect
-per-method `mean(ok)` (1.0 for solvers, 0.0 for non-solvers by construction).
-Partition reports also include coverage tables/plots (`coverage_vs_nodes.csv`,
-`coverage_vs_edges.csv`, `coverage_vs_evidence_size.csv`) to make the slice sizes explicit.
-
-Each `subset_<ensemble_slug>/subset_meta.json` includes the solver set, query counts,
-share of total, share of non-common, and a short note describing the partition definition.

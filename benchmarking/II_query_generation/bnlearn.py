@@ -338,10 +338,36 @@ def _build_domain(
     return domain, unsupported, reason
 
 
-def _write_domain(
-    root_path: Path, generator: str, dataset_id: str, domain: dict
+def _dataset_meta_path(
+    *,
+    dataset_dir: Path | None,
+    root_path: Path,
+    generator: str,
+    dataset_id: str,
+    name: str,
 ) -> Path:
-    path = get_dataset_domain_metadata_path(root_path, generator, dataset_id)
+    if dataset_dir is not None:
+        return dataset_dir / name
+    if name == "download.json":
+        return get_dataset_download_metadata_path(root_path, generator, dataset_id)
+    return get_dataset_domain_metadata_path(root_path, generator, dataset_id)
+
+
+def _write_domain(
+    root_path: Path,
+    generator: str,
+    dataset_id: str,
+    domain: dict,
+    *,
+    dataset_dir: Path | None = None,
+) -> Path:
+    path = _dataset_meta_path(
+        dataset_dir=dataset_dir,
+        root_path=root_path,
+        generator=generator,
+        dataset_id=dataset_id,
+        name="domain.json",
+    )
     ensure_dir(path.parent)
     write_json(path, domain)
     return path
@@ -1532,8 +1558,12 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
         rng: random.Random,
         logger: logging.Logger,
     ) -> dict:
-        download_meta_path = get_dataset_download_metadata_path(
-            self.root_path, self.name, dataset_id
+        download_meta_path = _dataset_meta_path(
+            dataset_dir=dataset_dir,
+            root_path=self.root_path,
+            generator=self.name,
+            dataset_id=dataset_id,
+            name="download.json",
         )
         download_meta: dict = {}
         if download_meta_path.exists():
@@ -1626,7 +1656,9 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             node_sources=node_sources,
             continuous_ranges=continuous_ranges,
         )
-        domain_path = _write_domain(self.root_path, self.name, dataset_id, domain)
+        domain_path = _write_domain(
+            self.root_path, self.name, dataset_id, domain, dataset_dir=dataset_dir
+        )
         logger.info("Wrote domain metadata to %s", domain_path)
         if unsupported:
             logger.warning("Skipping %s: %s", dataset_id, reason)
@@ -1876,7 +1908,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             if q.evidence_mode == "on_manifold"
         )"""
 
-        logger.info(
+        """logger.info(
             "Nodes=%s Edges=%s", len(nodes), sum(len(v) for v in children.values())
         )
         logger.info(
@@ -1895,7 +1927,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
         logger.info(
             "Inference evidence metrics: %s",
             json.dumps(inference_evidence_metrics, sort_keys=True),
-        )
+        )"""
         if inference_evidence_metrics.get("approx_on_manifold"):
             logger.info("On-manifold sampling approximated with independent draws.")
 

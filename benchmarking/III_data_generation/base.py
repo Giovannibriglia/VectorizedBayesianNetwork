@@ -8,6 +8,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - best-effort fallback
+
+    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+        return iterable
+
+
+from benchmarking.bundles import BenchmarkBundle
 from benchmarking.utils import (
     ensure_dir,
     get_dataset_data_generation_metadata_path,
@@ -49,6 +58,7 @@ class BaseDataGenerator(ABC):
         n_samples: int,
         generation_strategy: str = "default",
         generator_kwargs: dict | None = None,
+        bundle: BenchmarkBundle | None = None,
         **kwargs: Any,
     ) -> None:
         self.root_path = Path(root_path).resolve()
@@ -57,6 +67,7 @@ class BaseDataGenerator(ABC):
         if self.n_samples <= 0:
             raise ValueError("n_samples must be a positive integer")
         self.generation_strategy = generation_strategy or "default"
+        self.bundle = bundle
         if not getattr(self, "name", None):
             raise ValueError("Data generator class must define a non-empty 'name'.")
         self.generator_kwargs: dict = dict(generator_kwargs or {})
@@ -64,12 +75,18 @@ class BaseDataGenerator(ABC):
             if key not in self.generator_kwargs:
                 self.generator_kwargs[key] = value
 
-        self.datasets_dir = ensure_dir(
-            get_generator_datasets_dir(self.root_path, self.name)
-        )
-        self.generator_log_dir = ensure_dir(
-            get_generator_datasets_log_dir(self.root_path, self.name)
-        )
+        if self.bundle is not None:
+            self.datasets_dir = ensure_dir(self.bundle.paths.datasets / self.name)
+            self.generator_log_dir = ensure_dir(
+                self.bundle.paths.root / "logs" / "datasets" / self.name
+            )
+        else:
+            self.datasets_dir = ensure_dir(
+                get_generator_datasets_dir(self.root_path, self.name)
+            )
+            self.generator_log_dir = ensure_dir(
+                get_generator_datasets_log_dir(self.root_path, self.name)
+            )
 
     def list_dataset_dirs(self) -> list[Path]:
         if not self.datasets_dir.exists():
@@ -104,15 +121,20 @@ class BaseDataGenerator(ABC):
         logger_name = f"benchmarking.data.{self.name}.{dataset_id}"
         logger = logging.getLogger(logger_name)
         logger.setLevel(logging.INFO)
-        logger.propagate = False
+        logger.propagate = True
         logger.handlers.clear()
-        handler = logging.FileHandler(log_path)
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        try:
+            handler = logging.FileHandler(log_path)
+            formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        except Exception:
+            pass
         return logger
 
     def _metadata_path(self, dataset_id: str) -> Path:
+        if self.bundle is not None:
+            return ensure_dir(self.datasets_dir / dataset_id) / "data_generation.json"
         return get_dataset_data_generation_metadata_path(
             self.root_path, self.name, dataset_id
         )
@@ -166,14 +188,17 @@ class BaseDataGenerator(ABC):
         outputs: list[Path] = []
         dataset_dirs = self.list_dataset_dirs()
         root_logger = logging.getLogger(__name__)
-        for dataset_dir in dataset_dirs:
+        for dataset_dir in tqdm(dataset_dirs, desc=f"{self.name} data", unit="dataset"):
             dataset_id = dataset_dir.name
             logger = self._logger_for(dataset_id)
-            meta_dir = ensure_dir(
-                get_dataset_metadata_dir_generated(
-                    self.root_path, self.name, dataset_id
+            if self.bundle is not None:
+                meta_dir = ensure_dir(dataset_dir)
+            else:
+                meta_dir = ensure_dir(
+                    get_dataset_metadata_dir_generated(
+                        self.root_path, self.name, dataset_id
+                    )
                 )
-            )
             out_dir = ensure_dir(dataset_dir)
             root_logger.info(
                 "Generating data for dataset %s (n_samples=%s, strategy=%s)",
@@ -204,6 +229,30 @@ class BaseDataGenerator(ABC):
             logger.info("Wrote data generation metadata to %s", meta_path)
             root_logger.info("Wrote data generation metadata to %s", meta_path)
             outputs.append(meta_path)
+            if self.bundle is not None:
+                rel_dataset = _rel_path(self.bundle.paths.root, dataset_dir)
+                rel_meta = _rel_path(self.bundle.paths.root, meta_path)
+                rel_data = _rel_path(self.bundle.paths.root, result.data_path)
+                self.bundle.update_artifact(
+                    dataset_id,
+                    {
+                        "dataset_dir": rel_dataset,
+                        "data_generation_meta": rel_meta,
+                        "data_path": rel_data,
+                        "data_format": result.format,
+                    },
+                )
+        if self.bundle is not None:
+            self.bundle.set_dataset_ids([p.name for p in dataset_dirs])
+            self.bundle.set_data_generation(
+                {
+                    "seed": int(self.seed),
+                    "n_samples": int(self.n_samples),
+                    "generation_strategy": self.generation_strategy,
+                    "generator_kwargs": dict(self.generator_kwargs),
+                }
+            )
+            self.bundle.save_metadata()
         return outputs
 
     @abstractmethod
@@ -219,3 +268,12 @@ class BaseDataGenerator(ABC):
         Generate a dataset for the given dataset directory.
         Return a DataGenResult or None to skip.
         """
+
+
+def _rel_path(root: Path, path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)

@@ -192,7 +192,7 @@ class BNLearnDownloader(BaseDataDownloader):
                 "artifacts": artifacts_list,
             }
             self.write_dataset_manifest(dataset_dir, manifest)
-            self.write_dataset_metadata(
+            download_meta_path = self.write_dataset_metadata(
                 dataset_id,
                 "download.json",
                 {
@@ -210,6 +210,16 @@ class BNLearnDownloader(BaseDataDownloader):
                     "capabilities": capabilities,
                 },
             )
+            if self.bundle is not None:
+                self.bundle.update_artifact(
+                    dataset_id,
+                    {
+                        "dataset_dir": _rel_path(self.bundle.paths.root, dataset_dir),
+                        "download_meta": _rel_path(
+                            self.bundle.paths.root, download_meta_path
+                        ),
+                    },
+                )
 
             dataset_entries.append(
                 {
@@ -236,3 +246,15 @@ class BNLearnDownloader(BaseDataDownloader):
             selected_networks=selected,
         )
         self.save_metadata(metadata, filename=f"{self.name}.json")
+        if self.bundle is not None:
+            self.bundle.set_dataset_ids(
+                [entry["dataset_id"] for entry in dataset_entries]
+            )
+            self.bundle.save_metadata()
+
+
+def _rel_path(root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)

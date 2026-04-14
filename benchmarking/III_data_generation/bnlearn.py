@@ -490,8 +490,31 @@ def _build_domain(
     return domain, unsupported, reason
 
 
-def _domain_path(root: Path, generator: str, dataset_id: str) -> Path:
-    return get_dataset_domain_metadata_path(root, generator, dataset_id)
+def _dataset_meta_path(
+    *,
+    dataset_dir: Path | None,
+    root_path: Path,
+    generator: str,
+    dataset_id: str,
+    name: str,
+) -> Path:
+    if dataset_dir is not None:
+        return dataset_dir / name
+    if name == "download.json":
+        return get_dataset_download_metadata_path(root_path, generator, dataset_id)
+    return get_dataset_domain_metadata_path(root_path, generator, dataset_id)
+
+
+def _domain_path(
+    root: Path, generator: str, dataset_id: str, *, dataset_dir: Path | None = None
+) -> Path:
+    return _dataset_meta_path(
+        dataset_dir=dataset_dir,
+        root_path=root,
+        generator=generator,
+        dataset_id=dataset_id,
+        name="domain.json",
+    )
 
 
 def _load_or_create_domain(
@@ -506,8 +529,9 @@ def _load_or_create_domain(
     node_sources: Dict[str, str],
     logger: logging.Logger,
     continuous_ranges: Dict[str, dict] | None = None,
+    dataset_dir: Path | None = None,
 ) -> tuple[Path, dict]:
-    path = _domain_path(root_path, generator, dataset_id)
+    path = _domain_path(root_path, generator, dataset_id, dataset_dir=dataset_dir)
     if path.exists():
         domain = read_json(path)
         return path, domain
@@ -572,8 +596,12 @@ class BNLearnDataGenerator(BaseDataGenerator):
         meta_dir: Path,
         logger: logging.Logger,
     ) -> DataGenResult | None:
-        download_meta_path = get_dataset_download_metadata_path(
-            self.root_path, self.name, dataset_id
+        download_meta_path = _dataset_meta_path(
+            dataset_dir=dataset_dir,
+            root_path=self.root_path,
+            generator=self.name,
+            dataset_id=dataset_id,
+            name="download.json",
         )
         download_meta = None
         if download_meta_path.exists():
@@ -713,6 +741,7 @@ class BNLearnDataGenerator(BaseDataGenerator):
                 node_sources=node_sources,
                 logger=logger,
                 continuous_ranges=continuous_ranges,
+                dataset_dir=dataset_dir,
             )
 
             if isinstance(domain, dict) and domain.get("unsupported"):

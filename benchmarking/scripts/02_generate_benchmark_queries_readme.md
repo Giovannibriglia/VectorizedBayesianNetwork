@@ -1,32 +1,26 @@
 # Benchmark Query Generation (Step 02)
 
-## 1) Pipeline Overview
+## Overview
 
-The benchmarking pipeline produces three data components under a gitignored `benchmarking/data/` tree:
+Query generation produces deterministic CPD or inference query sets for each dataset in a bundle.
 
-- **Datasets**: downloaded/converted model artifacts per generator and problem.
-- **Metadata**: derived, per-problem artifacts such as domain mappings and capability flags.
-- **Queries**: generated benchmark queries (CPD and inference) for each problem.
-
-Directory layout:
+Bundle layout:
 
 ```
-benchmarking/data/
-  datasets/<generator>/<problem>/
-  metadata/<generator>/<problem>/
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/
   queries/<generator>/<problem>/
-  queries/log/<generator>/
+    cpds.jsonl | inference.jsonl
+    queries.json
+  ground_truth/<generator>/<problem>/ground_truth.jsonl
 ```
 
-Notes:
+Logs are written under:
 
-- `benchmarking/data/` is generated locally and should not be committed.
-- Static metadata shipped with the repo lives under `benchmarking/metadata/`.
-- Query payloads are stored in `cpds.jsonl` / `inference.jsonl`; `queries.json` is metadata.
+```
+benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/logs/queries/<generator>/
+```
 
-## 2) Query Generation Script and CLI
-
-Entry point:
+## CLI
 
 ```bash
 python -m benchmarking.scripts.02_generate_benchmark_queries \
@@ -34,118 +28,30 @@ python -m benchmarking.scripts.02_generate_benchmark_queries \
   --mode cpds \
   --seed 42 \
   --n_queries_cpds 64 \
-  --generator-kwargs '{"n_mc": 32}'
+  --generator-kwargs '{"n_mc": 32}' \
+  --bundle benchmark_cpds_YYYYMMDD_HHMMSS
 ```
 
 Required flags:
 
 - `--generator`
-- `--seed`
 - `--mode` (`cpds` or `inference`)
-- `--n_queries_cpds` (required for `--mode cpds`)
-- `--n_queries_inference` (required for `--mode inference`)
+- `--n_queries_cpds` for `--mode cpds`
+- `--n_queries_inference` for `--mode inference`
 
-Generator kwargs:
+Bundle selection:
 
-- Pass JSON via `--generator-kwargs`, for example `{"n_mc": 32}`.
-- The parsed kwargs are forwarded to the generator and stored in the output payload as `generator_kwargs`.
+- `--bundle_dir <path>` (explicit)
+- `--bundle <benchmark_cpds_...>` + `--bundle_root <root>`
 
-Exact-count constraint:
+If no bundle is provided, the script uses the most recent bundle for the generator/mode.
 
-- CPD query count equals `n_queries_cpds`.
-- Inference query count equals `n_queries_inference` and refers to **instantiated** queries (after MC expansion).
-- If `n_mc` is set, inference queries are generated in contiguous blocks per skeleton. The number of skeletons is derived from `n_queries_inference / n_mc` and the final skeleton may be a partial block if there is a remainder.
+## Ground Truth
 
-## 3) BNLearn Generator (`bnlearn`)
-
-### Targets
-
-CPD target categories:
-
-- big Markov blanket
-- big parent set
-- random (PAC-diverse)
-
-Inference target categories:
-
-- central hubs
-- separators/cut nodes
-- peripheral/terminal
-- random (PAC-diverse)
-
-Inference tasks:
-
-- prediction (evidence biased toward ancestors)
-- diagnosis (evidence biased toward descendants)
-
-### Evidence
-
-CPD evidence strategies:
-
-- paths
-- markov_blanket
-- random
-
-Evidence subset sampling rule (CPD and inference on-manifold):
-
-- Sample subset size `k` uniformly from `{0..|P(Q)|}`.
-- Sample a size-`k` subset uniformly without replacement.
-
-Inference evidence modes:
-
-- empty (prior)
-- on-manifold (MC instantiations)
-- off-manifold with full evidence (MC instantiations)
-
-Evidence values must be numeric:
-
-- Discrete variables use the domain mapping (state label → integer code).
-- Variable identifiers remain strings (BN node names).
-
-### Ground Truth (GT)
-
-During query generation, exact ground truth distributions are computed (pgmpy exact inference) and stored once per dataset:
+Exact ground truth distributions are computed during query generation and stored once per dataset:
 
 ```
-benchmarking/data/queries/<generator>/<problem>/ground_truth.jsonl
+ground_truth/<generator>/<problem>/ground_truth.jsonl
 ```
 
-The `queries.json` metadata records a pointer under `ground_truth.path` so later stages can reuse the GT without copying.
-If pgmpy is unavailable, the ground-truth file is still created but may be empty and annotated with a status/reason in `queries.json`.
-
-### bnlearn metadata
-
-Dataset types and download URLs are defined in:
-
-- `benchmarking/metadata/bnlearn.json`
-
-Some gaussian/clgaussian datasets do not have `.bif` artifacts and may be skipped depending on capabilities.
-
-## 4) Coverage Metrics
-
-The generator logs and stores coverage metrics for both target selection and evidence:
-
-CPD coverage:
-
-- Markov blanket size and parent-set coverage.
-- Evidence size and variable coverage within evidence pools.
-
-Inference coverage:
-
-- Role coverage (hubs, separators, peripheral/terminal).
-- Evidence mode counts and empty rate.
-- Instantiated vs skeleton counts.
-
-Generation is deterministic and reproducible given the same seed and downloaded artifacts.
-
-## 5) File Examples
-
-```
-benchmarking/data/
-  datasets/bnlearn/asia/model.bif
-  metadata/bnlearn/asia/domain.json
-  queries/bnlearn/asia/cpds.jsonl
-  queries/bnlearn/asia/inference.jsonl
-  queries/bnlearn/asia/queries.json
-  queries/log/bnlearn/asia_seed0.log
-```
+The `queries.json` file records the ground-truth path and status for downstream use.
