@@ -124,6 +124,81 @@ def _normalize_probs(probs: Iterable[float]) -> list[float]:
     return (arr / total).tolist()
 
 
+def _target_discrete_cardinality(domain: dict, target: str) -> int:
+    nodes = _domain_nodes(domain)
+    meta = nodes.get(target, {}) if isinstance(nodes, dict) else {}
+    states = meta.get("states")
+    if isinstance(states, list) and states:
+        return int(len(states))
+    codes = meta.get("codes")
+    if isinstance(codes, dict) and codes:
+        values: list[int] = []
+        for code in codes.values():
+            try:
+                values.append(int(code))
+            except Exception:
+                return 0
+        unique_vals = sorted(set(values))
+        if unique_vals:
+            return int(len(unique_vals))
+    return 0
+
+
+def _normal_to_categorical_probs(
+    mean: float, std: float, *, k: int
+) -> list[float] | None:
+    if k <= 0:
+        return None
+    if not math.isfinite(mean) or not math.isfinite(std) or std < 0:
+        return None
+    if std <= 1e-12:
+        idx = int(round(mean))
+        idx = max(0, min(int(k) - 1, idx))
+        probs = np.zeros(int(k), dtype=float)
+        probs[idx] = 1.0
+        return probs.tolist()
+
+    sigma = float(std)
+    mu = float(mean)
+    sqrt2 = math.sqrt(2.0)
+
+    def _cdf(x: float) -> float:
+        if x == float("-inf"):
+            return 0.0
+        if x == float("inf"):
+            return 1.0
+        z = (x - mu) / (sigma * sqrt2)
+        return 0.5 * (1.0 + math.erf(z))
+
+    probs = np.zeros(int(k), dtype=float)
+    for idx in range(int(k)):
+        left = float("-inf") if idx == 0 else float(idx) - 0.5
+        right = float("inf") if idx == int(k) - 1 else float(idx) + 0.5
+        prob = _cdf(right) - _cdf(left)
+        if prob < 0 and abs(prob) <= 1e-12:
+            prob = 0.0
+        probs[idx] = max(float(prob), 0.0)
+    return _normalize_probs(probs)
+
+
+def _samples_to_categorical_probs(
+    samples: Iterable[float], *, k: int
+) -> list[float] | None:
+    if k <= 0:
+        return None
+    arr = np.asarray(list(samples), dtype=float).reshape(-1)
+    if arr.size == 0:
+        return None
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    edges = np.arange(int(k) + 1, dtype=float) - 0.5
+    edges[0] = float("-inf")
+    edges[-1] = float("inf")
+    hist, _ = np.histogram(arr, bins=edges)
+    return _normalize_probs(hist.astype(float))
+
+
 def _map_codes_to_states(
     series: pd.Series, states: list[str], var: str
 ) -> pd.Categorical:
@@ -473,6 +548,39 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
         if mu.shape[0] != n_vars or cov.shape != (n_vars, n_vars):
             raise ValueError("Joint Gaussian mean/cov dimensions do not match nodes")
 
+    def _coerce_continuous_output_for_target(
+        self, *, target: str, result: dict
+    ) -> dict:
+        if not isinstance(result, dict):
+            return result
+        k = _target_discrete_cardinality(self.domain, target)
+        if k <= 0:
+            return result
+        if result.get("format") == "categorical_probs":
+            return result
+
+        probs: list[float] | None = None
+        if result.get("format") == "normal_params":
+            mean = result.get("mean")
+            std = result.get("std")
+            try:
+                probs = _normal_to_categorical_probs(float(mean), float(std), k=k)
+            except Exception:
+                probs = None
+            if probs is None:
+                probs = _samples_to_categorical_probs(result.get("samples") or [], k=k)
+        elif result.get("format") == "samples_1d":
+            probs = _samples_to_categorical_probs(result.get("samples") or [], k=k)
+
+        if probs is None:
+            return result
+        return {
+            "format": "categorical_probs",
+            "k": int(k),
+            "probs": probs,
+            "support": list(range(int(k))),
+        }
+
     def _gaussian_exact_condition(
         self,
         *,
@@ -764,6 +872,9 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
                     evidence={k: _to_float(v) for k, v in evidence.items()},
                     n_samples=0,
                 )
+                result = self._coerce_continuous_output_for_target(
+                    target=target, result=result
+                )
             else:
                 result = self._infer_distribution(target, evidence)
             ok = _result_ok(result)
@@ -794,6 +905,9 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
                     ),
                 )
                 result = self._infer_distribution(target, evidence, n_samples=n_samples)
+                result = self._coerce_continuous_output_for_target(
+                    target=target, result=result
+                )
             else:
                 result = self._infer_distribution(target, evidence)
             ok = _result_ok(result)

@@ -14,7 +14,7 @@ def test_pgmpy_gaussian_inference_presets_exist() -> None:
     assert exact.cpd.name == "gaussian"
     assert exact.inference.name == "gaussian_exact"
 
-    forward = get_preset_config("pgmpy", "inference", "pgmpy_gaussian_forward_sample")
+    forward = get_preset_config("pgmpy", "inference", "pgmpy_gaussian_fs")
     assert forward.learning.name == "gaussian"
     assert forward.cpd.name == "gaussian"
     assert forward.inference.name == "gaussian_forward_sample"

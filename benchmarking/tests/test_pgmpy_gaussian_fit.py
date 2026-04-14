@@ -43,6 +43,9 @@ class _FakeLG:
     def add_nodes_from(self, nodes) -> None:
         self.nodes_list.extend(list(nodes))
 
+    def nodes(self) -> list[str]:
+        return list(self.nodes_list)
+
     def fit(self, df: pd.DataFrame) -> None:
         self.fit_calls.append(df.copy())
 
@@ -129,4 +132,19 @@ def test_pgmpy_gaussian_can_be_forced_on_discrete_domain(monkeypatch) -> None:
     assert response["ok"] is True
     result = response["result"]
     assert isinstance(result, dict)
-    assert result.get("format") == "normal_params"
+    assert result.get("format") == "categorical_probs"
+    assert result.get("k") == 2
+    assert result.get("support") == [0, 1]
+    probs = result.get("probs")
+    assert isinstance(probs, list)
+    assert len(probs) == 2
+    assert abs(float(sum(probs)) - 1.0) < 1e-8
+
+    inf_response = model.answer_inference_query(
+        {"target": "x1", "evidence_values": {"x2": 1.0}}
+    )
+    assert inf_response["ok"] is True
+    inf_result = inf_response["result"]
+    assert isinstance(inf_result, dict)
+    assert inf_result.get("format") == "categorical_probs"
+    assert inf_result.get("k") == 2
