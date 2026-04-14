@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable
 
 
 def setup_logging(level: str = "INFO", log_path: Path | None = None) -> None:
