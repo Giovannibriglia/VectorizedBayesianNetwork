@@ -1,0 +1,6 @@
+name: rao_blackwellized_marginalization
+n_samples: 256
+n_particles: 256
+stddevs: 4.0
+min_scale: 1.0e-6
+fallback: likelihood_weighting

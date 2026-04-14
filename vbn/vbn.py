@@ -480,6 +480,93 @@ class VBN:
         pdf, samples = self._inference.infer_posterior(self, q, **kwargs)
         return pdf.detach(), samples.detach()
 
+    def _posterior_stats(
+        self, pdf: torch.Tensor, samples: torch.Tensor, *, eps: float = 1e-12
+    ) -> Dict[str, torch.Tensor]:
+        if pdf.dim() != 2:
+            raise ValueError(f"Expected pdf with shape [B,S], got {tuple(pdf.shape)}")
+        if samples.dim() != 3:
+            raise ValueError(
+                f"Expected samples with shape [B,S,D], got {tuple(samples.shape)}"
+            )
+        if pdf.shape[0] != samples.shape[0] or pdf.shape[1] != samples.shape[1]:
+            raise ValueError("pdf and samples shapes are incompatible.")
+
+        weights = torch.nan_to_num(pdf, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        denom = weights.sum(dim=1, keepdim=True)
+        uniform = torch.full_like(weights, 1.0 / max(1, weights.shape[1]))
+        weights = torch.where(denom > eps, weights / denom.clamp_min(eps), uniform)
+
+        mean = (weights.unsqueeze(-1) * samples).sum(dim=1)
+        var = (weights.unsqueeze(-1) * (samples - mean.unsqueeze(1)) ** 2).sum(dim=1)
+        std = var.clamp_min(0.0).sqrt()
+        ess = 1.0 / (weights**2).sum(dim=1).clamp_min(eps)
+        return {"mean": mean.detach(), "std": std.detach(), "ess": ess.detach()}
+
+    def _broadcast_batch(
+        self, a: torch.Tensor, b: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if a.shape[0] == b.shape[0]:
+            return a, b
+        if a.shape[0] == 1:
+            return a.expand(b.shape[0], *a.shape[1:]), b
+        if b.shape[0] == 1:
+            return a, b.expand(a.shape[0], *b.shape[1:])
+        raise ValueError(
+            "Query and reference batch sizes must match, unless one of them is 1."
+        )
+
+    def infer_relative(
+        self,
+        query: Dict | Query,
+        reference_query: Optional[Dict | Query] = None,
+        *,
+        eps: float = 1e-12,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor | Dict[str, torch.Tensor] | str]:
+        q = self._normalize_query(query)
+        if reference_query is None:
+            reference_query = Query(target=q.target, evidence={}, do={})
+        rq = self._normalize_query(reference_query)
+        if rq.target != q.target:
+            raise ValueError(
+                "query and reference_query must have the same target node."
+            )
+
+        query_pdf, query_samples = self.infer_posterior(q, **kwargs)
+        ref_pdf, ref_samples = self.infer_posterior(rq, **kwargs)
+        query_stats = self._posterior_stats(query_pdf, query_samples, eps=eps)
+        ref_stats = self._posterior_stats(ref_pdf, ref_samples, eps=eps)
+
+        query_mean, ref_mean = self._broadcast_batch(
+            query_stats["mean"], ref_stats["mean"]
+        )
+        query_std, ref_std = self._broadcast_batch(query_stats["std"], ref_stats["std"])
+        query_ess, ref_ess = self._broadcast_batch(query_stats["ess"], ref_stats["ess"])
+
+        delta_mean = query_mean - ref_mean
+        delta_std = query_std - ref_std
+        rel_mean = delta_mean / ref_mean.abs().clamp_min(eps)
+        rel_std = delta_std / ref_std.abs().clamp_min(eps)
+
+        return {
+            "target": q.target,
+            "query_stats": {
+                "mean": query_mean.detach(),
+                "std": query_std.detach(),
+                "effective_sample_size": query_ess.detach(),
+            },
+            "reference_stats": {
+                "mean": ref_mean.detach(),
+                "std": ref_std.detach(),
+                "effective_sample_size": ref_ess.detach(),
+            },
+            "delta_mean": delta_mean.detach(),
+            "delta_std": delta_std.detach(),
+            "relative_mean_change": rel_mean.detach(),
+            "relative_std_change": rel_std.detach(),
+        }
+
     def sample(self, query: Dict | Query, n_samples: int = 200, **kwargs):
         if self._sampling is None:
             raise RuntimeError("Call set_sampling_method(...) before sample().")

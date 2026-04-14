@@ -2,7 +2,7 @@ name: linear_gaussian
 ridge: 1e-6
 min_scale: 1e-4
 fit:
-  epochs: 100
+  epochs: 5
   batch_size: 4096
   lr: 1e-3
   weight_decay: 0.0
