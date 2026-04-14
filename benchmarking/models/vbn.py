@@ -603,6 +603,34 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
                 raise ValueError("Inconsistent evidence vars in batch")
         evidence_vars = evidence_vars or []
 
+        if not evidence_vars:
+            n_samples = _get_n_mc(queries[0], default=200)
+            pdf, samples = self._vbn.infer_posterior(
+                {"target": target, "evidence": {}}, n_samples=int(n_samples)
+            )
+            meta = _domain_node(self.domain, target)
+            states = meta.get("states") or []
+            k = len(states)
+            if k == 0:
+                result = {
+                    "format": "categorical_probs",
+                    "probs": None,
+                    "k": 0,
+                    "support": [],
+                }
+                return [
+                    {"ok": False, "error": "Empty target state space", "result": result}
+                    for _ in queries
+                ]
+            probs = _estimate_discrete_posterior(samples, pdf, k)
+            output = {
+                "format": "categorical_probs",
+                "probs": probs,
+                "k": k,
+                "support": list(range(k)),
+            }
+            return [{"ok": True, "error": None, "result": output} for _ in queries]
+
         evidence_values: dict[str, list[float]] = {v: [] for v in evidence_vars}
         for query in queries:
             values = query.get("evidence_values")
@@ -651,6 +679,8 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
                 for _ in queries
             ]
         probs_list = _estimate_discrete_posterior_batch(samples, pdf, k)
+        if len(probs_list) != len(queries):
+            return [self.answer_inference_query(query) for query in queries]
         results = []
         for probs in probs_list:
             output = {

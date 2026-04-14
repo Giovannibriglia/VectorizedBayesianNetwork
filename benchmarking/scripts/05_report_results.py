@@ -755,7 +755,7 @@ def _write_root_report_index(
     problem_categories = problem_categories or []
     lines = [f"# Report: {run_dir.name}", ""]
     lines.append(f"- summary_style: {summary_style.name}")
-    lines.append(f"- aggregate: [aggregate](aggregate/)")
+    lines.append("- aggregate: [aggregate](aggregate/)")
     lines.append(f"- n_problems: {len(problem_ids)}")
     lines.append(f"- n_problem_categories: {len(problem_categories)}")
     lines.append("")
@@ -1649,9 +1649,7 @@ def _compute_graph_stats(run_dir: Path) -> dict[str, dict[str, int]]:
 
 def _load_problem_categories(run_dir: Path) -> dict[str, str]:
     generator = run_dir.parent.name
-    meta_path = (
-        get_project_root() / "benchmarking" / "metadata" / f"{generator}.json"
-    )
+    meta_path = get_project_root() / "benchmarking" / "metadata" / f"{generator}.json"
     if not meta_path.exists():
         return {}
     try:

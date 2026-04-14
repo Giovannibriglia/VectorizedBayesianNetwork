@@ -61,7 +61,8 @@ inference:
         kwargs: {}
     inference:
       method: categorical_exact
-      kwargs: {}
+      kwargs:
+        fallback: likelihood_weighting
 
   vbn_ct_ris:
     learning:
@@ -85,7 +86,8 @@ inference:
         kwargs: { }
     inference:
       method: rao_blackwellized_marginalization
-      kwargs: { }
+      kwargs:
+        fallback: likelihood_weighting
 
   vbn_lg_exact:
     learning:
@@ -97,4 +99,5 @@ inference:
         kwargs: { }
     inference:
       method: gaussian_exact
-      kwargs: { }
+      kwargs:
+        fallback: likelihood_weighting
