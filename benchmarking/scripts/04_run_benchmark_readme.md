@@ -19,7 +19,7 @@ python -m benchmarking.scripts.04_run_benchmark \
   --seed 0 \
   --mode cpds \
   --bundle benchmark_cpds_YYYYMMDD_HHMMSS \
-  --models vbn,pgmpy,numpyro,gpytorch
+  --models vbn,pgmpy,numpyro,gpytorch,pyro
 ```
 
 Bundle selection:
@@ -57,3 +57,4 @@ Presets live in:
 - `benchmarking/models/presets/pgmpy.yaml`
 - `benchmarking/models/presets/numpyro.yaml`
 - `benchmarking/models/presets/gpytorch.yaml`
+- `benchmarking/models/presets/pyro.yaml`

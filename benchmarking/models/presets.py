@@ -7,18 +7,20 @@ import yaml
 
 from .config import ComponentSpec, make_component, ModelBenchmarkConfig
 
-Backend = Literal["vbn", "pgmpy", "numpyro", "gpytorch"]
+Backend = Literal["vbn", "pgmpy", "numpyro", "gpytorch", "pyro"]
 Mode = Literal["cpds", "inference"]
 
 _VBN_PRESETS_PATH = Path(__file__).parent / "presets" / "vbn.yaml"
 _PGMPY_PRESETS_PATH = Path(__file__).parent / "presets" / "pgmpy.yaml"
 _NUMPYRO_PRESETS_PATH = Path(__file__).parent / "presets" / "numpyro.yaml"
 _GPYTORCH_PRESETS_PATH = Path(__file__).parent / "presets" / "gpytorch.yaml"
+_PYRO_PRESETS_PATH = Path(__file__).parent / "presets" / "pyro.yaml"
 
 _DEFAULT_VBN_INFERENCE = "importance_sampling"
 _DEFAULT_PGMPY_INFERENCE = "exact_variable_elimination"
 _DEFAULT_NUMPYRO_INFERENCE = "likelihood_weighting"
 _DEFAULT_GPYTORCH_INFERENCE = "gp_forward_sample"
+_DEFAULT_PYRO_INFERENCE = "likelihood_weighting"
 
 _PRESET_CACHE: dict[tuple[str, ...], dict[str, dict]] = {}
 
@@ -38,6 +40,7 @@ def load_presets(
     pgmpy_path: Path | None = None,
     numpyro_path: Path | None = None,
     gpytorch_path: Path | None = None,
+    pyro_path: Path | None = None,
 ) -> dict[str, dict]:
     vbn_path = Path(vbn_path) if vbn_path is not None else _VBN_PRESETS_PATH
     pgmpy_path = Path(pgmpy_path) if pgmpy_path is not None else _PGMPY_PRESETS_PATH
@@ -47,11 +50,13 @@ def load_presets(
     gpytorch_path = (
         Path(gpytorch_path) if gpytorch_path is not None else _GPYTORCH_PRESETS_PATH
     )
+    pyro_path = Path(pyro_path) if pyro_path is not None else _PYRO_PRESETS_PATH
     return {
         "vbn": _read_yaml(vbn_path),
         "pgmpy": _read_yaml(pgmpy_path),
         "numpyro": _read_yaml(numpyro_path),
         "gpytorch": _read_yaml(gpytorch_path),
+        "pyro": _read_yaml(pyro_path),
     }
 
 
@@ -61,6 +66,7 @@ def _get_cached_presets() -> dict[str, dict]:
         str(_PGMPY_PRESETS_PATH),
         str(_NUMPYRO_PRESETS_PATH),
         str(_GPYTORCH_PRESETS_PATH),
+        str(_PYRO_PRESETS_PATH),
     )
     if cache_key in _PRESET_CACHE:
         return _PRESET_CACHE[cache_key]
@@ -211,6 +217,10 @@ def _normalize_gpytorch_preset(mode: Mode, preset: dict) -> dict:
     return _normalize_generic_preset("gpytorch", mode, preset)
 
 
+def _normalize_pyro_preset(mode: Mode, preset: dict) -> dict:
+    return _normalize_generic_preset("pyro", mode, preset)
+
+
 def validate_preset(backend: Backend, mode: Mode, preset: dict) -> dict:
     if backend == "vbn":
         return _normalize_vbn_preset(mode, preset)
@@ -220,6 +230,8 @@ def validate_preset(backend: Backend, mode: Mode, preset: dict) -> dict:
         return _normalize_numpyro_preset(mode, preset)
     if backend == "gpytorch":
         return _normalize_gpytorch_preset(mode, preset)
+    if backend == "pyro":
+        return _normalize_pyro_preset(mode, preset)
     raise ValueError(f"Unsupported backend '{backend}'")
 
 
@@ -399,6 +411,16 @@ def get_preset_config(
             default_learning="exact_gp",
             default_cpd="gp_posterior",
             default_inference=_DEFAULT_GPYTORCH_INFERENCE,
+        )
+    if backend == "pyro":
+        return _generic_config_from_preset(
+            "pyro",
+            mode,
+            preset,
+            config_id,
+            default_learning="dirichlet_table",
+            default_cpd="dirichlet_table",
+            default_inference=_DEFAULT_PYRO_INFERENCE,
         )
     raise KeyError(f"Unknown backend '{backend}'")
 

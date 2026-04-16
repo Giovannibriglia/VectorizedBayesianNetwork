@@ -175,7 +175,7 @@ python -m benchmarking.scripts.04_run_benchmark \
   --seed 42 \
   --mode cpds \
   --bundle benchmark_cpds_YYYYMMDD_HHMMSS \
-  --models vbn,pgmpy,numpyro,gpytorch
+  --models vbn,pgmpy,numpyro,gpytorch,pyro
 ```
 
 Outputs:

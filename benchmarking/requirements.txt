@@ -9,6 +9,7 @@ numpyro
 jax
 jaxlib
 gpytorch
+pyro-ppl
 pyyaml
 pyreadr
 rds2py
