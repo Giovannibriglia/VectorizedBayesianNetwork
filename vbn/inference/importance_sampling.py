@@ -34,6 +34,25 @@ class ImportanceSampling:
         nodes = state.topo_order
         cpds = [vbn.nodes[node] for node in nodes]
 
+        def _sample_node(cpd, parent_tensor):
+            if b <= 1:
+                return cpd.sample(parent_tensor, n_samples)
+            batches = []
+            for batch_idx in range(b):
+                if parent_tensor is None:
+                    parent_i = None
+                else:
+                    parent_i = parent_tensor[batch_idx : batch_idx + 1]
+                sample_i = cpd.sample(parent_i, n_samples)
+                if sample_i.dim() == 2:
+                    sample_i = sample_i.unsqueeze(0)
+                if sample_i.dim() != 3 or sample_i.shape[0] != 1:
+                    raise ValueError(
+                        "CPD.sample must return [B,S,D] or [S,D] for inference"
+                    )
+                batches.append(sample_i)
+            return torch.cat(batches, dim=0)
+
         for idx, node in enumerate(nodes):
             node_slice = state.node_slices[idx]
             fixed = fixed_values[idx]
@@ -58,7 +77,7 @@ class ImportanceSampling:
                 )
             else:
                 parent_tensor = None
-            samples[..., node_slice] = cpds[idx].sample(parent_tensor, n_samples)
+            samples[..., node_slice] = _sample_node(cpds[idx], parent_tensor)
 
         weights = torch.softmax(log_weights, dim=1)
         ess = 1.0 / (weights**2).sum(dim=1)
