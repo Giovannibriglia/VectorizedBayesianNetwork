@@ -231,3 +231,67 @@ def test_gpytorch_inference_requires_method() -> None:
         },
     )
     assert preset["inference"]["kwargs"] == {}
+
+
+def test_pyro_cpds_requires_learning_and_cpd_method() -> None:
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "pyro",
+            "cpds",
+            {
+                "cpds": {"method": "dirichlet_table"},
+            },
+        )
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "pyro",
+            "cpds",
+            {
+                "learning": {"method": "dirichlet_table"},
+                "cpds": {},
+            },
+        )
+
+    preset = presets_mod.validate_preset(
+        "pyro",
+        "cpds",
+        {
+            "learning": {"method": "dirichlet_table"},
+            "cpds": {"method": "dirichlet_table"},
+        },
+    )
+    assert preset["learning"]["kwargs"] == {}
+    assert preset["cpds"]["kwargs"] == {}
+
+
+def test_pyro_inference_requires_method() -> None:
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "pyro",
+            "inference",
+            {
+                "learning": {"method": "dirichlet_table"},
+                "cpds": {"method": "dirichlet_table"},
+            },
+        )
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "pyro",
+            "inference",
+            {
+                "learning": {"method": "dirichlet_table"},
+                "cpds": {"method": "dirichlet_table"},
+                "inference": {},
+            },
+        )
+
+    preset = presets_mod.validate_preset(
+        "pyro",
+        "inference",
+        {
+            "learning": {"method": "dirichlet_table"},
+            "cpds": {"method": "dirichlet_table"},
+            "inference": {"method": "likelihood_weighting"},
+        },
+    )
+    assert preset["inference"]["kwargs"] == {}
