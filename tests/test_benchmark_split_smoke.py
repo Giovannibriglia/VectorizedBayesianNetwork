@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import shutil
 import sys
 from pathlib import Path
 
 import pandas as pd
-from benchmarking.II_query_generation import (
-    get_cpd_query_generator,
-    get_inference_query_generator,
-)
+from benchmarking.bundles import BenchmarkBundle
+from benchmarking.II_query_generation import get_query_generator
 from benchmarking.models.base import BaseBenchmarkModel
+from benchmarking.models.config import make_component, ModelBenchmarkConfig
 from benchmarking.models.registry import BENCHMARK_MODEL_REGISTRY
 
 BIF_TEMPLATE = """network \"{network}\" {{
@@ -88,13 +86,13 @@ def _load_script(path: Path):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load script: {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-def _prepare_dataset(project_root: Path, network: str, seed: int) -> Path:
-    datasets_dir = project_root / "benchmarking" / "data" / "datasets" / "bnlearn"
-    dataset_dir = datasets_dir / network
+def _prepare_dataset(bundle: BenchmarkBundle, network: str, seed: int) -> Path:
+    dataset_dir = bundle.paths.datasets / "bnlearn" / network
     dataset_dir.mkdir(parents=True, exist_ok=True)
     (dataset_dir / "model.bif").write_text(BIF_TEMPLATE.format(network=network))
     data = pd.DataFrame(
@@ -109,184 +107,163 @@ def _prepare_dataset(project_root: Path, network: str, seed: int) -> Path:
     return dataset_dir
 
 
-def _write_preset(path: Path, payload: dict) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+def _dummy_config(model: str, mode: str, config_id: str) -> ModelBenchmarkConfig:
+    del mode
+    return ModelBenchmarkConfig(
+        model=model,
+        config_id=config_id,
+        learning=make_component("learning", "none", kwargs={}),
+        cpd=make_component("cpd", "none", kwargs={}),
+        inference=make_component("inference", "none", kwargs={}),
+    )
 
 
 def test_benchmark_split_smoke(tmp_path, monkeypatch) -> None:
     project_root = Path(__file__).resolve().parents[1]
     seed = 0
     network = f"smoke_{tmp_path.name.replace('-', '_').replace('.', '_')}"
+    bundle_root = tmp_path / "bundles"
+    bundle_cpds = BenchmarkBundle.create(
+        mode="cpds",
+        generator="bnlearn",
+        seed=seed,
+        root=bundle_root,
+        timestamp="cpds_000001",
+    )
+    bundle_inference = BenchmarkBundle.create(
+        mode="inference",
+        generator="bnlearn",
+        seed=seed,
+        root=bundle_root,
+        timestamp="inf_000001",
+    )
+    _prepare_dataset(bundle_cpds, network, seed)
+    _prepare_dataset(bundle_inference, network, seed)
 
-    dataset_dir = _prepare_dataset(project_root, network, seed)
-    metadata_dir = (
-        project_root / "benchmarking" / "data" / "metadata" / "bnlearn" / network
+    generate_script = (
+        project_root / "benchmarking" / "scripts" / "02_generate_benchmark_queries.py"
     )
-
-    cpds_queries_dir = tmp_path / "queries_cpds"
-    inf_queries_dir = tmp_path / "queries_inference"
-    cpds_results_dir = tmp_path / "results_cpds"
-    inf_results_dir = tmp_path / "results_inference"
-
-    cpds_script = (
-        project_root / "benchmarking" / "scripts" / "02_generate_cpds_queries.py"
-    )
-    inf_script = (
-        project_root / "benchmarking" / "scripts" / "02_generate_inference_queries.py"
-    )
-    cpds_runner_script = (
-        project_root / "benchmarking" / "scripts" / "04_run_cpds_benchmark.py"
-    )
-    inf_runner_script = (
-        project_root / "benchmarking" / "scripts" / "04_run_inference_benchmark.py"
-    )
+    run_script = project_root / "benchmarking" / "scripts" / "04_run_benchmark.py"
+    out_root = tmp_path / "benchmark_out"
 
     BENCHMARK_MODEL_REGISTRY["dummy"] = DummyBenchmarkModel
 
     try:
-        assert get_cpd_query_generator("bnlearn")
-        assert get_inference_query_generator("bnlearn")
+        assert get_query_generator("bnlearn")
 
-        cpds_module = _load_script(cpds_script)
+        import benchmarking.IIII_run_benchmark.base as runner_base
+
+        monkeypatch.setattr(
+            runner_base, "get_preset_config", lambda m, mo, c: _dummy_config(m, mo, c)
+        )
+        monkeypatch.setattr(
+            runner_base, "get_generator_out_dir", lambda root, gen: out_root / gen
+        )
+
+        generate_module = _load_script(generate_script)
         monkeypatch.setattr(
             sys,
             "argv",
             [
-                str(cpds_script),
-                "--networks",
-                network,
+                str(generate_script),
                 "--generator",
                 "bnlearn",
-                "--strategy",
-                "parents",
-                "--budget",
+                "--mode",
+                "cpds",
+                "--seed",
+                str(seed),
+                "--n_queries_cpds",
                 "2",
-                "--seed",
-                str(seed),
-                "--out_dir",
-                str(cpds_queries_dir),
+                "--bundle_dir",
+                str(bundle_cpds.paths.root),
                 "--log-level",
                 "ERROR",
             ],
         )
-        cpds_module.main()
-        cpd_files = list((cpds_queries_dir / network).glob("*.jsonl"))
-        assert cpd_files
-        first_cpd = json.loads(cpd_files[0].read_text().splitlines()[0])
-        assert first_cpd.get("kind") == "cpd"
+        generate_module.main()
+        cpds_path = bundle_cpds.problem_paths(network).cpds_path
+        assert cpds_path.exists()
+        first_cpd = json.loads(cpds_path.read_text().splitlines()[0])
+        assert first_cpd.get("query_type") == "cpd"
 
-        inf_module = _load_script(inf_script)
         monkeypatch.setattr(
             sys,
             "argv",
             [
-                str(inf_script),
-                "--networks",
-                network,
+                str(generate_script),
                 "--generator",
                 "bnlearn",
-                "--strategy",
-                "balanced",
-                "--budget",
+                "--mode",
+                "inference",
+                "--seed",
+                str(seed),
+                "--n_queries_inference",
                 "3",
-                "--seed",
-                str(seed),
-                "--out_dir",
-                str(inf_queries_dir),
+                "--bundle_dir",
+                str(bundle_inference.paths.root),
                 "--log-level",
                 "ERROR",
             ],
         )
-        inf_module.main()
-        inf_files = list((inf_queries_dir / network).glob("*.jsonl"))
-        assert inf_files
-        first_inf = json.loads(inf_files[0].read_text().splitlines()[0])
-        assert first_inf.get("kind") == "inference"
+        generate_module.main()
+        inf_path = bundle_inference.problem_paths(network).inference_path
+        assert inf_path.exists()
+        first_inf = json.loads(inf_path.read_text().splitlines()[0])
+        assert first_inf.get("query_type") == "inference"
 
-        cpds_preset_path = tmp_path / "cpds_preset.json"
-        _write_preset(
-            cpds_preset_path,
-            {
-                "models": {
-                    "dummy": {
-                        "learning": {"name": "none", "kwargs": {}},
-                        "cpd": {"name": "none", "kwargs": {}},
-                    }
-                }
-            },
-        )
-
-        cpds_runner_module = _load_script(cpds_runner_script)
+        run_module = _load_script(run_script)
         monkeypatch.setattr(
             sys,
             "argv",
             [
-                str(cpds_runner_script),
-                "--networks",
-                network,
-                "--cpd_models",
-                "dummy",
-                "--cpd_preset",
-                str(cpds_preset_path),
-                "--queries_dir",
-                str(cpds_queries_dir),
-                "--results_dir",
-                str(cpds_results_dir),
+                str(run_script),
+                "--generator",
+                "bnlearn",
                 "--seed",
                 str(seed),
+                "--mode",
+                "cpds",
+                "--models",
+                "dummy",
+                "--bundle_dir",
+                str(bundle_cpds.paths.root),
                 "--log-level",
                 "ERROR",
             ],
         )
-        cpds_runner_module.main()
-        cpd_runs = list((cpds_results_dir / "dummy" / network).glob("run_*.jsonl"))
-        assert cpd_runs
-
-        inf_preset_path = tmp_path / "inference_preset.json"
-        _write_preset(
-            inf_preset_path,
-            {
-                "methods": {
-                    "dummy_inf": {
-                        "model": "dummy",
-                        "inference": {"name": "none", "kwargs": {}},
-                    }
-                }
-            },
+        run_module.main()
+        cpds_runs = sorted((out_root / "bnlearn").glob("benchmark_cpds_*"))
+        assert cpds_runs
+        cpds_result_files = list(
+            (cpds_runs[-1] / "results" / network).glob("dummy*.jsonl")
         )
+        assert cpds_result_files
 
-        inf_runner_module = _load_script(inf_runner_script)
         monkeypatch.setattr(
             sys,
             "argv",
             [
-                str(inf_runner_script),
-                "--networks",
-                network,
-                "--cpd_models",
-                "dummy",
-                "--inference_methods",
-                "dummy_inf",
-                "--cpd_preset",
-                str(cpds_preset_path),
-                "--inference_preset",
-                str(inf_preset_path),
-                "--queries_dir",
-                str(inf_queries_dir),
-                "--results_dir",
-                str(inf_results_dir),
+                str(run_script),
+                "--generator",
+                "bnlearn",
                 "--seed",
                 str(seed),
+                "--mode",
+                "inference",
+                "--models",
+                "dummy",
+                "--bundle_dir",
+                str(bundle_inference.paths.root),
                 "--log-level",
                 "ERROR",
             ],
         )
-        inf_runner_module.main()
-        inf_runs = list(
-            (inf_results_dir / "dummy" / "dummy_inf" / network).glob("run_*.jsonl")
-        )
+        run_module.main()
+        inf_runs = sorted((out_root / "bnlearn").glob("benchmark_inference_*"))
         assert inf_runs
+        inf_result_files = list(
+            (inf_runs[-1] / "results" / network).glob("dummy*.jsonl")
+        )
+        assert inf_result_files
     finally:
         BENCHMARK_MODEL_REGISTRY.pop("dummy", None)
-        shutil.rmtree(dataset_dir, ignore_errors=True)
-        shutil.rmtree(metadata_dir, ignore_errors=True)
