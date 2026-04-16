@@ -4,7 +4,11 @@ import math
 from typing import Iterable
 
 import numpy as np
-from scipy.stats import wasserstein_distance as _scipy_wasserstein
+
+try:
+    from scipy.stats import wasserstein_distance as _scipy_wasserstein
+except Exception:  # pragma: no cover - optional dependency
+    _scipy_wasserstein = None
 
 _NEG_TOL = 1e-12
 _SUM_TOL = 1e-6
