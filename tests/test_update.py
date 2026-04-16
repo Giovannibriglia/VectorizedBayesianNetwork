@@ -48,3 +48,34 @@ def test_update_keeps_optimizer_state():
     vbn.update(update_data, update_method="online_sgd")
     second_opt = next(iter(vbn.nodes.values()))._optimizer
     assert first_opt is second_opt
+
+
+def test_update_methods_support_non_gradient_root_softmax():
+    g = nx.DiGraph()
+    g.add_node("x")
+    vbn = VBN(g, seed=0, device="cpu")
+    vbn.set_learning_method(
+        "node_wise",
+        nodes_cpds={
+            "x": {
+                "cpd": "softmax_nn",
+                "fit": {
+                    "epochs": 1,
+                    "batch_size": 32,
+                    "lr": 1e-3,
+                    "weight_decay": 0.0,
+                },
+                "update": {
+                    "lr": 1e-3,
+                    "n_steps": 1,
+                    "batch_size": 16,
+                    "weight_decay": 0.0,
+                },
+            }
+        },
+    )
+    train_data = {"x": torch.randn(64, 1)}
+    update_data = {"x": torch.randn(16, 1)}
+    vbn.fit(train_data)
+    vbn.update(update_data, update_method="online_sgd")
+    vbn.update(update_data, update_method="replay_buffer")

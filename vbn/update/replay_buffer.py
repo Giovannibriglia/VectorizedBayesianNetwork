@@ -33,15 +33,7 @@ class ReplayBufferUpdate(BaseUpdatePolicy):
             parent_tensor = concat_parents(data, parents)
             self._update_buffer(node, parent_tensor, data[node])
             parents_mix, x_mix = self._mix_with_replay(node, parent_tensor, data[node])
-            self._online_update(
-                vbn.nodes[node],
-                parents_mix,
-                x_mix,
-                params["lr"],
-                params["n_steps"],
-                params["batch_size"],
-                params["weight_decay"],
-            )
+            self._online_update(vbn.nodes[node], parents_mix, x_mix, params)
         return vbn.nodes
 
     def _update_buffer(
@@ -76,30 +68,10 @@ class ReplayBufferUpdate(BaseUpdatePolicy):
         x_replay = x_buf[idx]
         return torch.cat([parents, p_replay], dim=0), torch.cat([x, x_replay], dim=0)
 
-    def _online_update(self, cpd, parents, x, lr, n_steps, batch_size, weight_decay):
-        if not any(p.requires_grad for p in cpd.parameters()):
-            raise NotImplementedError(
-                "CPD has no trainable parameters for replay update"
-            )
-        if parents is None:
-            parents = torch.zeros(x.shape[0], 0, device=cpd.device)
-        dataset = torch.utils.data.TensorDataset(parents, x)
-        loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True
-        )
-        optimizer = getattr(cpd, "_optimizer", None)
-        if optimizer is None:
-            optimizer = torch.optim.Adam(
-                cpd.parameters(), lr=lr, weight_decay=weight_decay
-            )
-            cpd._optimizer = optimizer
-        for _ in range(int(n_steps)):
-            for batch_parents, batch_x in loader:
-                log_prob = cpd.log_prob(batch_x, batch_parents)
-                loss = -log_prob.mean()
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+    def _online_update(self, cpd, parents, x, params):
+        # Delegate to CPD update implementation to support replay with both
+        # differentiable and closed-form/non-gradient CPDs.
+        cpd.update(parents, x, **params)
 
     def get_state(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         return {"buffer": self._buffer}

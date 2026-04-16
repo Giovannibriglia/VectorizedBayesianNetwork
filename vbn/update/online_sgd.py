@@ -26,38 +26,10 @@ class OnlineSGDUpdate(BaseUpdatePolicy):
             params = _resolve_node_update(vbn, node)
             parents = vbn.dag.parents(node)
             parent_tensor = concat_parents(data, parents)
-            self._update_cpd(
-                vbn.nodes[node],
-                parent_tensor,
-                data[node],
-                params["lr"],
-                params["n_steps"],
-                params["batch_size"],
-                params["weight_decay"],
-            )
+            self._update_cpd(vbn.nodes[node], parent_tensor, data[node], params)
         return vbn.nodes
 
-    def _update_cpd(self, cpd, parents, x, lr, n_steps, batch_size, weight_decay):
-        if not any(p.requires_grad for p in cpd.parameters()):
-            raise NotImplementedError(
-                "CPD has no trainable parameters for online SGD update"
-            )
-        if parents is None:
-            parents = torch.zeros(x.shape[0], 0, device=cpd.device)
-        dataset = torch.utils.data.TensorDataset(parents, x)
-        loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True
-        )
-        optimizer = getattr(cpd, "_optimizer", None)
-        if optimizer is None:
-            optimizer = torch.optim.Adam(
-                cpd.parameters(), lr=lr, weight_decay=weight_decay
-            )
-            cpd._optimizer = optimizer
-        for _ in range(int(n_steps)):
-            for batch_parents, batch_x in loader:
-                log_prob = cpd.log_prob(batch_x, batch_parents)
-                loss = -log_prob.mean()
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+    def _update_cpd(self, cpd, parents, x, params):
+        # Delegate updates to the CPD implementation so non-gradient CPDs/root
+        # fast paths (e.g. cached logits) can update safely without autograd.
+        cpd.update(parents, x, **params)
