@@ -19,7 +19,7 @@ python -m benchmarking.scripts.04_run_benchmark \
   --seed 0 \
   --mode cpds \
   --bundle benchmark_cpds_YYYYMMDD_HHMMSS \
-  --models vbn,pgmpy
+  --models vbn,pgmpy,numpyro,gpytorch
 ```
 
 Bundle selection:
@@ -53,5 +53,7 @@ Each JSONL record contains model metadata, compact query info, timing, and resul
 
 Presets live in:
 
-- `benchmarking/models/presets_vbn.yaml`
-- `benchmarking/models/presets_pgmpy.yaml`
+- `benchmarking/models/presets/vbn.yaml`
+- `benchmarking/models/presets/pgmpy.yaml`
+- `benchmarking/models/presets/numpyro.yaml`
+- `benchmarking/models/presets/gpytorch.yaml`

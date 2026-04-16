@@ -1,0 +1,70 @@
+cpds:
+  default:
+    learning:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    cpds:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+
+  numpyro_dirichlet:
+    learning:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    cpds:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+
+  numpyro_dirichlet_smooth:
+    learning:
+      method: dirichlet_table
+      kwargs:
+        alpha: 0.5
+    cpds:
+      method: dirichlet_table
+      kwargs:
+        alpha: 0.5
+
+inference:
+  default:
+    learning:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    cpds:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    inference:
+      method: likelihood_weighting
+      kwargs: {}
+
+  numpyro_lw:
+    learning:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    cpds:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    inference:
+      method: likelihood_weighting
+      kwargs: {}
+
+  numpyro_ais:
+    learning:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    cpds:
+      method: dirichlet_table
+      kwargs:
+        alpha: 1.0
+    inference:
+      method: ancestral_importance_sampling
+      kwargs: {}

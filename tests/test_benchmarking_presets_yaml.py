@@ -103,3 +103,131 @@ def test_pgmpy_inference_requires_inference_method() -> None:
         },
     )
     assert preset["inference"]["kwargs"] == {}
+
+
+def test_numpyro_cpds_requires_learning_and_cpd_method() -> None:
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "numpyro",
+            "cpds",
+            {
+                "cpds": {"method": "dirichlet_table"},
+            },
+        )
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "numpyro",
+            "cpds",
+            {
+                "learning": {"method": "dirichlet_table"},
+                "cpds": {},
+            },
+        )
+
+    preset = presets_mod.validate_preset(
+        "numpyro",
+        "cpds",
+        {
+            "learning": {"method": "dirichlet_table"},
+            "cpds": {"method": "dirichlet_table"},
+        },
+    )
+    assert preset["learning"]["kwargs"] == {}
+    assert preset["cpds"]["kwargs"] == {}
+
+
+def test_numpyro_inference_requires_method() -> None:
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "numpyro",
+            "inference",
+            {
+                "learning": {"method": "dirichlet_table"},
+                "cpds": {"method": "dirichlet_table"},
+            },
+        )
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "numpyro",
+            "inference",
+            {
+                "learning": {"method": "dirichlet_table"},
+                "cpds": {"method": "dirichlet_table"},
+                "inference": {},
+            },
+        )
+
+    preset = presets_mod.validate_preset(
+        "numpyro",
+        "inference",
+        {
+            "learning": {"method": "dirichlet_table"},
+            "cpds": {"method": "dirichlet_table"},
+            "inference": {"method": "likelihood_weighting"},
+        },
+    )
+    assert preset["inference"]["kwargs"] == {}
+
+
+def test_gpytorch_cpds_requires_learning_and_cpd_method() -> None:
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "gpytorch",
+            "cpds",
+            {
+                "cpds": {"method": "gp_posterior"},
+            },
+        )
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "gpytorch",
+            "cpds",
+            {
+                "learning": {"method": "exact_gp"},
+                "cpds": {},
+            },
+        )
+
+    preset = presets_mod.validate_preset(
+        "gpytorch",
+        "cpds",
+        {
+            "learning": {"method": "exact_gp"},
+            "cpds": {"method": "gp_posterior"},
+        },
+    )
+    assert preset["learning"]["kwargs"] == {}
+    assert preset["cpds"]["kwargs"] == {}
+
+
+def test_gpytorch_inference_requires_method() -> None:
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "gpytorch",
+            "inference",
+            {
+                "learning": {"method": "exact_gp"},
+                "cpds": {"method": "gp_posterior"},
+            },
+        )
+    with pytest.raises(ValueError):
+        presets_mod.validate_preset(
+            "gpytorch",
+            "inference",
+            {
+                "learning": {"method": "exact_gp"},
+                "cpds": {"method": "gp_posterior"},
+                "inference": {},
+            },
+        )
+
+    preset = presets_mod.validate_preset(
+        "gpytorch",
+        "inference",
+        {
+            "learning": {"method": "exact_gp"},
+            "cpds": {"method": "gp_posterior"},
+            "inference": {"method": "gp_forward_sample"},
+        },
+    )
+    assert preset["inference"]["kwargs"] == {}

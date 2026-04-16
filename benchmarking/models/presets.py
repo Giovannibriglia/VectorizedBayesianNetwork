@@ -7,16 +7,20 @@ import yaml
 
 from .config import ComponentSpec, make_component, ModelBenchmarkConfig
 
-Backend = Literal["vbn", "pgmpy"]
+Backend = Literal["vbn", "pgmpy", "numpyro", "gpytorch"]
 Mode = Literal["cpds", "inference"]
 
 _VBN_PRESETS_PATH = Path(__file__).parent / "presets" / "vbn.yaml"
 _PGMPY_PRESETS_PATH = Path(__file__).parent / "presets" / "pgmpy.yaml"
+_NUMPYRO_PRESETS_PATH = Path(__file__).parent / "presets" / "numpyro.yaml"
+_GPYTORCH_PRESETS_PATH = Path(__file__).parent / "presets" / "gpytorch.yaml"
 
 _DEFAULT_VBN_INFERENCE = "importance_sampling"
 _DEFAULT_PGMPY_INFERENCE = "exact_variable_elimination"
+_DEFAULT_NUMPYRO_INFERENCE = "likelihood_weighting"
+_DEFAULT_GPYTORCH_INFERENCE = "gp_forward_sample"
 
-_PRESET_CACHE: dict[tuple[str, str], dict[str, dict]] = {}
+_PRESET_CACHE: dict[tuple[str, ...], dict[str, dict]] = {}
 
 
 def _read_yaml(path: Path) -> dict:
@@ -32,17 +36,32 @@ def load_presets(
     *,
     vbn_path: Path | None = None,
     pgmpy_path: Path | None = None,
+    numpyro_path: Path | None = None,
+    gpytorch_path: Path | None = None,
 ) -> dict[str, dict]:
     vbn_path = Path(vbn_path) if vbn_path is not None else _VBN_PRESETS_PATH
     pgmpy_path = Path(pgmpy_path) if pgmpy_path is not None else _PGMPY_PRESETS_PATH
+    numpyro_path = (
+        Path(numpyro_path) if numpyro_path is not None else _NUMPYRO_PRESETS_PATH
+    )
+    gpytorch_path = (
+        Path(gpytorch_path) if gpytorch_path is not None else _GPYTORCH_PRESETS_PATH
+    )
     return {
         "vbn": _read_yaml(vbn_path),
         "pgmpy": _read_yaml(pgmpy_path),
+        "numpyro": _read_yaml(numpyro_path),
+        "gpytorch": _read_yaml(gpytorch_path),
     }
 
 
 def _get_cached_presets() -> dict[str, dict]:
-    cache_key = (str(_VBN_PRESETS_PATH), str(_PGMPY_PRESETS_PATH))
+    cache_key = (
+        str(_VBN_PRESETS_PATH),
+        str(_PGMPY_PRESETS_PATH),
+        str(_NUMPYRO_PRESETS_PATH),
+        str(_GPYTORCH_PRESETS_PATH),
+    )
     if cache_key in _PRESET_CACHE:
         return _PRESET_CACHE[cache_key]
     presets = load_presets()
@@ -151,11 +170,56 @@ def _normalize_pgmpy_preset(mode: Mode, preset: dict) -> dict:
     return normalized
 
 
+def _normalize_generic_preset(
+    backend: str,
+    mode: Mode,
+    preset: dict,
+) -> dict:
+    learning = _require_mapping(preset.get("learning"), label="learning")
+    learning_method = _require_string(learning.get("method"), label="learning.method")
+    learning_kwargs = _normalize_kwargs(learning.get("kwargs"))
+
+    cpds = _require_mapping(preset.get("cpds"), label="cpds")
+    cpd_method = _require_string(cpds.get("method"), label="cpds.method")
+    cpd_kwargs = _normalize_kwargs(cpds.get("kwargs"))
+
+    inference = None
+    if mode == "inference":
+        inference_map = _require_mapping(preset.get("inference"), label="inference")
+        inference_method = _require_string(
+            inference_map.get("method"), label="inference.method"
+        )
+        inference_kwargs = _normalize_kwargs(inference_map.get("kwargs"))
+        inference = {"method": inference_method, "kwargs": inference_kwargs}
+
+    normalized: dict[str, Any] = {
+        "backend": backend,
+        "mode": mode,
+        "learning": {"method": learning_method, "kwargs": learning_kwargs},
+        "cpds": {"method": cpd_method, "kwargs": cpd_kwargs},
+    }
+    if inference is not None:
+        normalized["inference"] = inference
+    return normalized
+
+
+def _normalize_numpyro_preset(mode: Mode, preset: dict) -> dict:
+    return _normalize_generic_preset("numpyro", mode, preset)
+
+
+def _normalize_gpytorch_preset(mode: Mode, preset: dict) -> dict:
+    return _normalize_generic_preset("gpytorch", mode, preset)
+
+
 def validate_preset(backend: Backend, mode: Mode, preset: dict) -> dict:
     if backend == "vbn":
         return _normalize_vbn_preset(mode, preset)
     if backend == "pgmpy":
         return _normalize_pgmpy_preset(mode, preset)
+    if backend == "numpyro":
+        return _normalize_numpyro_preset(mode, preset)
+    if backend == "gpytorch":
+        return _normalize_gpytorch_preset(mode, preset)
     raise ValueError(f"Unsupported backend '{backend}'")
 
 
@@ -268,6 +332,46 @@ def _pgmpy_config_from_preset(
     )
 
 
+def _generic_config_from_preset(
+    backend: str,
+    mode: Mode,
+    preset: dict,
+    config_id: str,
+    *,
+    default_learning: str,
+    default_cpd: str,
+    default_inference: str,
+) -> ModelBenchmarkConfig:
+    learning = preset.get("learning") or {}
+    learning_spec = _component_from_method(
+        "learning",
+        learning.get("method", default_learning),
+        learning.get("kwargs", {}),
+    )
+
+    cpds = preset.get("cpds") or {}
+    cpd_spec = _component_from_method(
+        "cpd",
+        cpds.get("method", default_cpd),
+        cpds.get("kwargs", {}),
+    )
+
+    inference = preset.get("inference") or {}
+    inference_method = inference.get("method") or default_inference
+    inference_spec = _component_from_method(
+        "inference",
+        inference_method,
+        inference.get("kwargs", {}),
+    )
+    return ModelBenchmarkConfig(
+        model=backend,
+        config_id=config_id,
+        learning=learning_spec,
+        cpd=cpd_spec,
+        inference=inference_spec,
+    )
+
+
 def get_preset_config(
     backend: Backend, mode: Mode, config_id: str
 ) -> ModelBenchmarkConfig:
@@ -276,6 +380,26 @@ def get_preset_config(
         return _vbn_config_from_preset(mode, preset, config_id)
     if backend == "pgmpy":
         return _pgmpy_config_from_preset(mode, preset, config_id)
+    if backend == "numpyro":
+        return _generic_config_from_preset(
+            "numpyro",
+            mode,
+            preset,
+            config_id,
+            default_learning="dirichlet_table",
+            default_cpd="dirichlet_table",
+            default_inference=_DEFAULT_NUMPYRO_INFERENCE,
+        )
+    if backend == "gpytorch":
+        return _generic_config_from_preset(
+            "gpytorch",
+            mode,
+            preset,
+            config_id,
+            default_learning="exact_gp",
+            default_cpd="gp_posterior",
+            default_inference=_DEFAULT_GPYTORCH_INFERENCE,
+        )
     raise KeyError(f"Unknown backend '{backend}'")
 
 

@@ -5,6 +5,10 @@ fastparquet
 pyarrow
 scipy
 pgmpy
+numpyro
+jax
+jaxlib
+gpytorch
 pyyaml
 pyreadr
 rds2py
