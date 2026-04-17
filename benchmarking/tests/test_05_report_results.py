@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from benchmarking.bundles import BenchmarkBundle
@@ -100,3 +102,57 @@ def test_report_results_single_and_aggregate(
     assert (report_root / "single" / "asia" / "index.md").exists()
     root_index = (report_root / "index.md").read_text()
     assert "(by_category/small/)" in root_index
+
+
+def test_report_robust_summary_clips_non_negative_metrics() -> None:
+    module = importlib.import_module("benchmarking.scripts.05_report_results")
+    style = module.SUMMARY_STYLES["robust"]
+    summary = module.summarize([-0.4, 0.1, 0.3], style, metric="jsd")
+    assert summary["iqm"] >= 0.0
+    assert summary["min"] >= 0.0
+    assert summary["max"] >= summary["min"]
+    assert summary["q1"] >= 0.0
+    assert summary["iqr"] >= 0.0
+    assert summary["iqm_pm_iqr"] is not None
+    assert summary["iqm_low_iqrstd_clipped"] >= summary["min"]
+    assert summary["iqm_high_iqrstd_clipped"] <= summary["max"]
+    assert summary["iqm_range_iqrstd_clipped"] is not None
+
+
+def test_report_aggregate_time_table_stores_total_and_per_query() -> None:
+    module = importlib.import_module("benchmarking.scripts.05_report_results")
+    style = module.SUMMARY_STYLES["robust"]
+    df = pd.DataFrame(
+        {
+            "method_id": ["m1", "m1", "m1"],
+            "time": [1.0, 2.0, 3.0],
+        }
+    )
+    table = module.aggregate_time_table(df, ["method_id"], summary_style=style)
+    row = table.iloc[0]
+    assert "time_min" in table.columns
+    assert "time_max" in table.columns
+    assert "time_iqm_low_iqrstd_clipped" in table.columns
+    assert "time_iqm_high_iqrstd_clipped" in table.columns
+    assert int(row["n_queries"]) == 3
+    assert int(row["n_timed_queries"]) == 3
+    assert row["time_sum_ms"] == pytest.approx(6.0)
+    assert row["time_per_query_ms"] == pytest.approx(2.0)
+
+
+def test_metric_errorbars_robust_are_asymmetric_and_clipped() -> None:
+    module = importlib.import_module("benchmarking.scripts.05_report_results")
+    style = module.SUMMARY_STYLES["robust"]
+    df = pd.DataFrame(
+        {
+            "kl_iqm": [1.5, 2.0],
+            "kl_iqr": [4.0, 5.0],  # should be ignored for robust error bars
+            "kl_iqm_low_iqrstd_clipped": [1.0, 1.6],
+            "kl_iqm_high_iqrstd_clipped": [2.2, 2.5],
+        }
+    )
+    yerr = module._metric_errorbars(df, metric="kl", summary_style=style)
+    assert isinstance(yerr, np.ndarray)
+    assert yerr.shape == (2, 2)
+    assert yerr[0, 0] == pytest.approx(0.5)
+    assert yerr[1, 0] == pytest.approx(0.7)

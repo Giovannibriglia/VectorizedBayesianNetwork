@@ -70,12 +70,27 @@ class SummaryStyle:
 SUMMARY_STYLES: dict[str, SummaryStyle] = {
     "robust": SummaryStyle(
         name="robust",
-        keys=("n", "iqm", "iqr_std", "q1", "median", "q3", "iqm_pm_iqrstd"),
+        keys=(
+            "n",
+            "iqm",
+            "min",
+            "max",
+            "iqr",
+            "q1",
+            "median",
+            "q3",
+            "iqm_pm_iqr",
+            "iqr_std",
+            "iqm_pm_iqrstd",
+            "iqm_low_iqrstd_clipped",
+            "iqm_high_iqrstd_clipped",
+            "iqm_range_iqrstd_clipped",
+        ),
         center_key="iqm",
-        spread_key="iqr_std",
-        pm_key="iqm_pm_iqrstd",
+        spread_key="iqr",
+        pm_key="iqm_pm_iqr",
         center_label="IQM",
-        spread_label="IQRStd",
+        spread_label="IQR",
     ),
     "mean": SummaryStyle(
         name="mean",
@@ -135,6 +150,15 @@ METRIC_LABELS = {
     "time": "Time",
 }
 PLOT_METRICS = ["kl", "wass", "jsd_norm"]
+NON_NEGATIVE_METRICS = {
+    "kl",
+    "wass",
+    "jsd",
+    "jsd_norm",
+    "time",
+    "mean_abs_err",
+    "std_abs_err",
+}
 
 
 class GTComputer:
@@ -1155,39 +1179,83 @@ def _join_key(record: dict) -> tuple:
     )
 
 
-def robust_summary(values: list[float]) -> dict:
-    cleaned = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+def _metric_lower_bound(metric: str | None) -> float | None:
+    if metric and metric in NON_NEGATIVE_METRICS:
+        return 0.0
+    return None
+
+
+def _sanitize_numeric_values(
+    values: list[float], *, lower_bound: float | None = None
+) -> list[float]:
+    cleaned: list[float] = []
+    for value in values:
+        try:
+            numeric = float(value)
+        except Exception:
+            continue
+        if not math.isfinite(numeric):
+            continue
+        if lower_bound is not None and numeric < lower_bound:
+            numeric = lower_bound
+        cleaned.append(float(numeric))
+    return cleaned
+
+
+def robust_summary(values: list[float], *, lower_bound: float | None = None) -> dict:
+    cleaned = _sanitize_numeric_values(values, lower_bound=lower_bound)
     n = len(cleaned)
     if n == 0:
         return {
             "n": 0,
             "iqm": None,
+            "min": None,
+            "max": None,
+            "iqr": None,
             "iqr_std": None,
             "q1": None,
             "median": None,
             "q3": None,
+            "iqm_pm_iqr": None,
             "iqm_pm_iqrstd": None,
+            "iqm_low_iqrstd_clipped": None,
+            "iqm_high_iqrstd_clipped": None,
+            "iqm_range_iqrstd_clipped": None,
         }
     sorted_vals = sorted(cleaned)
     lo = int(n * 0.25)
     hi = int(n * 0.75)
     trimmed = sorted_vals[lo:hi] if hi > lo else sorted_vals
     iqm = float(np.mean(trimmed)) if trimmed else float(np.mean(sorted_vals))
+    observed_min = float(sorted_vals[0])
+    observed_max = float(sorted_vals[-1])
     q1, median, q3 = np.percentile(sorted_vals, [25, 50, 75])
+    iqr = float(q3 - q1)
     iqr_std = float((q3 - q1) / 1.349)
+    low_iqrstd_clipped = float(max(observed_min, iqm - iqr_std))
+    high_iqrstd_clipped = float(min(observed_max, iqm + iqr_std))
     return {
         "n": n,
         "iqm": iqm,
+        "min": observed_min,
+        "max": observed_max,
+        "iqr": iqr,
         "iqr_std": iqr_std,
         "q1": float(q1),
         "median": float(median),
         "q3": float(q3),
+        "iqm_pm_iqr": f"{iqm:.4f} ± {iqr:.4f}",
         "iqm_pm_iqrstd": f"{iqm:.4f} ± {iqr_std:.4f}",
+        "iqm_low_iqrstd_clipped": low_iqrstd_clipped,
+        "iqm_high_iqrstd_clipped": high_iqrstd_clipped,
+        "iqm_range_iqrstd_clipped": (
+            f"[{low_iqrstd_clipped:.4f}, {high_iqrstd_clipped:.4f}]"
+        ),
     }
 
 
-def mean_summary(values: list[float]) -> dict:
-    cleaned = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+def mean_summary(values: list[float], *, lower_bound: float | None = None) -> dict:
+    cleaned = _sanitize_numeric_values(values, lower_bound=lower_bound)
     n = len(cleaned)
     if n == 0:
         return {"n": 0, "mean": None, "std": None, "mean_pm_std": None}
@@ -1201,10 +1269,22 @@ def mean_summary(values: list[float]) -> dict:
     }
 
 
-def summarize(values: list[float], style: SummaryStyle) -> dict:
+def summarize(
+    values: list[float], style: SummaryStyle, *, metric: str | None = None
+) -> dict:
+    lower_bound = _metric_lower_bound(metric)
     if style.name == "mean":
-        return mean_summary(values)
-    return robust_summary(values)
+        return mean_summary(values, lower_bound=lower_bound)
+    return robust_summary(values, lower_bound=lower_bound)
+
+
+def _sanitize_metric_value(value: float | None, *, metric: str) -> float | None:
+    if value is None:
+        return None
+    cleaned = _sanitize_numeric_values([value], lower_bound=_metric_lower_bound(metric))
+    if not cleaned:
+        return None
+    return float(cleaned[0])
 
 
 def aggregate_table(
@@ -1227,7 +1307,7 @@ def aggregate_table(
             keys = (keys,)
         row = {col: val for col, val in zip(group_cols, keys)}
         for metric in metric_cols:
-            summary = summarize(group[metric].tolist(), summary_style)
+            summary = summarize(group[metric].tolist(), summary_style, metric=metric)
             for key, value in summary.items():
                 row[f"{metric}_{key}"] = value
         rows.append(row)
@@ -1242,7 +1322,15 @@ def aggregate_time_table(
         columns: list[str] = list(group_cols)
         for key in summary_style.keys:
             columns.append(f"time_{key}")
-        columns.extend(["time_sum_ms", "time_sum_s"])
+        columns.extend(
+            [
+                "n_queries",
+                "n_timed_queries",
+                "time_sum_ms",
+                "time_sum_s",
+                "time_per_query_ms",
+            ]
+        )
         return pd.DataFrame(columns=columns)
     rows = []
     grouped = df.groupby(group_cols, dropna=False)
@@ -1250,16 +1338,24 @@ def aggregate_time_table(
         if not isinstance(keys, tuple):
             keys = (keys,)
         row = {col: val for col, val in zip(group_cols, keys)}
+        lower_bound = _metric_lower_bound("time")
         times = [
-            float(v)
+            max(float(v), lower_bound) if lower_bound is not None else float(v)
             for v in group["time"].tolist()
             if v is not None and math.isfinite(float(v))
         ]
-        summary = summarize(times, summary_style)
+        summary = summarize(times, summary_style, metric="time")
         for key, value in summary.items():
             row[f"time_{key}"] = value
+        n_queries = int(len(group))
+        n_timed_queries = int(len(times))
+        row["n_queries"] = n_queries
+        row["n_timed_queries"] = n_timed_queries
         row["time_sum_ms"] = float(sum(times)) if times else 0.0
         row["time_sum_s"] = float(row["time_sum_ms"] / 1000.0)
+        row["time_per_query_ms"] = (
+            float(row["time_sum_ms"] / n_queries) if n_queries > 0 else None
+        )
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1296,8 +1392,9 @@ def aggregate_batching_table(df: pd.DataFrame, group_cols: list[str]) -> pd.Data
             if v is not None and math.isfinite(float(v))
         ]
         row["avg_batch_size"] = float(np.mean(batch_sizes)) if batch_sizes else None
+        lower_bound = _metric_lower_bound("time")
         times = [
-            float(v)
+            max(float(v), lower_bound) if lower_bound is not None else float(v)
             for v in group["time"].tolist()
             if v is not None and math.isfinite(float(v))
         ]
@@ -1319,6 +1416,72 @@ def _safe_tag(value: str) -> str:
 
 def _metric_label(metric: str) -> str:
     return METRIC_LABELS.get(metric, metric.upper())
+
+
+def _to_finite_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return float(numeric)
+
+
+def _metric_errorbars(
+    data: pd.DataFrame,
+    *,
+    metric: str,
+    summary_style: SummaryStyle,
+) -> np.ndarray | list[float] | None:
+    center_col = f"{metric}_{summary_style.center_key}"
+    if center_col not in data:
+        return None
+    center = pd.to_numeric(data[center_col], errors="coerce")
+    if center.dropna().empty:
+        return None
+    if summary_style.name == "robust":
+        low_col = f"{metric}_iqm_low_iqrstd_clipped"
+        high_col = f"{metric}_iqm_high_iqrstd_clipped"
+        if low_col in data and high_col in data:
+            low = pd.to_numeric(data[low_col], errors="coerce")
+            high = pd.to_numeric(data[high_col], errors="coerce")
+            if low.notna().all() and high.notna().all():
+                lower = (center - low).clip(lower=0.0)
+                upper = (high - center).clip(lower=0.0)
+                return np.vstack(
+                    [lower.to_numpy(dtype=float), upper.to_numpy(dtype=float)]
+                )
+    spread_col = f"{metric}_{summary_style.spread_key}"
+    if spread_col not in data:
+        return None
+    spread = pd.to_numeric(data[spread_col], errors="coerce")
+    if spread.dropna().empty:
+        return None
+    return spread.fillna(0.0).clip(lower=0.0).astype(float).tolist()
+
+
+def _metric_errorbar_point(
+    row: pd.Series,
+    *,
+    metric: str,
+    summary_style: SummaryStyle,
+) -> np.ndarray | float | None:
+    center_col = f"{metric}_{summary_style.center_key}"
+    center = _to_finite_float(row.get(center_col))
+    if center is None:
+        return None
+    if summary_style.name == "robust":
+        low = _to_finite_float(row.get(f"{metric}_iqm_low_iqrstd_clipped"))
+        high = _to_finite_float(row.get(f"{metric}_iqm_high_iqrstd_clipped"))
+        if low is not None and high is not None:
+            lower = max(0.0, center - low)
+            upper = max(0.0, high - center)
+            return np.array([[lower], [upper]], dtype=float)
+    spread = _to_finite_float(row.get(f"{metric}_{summary_style.spread_key}"))
+    if spread is None:
+        return None
+    return max(0.0, float(spread))
 
 
 def _ax_has_labeled_artists(ax: plt.Axes) -> bool:
@@ -1966,13 +2129,17 @@ def _build_records(
                     "seed": run_seed,
                     "generator": run_generator,
                     "timestamp_utc": run_timestamp,
-                    "kl": kl,
-                    "wass": wass,
-                    "jsd": jsd,
-                    "jsd_norm": jsd_norm,
-                    "time": time_ms,
-                    "mean_abs_err": mean_abs_err,
-                    "std_abs_err": std_abs_err,
+                    "kl": _sanitize_metric_value(kl, metric="kl"),
+                    "wass": _sanitize_metric_value(wass, metric="wass"),
+                    "jsd": _sanitize_metric_value(jsd, metric="jsd"),
+                    "jsd_norm": _sanitize_metric_value(jsd_norm, metric="jsd_norm"),
+                    "time": _sanitize_metric_value(time_ms, metric="time"),
+                    "mean_abs_err": _sanitize_metric_value(
+                        mean_abs_err, metric="mean_abs_err"
+                    ),
+                    "std_abs_err": _sanitize_metric_value(
+                        std_abs_err, metric="std_abs_err"
+                    ),
                     "batch_enabled": batch_enabled,
                     "batch_size": batch_size,
                 }
@@ -2239,7 +2406,7 @@ def _two_stage_aggregate(
             keys = (keys,)
         row = {col: val for col, val in zip(group_cols, keys)}
         for metric in metric_cols:
-            summary = summarize(group[metric].tolist(), summary_style)
+            summary = summarize(group[metric].tolist(), summary_style, metric=metric)
             row[metric] = summary.get(summary_style.center_key)
         stage1_rows.append(row)
     stage1 = pd.DataFrame(stage1_rows)
@@ -2272,7 +2439,7 @@ def _two_stage_aggregate(
             keys = (keys,)
         row = {col: val for col, val in zip(stage2_group, keys)}
         for metric in metric_cols:
-            summary = summarize(group[metric].tolist(), summary_style)
+            summary = summarize(group[metric].tolist(), summary_style, metric=metric)
             for key, value in summary.items():
                 row[f"{metric}_{key}"] = value
         row["dataset_n"] = int(group["problem_id"].nunique())
@@ -2295,7 +2462,7 @@ def _plot_error_vs_size(
     fig = None
     try:
         center_col = f"{metric}_{summary_style.center_key}"
-        spread_col = f"{metric}_{summary_style.spread_key}"
+        # spread_col = f"{metric}_{summary_style.spread_key}"
         pre_rows = int(len(df))
         filtered = df[df[size_col].notna() & df[center_col].notna()]
         post_rows = int(len(filtered))
@@ -2319,9 +2486,11 @@ def _plot_error_vs_size(
                 continue
             group = group.sort_values(size_col)
             x = group[size_col].astype(int).tolist()
-            y = group[center_col].tolist()
-            yerr = group[spread_col].tolist() if spread_col in group else None
+            y = pd.to_numeric(group[center_col], errors="coerce").astype(float).tolist()
+            yerr = _metric_errorbars(group, metric=metric, summary_style=summary_style)
             ax.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
+        if metric in NON_NEGATIVE_METRICS:
+            ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.3)
         saved = _finalize_and_save_plot(
             fig,
@@ -2357,7 +2526,7 @@ def _plot_error_vs_evidence_size(
         if mode is not None:
             data = data[data["evidence_mode"] == mode]
         center_col = f"{metric}_{summary_style.center_key}"
-        spread_col = f"{metric}_{summary_style.spread_key}"
+        # spread_col = f"{metric}_{summary_style.spread_key}"
         pre_rows = int(len(data))
         data = data[data["evidence_size"].notna() & data[center_col].notna()]
         out_path = out_dir / f"{filename_prefix}{'__mode_' + mode if mode else ''}.png"
@@ -2379,12 +2548,14 @@ def _plot_error_vs_evidence_size(
             if sub.empty:
                 continue
             x = sub["evidence_size"].astype(int).tolist()
-            y = sub[center_col].tolist()
-            yerr = sub[spread_col].tolist() if spread_col in sub else None
+            y = pd.to_numeric(sub[center_col], errors="coerce").astype(float).tolist()
+            yerr = _metric_errorbars(sub, metric=metric, summary_style=summary_style)
             ax.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
         title = f"Inference {_metric_label(metric)} vs Evidence Size"
         if mode is not None:
             title = f"{title} ({mode})"
+        if metric in NON_NEGATIVE_METRICS:
+            ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.3)
         saved = _finalize_and_save_plot(
             fig,
@@ -2419,7 +2590,6 @@ def _plot_category_bars(
     fig = None
     try:
         center_col = f"{metric}_{summary_style.center_key}"
-        spread_col = f"{metric}_{summary_style.spread_key}"
         data = df[df[category_col].notna()]
         data = data[data[center_col].notna()]
         if data.empty:
@@ -2444,18 +2614,49 @@ def _plot_category_bars(
                 sub[category_col], categories=ordered, ordered=True
             )
             sub = sub.sort_values(category_col)
-            y_map = dict(zip(sub[category_col], sub[center_col]))
-            err_map = (
-                dict(zip(sub[category_col], sub[spread_col]))
-                if spread_col in sub
-                else {}
+            sub = sub.drop_duplicates(subset=[category_col], keep="first")
+            row_map = {cat: row for cat, row in sub.set_index(category_col).iterrows()}
+            y: list[float] = []
+            lower: list[float] = []
+            upper: list[float] = []
+            has_errorbars = False
+            for cat in ordered:
+                row = row_map.get(cat)
+                if row is None:
+                    y.append(np.nan)
+                    lower.append(np.nan)
+                    upper.append(np.nan)
+                    continue
+                center = _to_finite_float(row.get(center_col))
+                y.append(center if center is not None else np.nan)
+                err = _metric_errorbar_point(
+                    row, metric=metric, summary_style=summary_style
+                )
+                if isinstance(err, np.ndarray):
+                    low = float(err[0, 0])
+                    high = float(err[1, 0])
+                    has_errorbars = True
+                elif err is not None:
+                    val = float(err)
+                    low = val
+                    high = val
+                    has_errorbars = True
+                else:
+                    low = np.nan
+                    high = np.nan
+                lower.append(low)
+                upper.append(high)
+            yerr = (
+                np.vstack([np.array(lower, dtype=float), np.array(upper, dtype=float)])
+                if has_errorbars
+                else None
             )
-            y = [y_map.get(cat, np.nan) for cat in ordered]
-            yerr = [err_map.get(cat, np.nan) for cat in ordered] if err_map else None
             offset = (idx - (len(method_ids) - 1) / 2) * width
             ax.bar(x + offset, y, width=width, yerr=yerr, capsize=3, label=method_id)
         ax.set_xticks(x)
         ax.set_xticklabels(ordered, rotation=30, ha="right")
+        if metric in NON_NEGATIVE_METRICS:
+            ax.set_ylim(bottom=0.0)
         ax.grid(axis="y", alpha=0.3)
         out_path = out_dir / f"{filename_prefix}.png"
         saved = _finalize_and_save_plot(
@@ -2718,9 +2919,9 @@ def _plot_pareto(
     try:
         sub = df.copy()
         metric_center = f"{metric}_{summary_style.center_key}"
-        metric_spread = f"{metric}_{summary_style.spread_key}"
+        # metric_spread = f"{metric}_{summary_style.spread_key}"
         time_center = f"time_{summary_style.center_key}"
-        time_spread = f"time_{summary_style.spread_key}"
+        # time_spread = f"time_{summary_style.spread_key}"
         sub = sub[sub[metric_center].notna() & sub[time_center].notna()]
         if sub.empty:
             return None
@@ -2732,17 +2933,16 @@ def _plot_pareto(
         ax = fig.gca()
         pareto_label_added = False
         other_label_added = False
-        for (time_val, err_val), is_pareto, method_id, xerr, yerr in zip(
-            points,
-            pareto_mask,
-            sub["method_id"].tolist(),
-            sub[time_spread].tolist() if time_spread in sub else [np.nan] * len(sub),
-            (
-                sub[metric_spread].tolist()
-                if metric_spread in sub
-                else [np.nan] * len(sub)
-            ),
-        ):
+        for (_, row), is_pareto in zip(sub.iterrows(), pareto_mask):
+            time_val = float(row[time_center])
+            err_val = float(row[metric_center])
+            method_id = row.get("method_id")
+            xerr = _metric_errorbar_point(
+                row, metric="time", summary_style=summary_style
+            )
+            yerr = _metric_errorbar_point(
+                row, metric=metric, summary_style=summary_style
+            )
             if is_pareto:
                 ax.errorbar(
                     time_val,
@@ -2782,6 +2982,10 @@ def _plot_pareto(
                 color="C1",
                 alpha=0.5,
             )
+        if "time" in NON_NEGATIVE_METRICS:
+            ax.set_xlim(left=0.0)
+        if metric in NON_NEGATIVE_METRICS:
+            ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.3)
         out_path = out_dir / filename
         saved = _finalize_and_save_plot(

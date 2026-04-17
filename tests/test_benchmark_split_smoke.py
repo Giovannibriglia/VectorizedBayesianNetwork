@@ -238,6 +238,8 @@ def test_benchmark_split_smoke(tmp_path, monkeypatch) -> None:
             (cpds_runs[-1] / "results" / network).glob("dummy*.jsonl")
         )
         assert cpds_result_files
+        cpd_record = json.loads(cpds_result_files[0].read_text().splitlines()[0])
+        assert cpd_record.get("result", {}).get("timing_ms") == 0.01
 
         monkeypatch.setattr(
             sys,
@@ -265,5 +267,7 @@ def test_benchmark_split_smoke(tmp_path, monkeypatch) -> None:
             (inf_runs[-1] / "results" / network).glob("dummy*.jsonl")
         )
         assert inf_result_files
+        inf_record = json.loads(inf_result_files[0].read_text().splitlines()[0])
+        assert inf_record.get("result", {}).get("timing_ms") == 0.01
     finally:
         BENCHMARK_MODEL_REGISTRY.pop("dummy", None)
