@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import re
 import subprocess
 import time
@@ -225,6 +226,22 @@ class _StreamingStats:
             "avg_ms": float(self.total / self.count),
             "median_ms": self.median.value(),
         }
+
+
+def _coerce_timing_ms(value: Any) -> float | None:
+    try:
+        timing = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(timing) or timing < 0.0:
+        return None
+    return timing
+
+
+def _response_timing_ms(response: dict | None) -> float | None:
+    if not isinstance(response, dict):
+        return None
+    return _coerce_timing_ms(response.get("timing_ms"))
 
 
 class BaseBenchmarkRunner(ABC):
@@ -615,7 +632,7 @@ class BaseBenchmarkRunner(ABC):
                     "cpd": {"ok": 0, "error": 0},
                     "inference": {"ok": 0, "error": 0},
                 },
-                "timing_ms": {"per_problem": {}},
+                "timing_ms": {"per_problem": {}, "per_problem_wall": {}},
             }
             model_stats[model_name]["_timing"] = {
                 "cpd": _StreamingStats(),
@@ -952,8 +969,14 @@ class BaseBenchmarkRunner(ABC):
                                     error_msg=error_msg,
                                     is_oom=is_oom,
                                 )
-                            elapsed = (time.perf_counter() - start) * 1000.0
-                            cpd_timing_sum += elapsed
+                            wall_elapsed = (time.perf_counter() - start) * 1000.0
+                            response_timing_ms = _response_timing_ms(response)
+                            elapsed = (
+                                response_timing_ms
+                                if response_timing_ms is not None
+                                else float(wall_elapsed)
+                            )
+                            cpd_timing_sum += float(elapsed)
                             if ok:
                                 ok_cpd += 1
                             else:
@@ -1032,7 +1055,9 @@ class BaseBenchmarkRunner(ABC):
                                     batch_error = exc
                                     responses = None
                                 elapsed = (time.perf_counter() - start) * 1000.0
-                                per_query_ms = elapsed / max(1, len(batch_queries))
+                                per_query_ms = float(
+                                    elapsed / max(1, len(batch_queries))
+                                )
                                 if batch_error is not None:
                                     if (
                                         self.logger.isEnabledFor(logging.DEBUG)
@@ -1067,7 +1092,7 @@ class BaseBenchmarkRunner(ABC):
                                             error_msg=error_msg,
                                             is_oom=is_oom,
                                         )
-                                        inf_timing_sum += per_query_ms
+                                        inf_timing_sum += float(per_query_ms)
                                         err_inf += 1
                                         model_stats[model_name]["_timing"][
                                             "inference"
@@ -1103,9 +1128,24 @@ class BaseBenchmarkRunner(ABC):
                                             json.dumps(record, sort_keys=True) + "\n"
                                         )
                                 else:
-                                    for (q_index, query), response in zip(
-                                        chunk, responses or []
-                                    ):
+                                    response_timings = [
+                                        _response_timing_ms(response)
+                                        for response in (responses or [])
+                                    ]
+                                    use_response_timings = bool(
+                                        response_timings
+                                        and len(response_timings) == len(batch_queries)
+                                        and all(t is not None for t in response_timings)
+                                    )
+                                    per_query_timings = (
+                                        [float(t) for t in response_timings]
+                                        if use_response_timings
+                                        else [float(per_query_ms)] * len(batch_queries)
+                                    )
+                                    for idx_in_chunk, (
+                                        (q_index, query),
+                                        response,
+                                    ) in enumerate(zip(chunk, responses or [])):
                                         if isinstance(response, dict):
                                             response = dict(response or {})
                                         else:
@@ -1140,14 +1180,17 @@ class BaseBenchmarkRunner(ABC):
                                                 error_msg=error_msg,
                                                 is_oom=is_oom,
                                             )
-                                        inf_timing_sum += per_query_ms
+                                        query_timing_ms = float(
+                                            per_query_timings[idx_in_chunk]
+                                        )
+                                        inf_timing_sum += float(query_timing_ms)
                                         if ok:
                                             ok_inf += 1
                                         else:
                                             err_inf += 1
                                         model_stats[model_name]["_timing"][
                                             "inference"
-                                        ].add(float(per_query_ms))
+                                        ].add(float(query_timing_ms))
                                         skeleton_id = (query.get("evidence") or {}).get(
                                             "skeleton_id"
                                         ) or query.get("skeleton_id")
@@ -1170,7 +1213,7 @@ class BaseBenchmarkRunner(ABC):
                                                 "error_signature": (
                                                     error_signature if not ok else None
                                                 ),
-                                                "timing_ms": float(per_query_ms),
+                                                "timing_ms": float(query_timing_ms),
                                                 "output": output,
                                             },
                                             "batching": {
@@ -1236,8 +1279,16 @@ class BaseBenchmarkRunner(ABC):
                                             error_msg=error_msg,
                                             is_oom=is_oom,
                                         )
-                                    elapsed = (time.perf_counter() - start) * 1000.0
-                                    inf_timing_sum += elapsed
+                                    wall_elapsed = (
+                                        time.perf_counter() - start
+                                    ) * 1000.0
+                                    response_timing_ms = _response_timing_ms(response)
+                                    elapsed = (
+                                        response_timing_ms
+                                        if response_timing_ms is not None
+                                        else float(wall_elapsed)
+                                    )
+                                    inf_timing_sum += float(elapsed)
                                     if ok:
                                         ok_inf += 1
                                     else:
@@ -1289,15 +1340,19 @@ class BaseBenchmarkRunner(ABC):
                         if inf_bar is not None:
                             inf_bar.close()
 
-                    total_ms = (time.perf_counter() - model_start) * 1000.0
+                    total_wall_ms = (time.perf_counter() - model_start) * 1000.0
+                    total_query_compute_ms = float(cpd_timing_sum + inf_timing_sum)
                     model_stats[model_name]["problems"]["ok"] += 1
                     model_stats[model_name]["queries"]["cpd"]["ok"] += ok_cpd
                     model_stats[model_name]["queries"]["cpd"]["error"] += err_cpd
                     model_stats[model_name]["queries"]["inference"]["ok"] += ok_inf
                     model_stats[model_name]["queries"]["inference"]["error"] += err_inf
                     model_stats[model_name]["timing_ms"]["per_problem"][problem] = (
-                        float(total_ms)
+                        float(total_query_compute_ms)
                     )
+                    model_stats[model_name]["timing_ms"]["per_problem_wall"][
+                        problem
+                    ] = float(total_wall_ms)
 
             del assets
             gc.collect()
@@ -1322,6 +1377,11 @@ class BaseBenchmarkRunner(ABC):
             stats["timing_ms"]["total_ms"] = float(
                 sum(stats["timing_ms"]["per_problem"].values())
                 if stats["timing_ms"]["per_problem"]
+                else 0.0
+            )
+            stats["timing_ms"]["total_wall_ms"] = float(
+                sum(stats["timing_ms"]["per_problem_wall"].values())
+                if stats["timing_ms"]["per_problem_wall"]
                 else 0.0
             )
             summary["models"][model_name] = stats
