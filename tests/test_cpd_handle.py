@@ -99,3 +99,20 @@ def test_missing_parent_raises():
     handle = vbn.get_cpd("y")
     with pytest.raises(ValueError):
         handle.sample({}, n_samples=1)
+
+
+def test_root_categorical_table_conditional_probs_format():
+    g = nx.DiGraph()
+    g.add_node("x")
+    vbn = VBN(g, seed=0, device="cpu")
+    vbn.set_learning_method(
+        "node_wise",
+        nodes_cpds={"x": {"cpd": "categorical_table", "n_classes": 3}},
+    )
+    x = torch.randint(0, 3, (64, 1)).float()
+    vbn.fit({"x": x})
+
+    handle = vbn.get_cpd("x")
+    cond = handle.conditional(None, n_samples=16)
+    assert cond["format"] == "categorical_probs"
+    assert int(cond["k"]) == 3

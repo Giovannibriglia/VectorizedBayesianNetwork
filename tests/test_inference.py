@@ -57,3 +57,31 @@ def test_inference_rejects_do_evidence_overlap():
     }
     with pytest.raises(ValueError):
         vbn.infer_posterior(query)
+
+
+def _make_categorical_vbn():
+    g = nx.DiGraph()
+    g.add_edge("x", "y")
+    vbn = VBN(g, seed=0, device="cpu")
+    vbn.set_learning_method(
+        "node_wise",
+        nodes_cpds={
+            "x": {"cpd": "categorical_table", "n_classes": 3},
+            "y": {"cpd": "categorical_table", "n_classes": 3},
+        },
+    )
+    x = torch.randint(0, 3, (128, 1)).float()
+    noise = torch.randint(0, 3, (128, 1)).float()
+    y = (x + noise).remainder(3.0)
+    vbn.fit({"x": x, "y": y})
+    return vbn
+
+
+def test_categorical_exact_supports_categorical_table_root():
+    vbn = _make_categorical_vbn()
+    vbn.set_inference_method("categorical_exact", fallback="none")
+    pdf, samples = vbn.infer_posterior({"target": "x"})
+    assert pdf.shape == (1, 3)
+    assert samples.shape == (1, 3, 1)
+    assert torch.isfinite(pdf).all()
+    assert torch.allclose(pdf.sum(dim=1), torch.ones(1), atol=1e-6)

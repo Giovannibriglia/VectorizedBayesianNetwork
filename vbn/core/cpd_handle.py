@@ -97,9 +97,18 @@ def _extract_categorical_probs(cpd, parents_tensor: Optional[torch.Tensor]):
         if parents_tensor is None:
             if hasattr(cpd, "_root_ready") and bool(cpd._root_ready.item()):
                 logits = cpd._root_log_probs
+            elif hasattr(cpd, "_params") and callable(cpd._params):
+                logits = cpd._params(None)
             else:
                 logits = cpd._logits
-            logits = logits.view(1, 1, cpd.output_dim, cpd.n_classes)
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            if logits.dim() == 2:
+                logits = logits.view(1, 1, cpd.output_dim, cpd.n_classes)
+            elif logits.dim() == 4:
+                pass
+            else:
+                return None
         else:
             logits = cpd._logits_from_parents(parents_tensor)
         probs = torch.softmax(logits, dim=-1)

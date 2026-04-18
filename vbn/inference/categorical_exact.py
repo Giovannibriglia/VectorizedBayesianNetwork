@@ -49,9 +49,20 @@ class CategoricalExact:
             if hasattr(cpd, "_root_ready") and bool(getattr(cpd, "_root_ready").item()):
                 logits = cpd._root_log_probs
                 logits = torch.log_softmax(logits / temperature, dim=-1)
+            elif hasattr(cpd, "_params") and callable(cpd._params):
+                logits = cpd._params(None)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                logits = logits / temperature
             else:
                 logits = cpd._logits / temperature
-            probs = torch.softmax(logits, dim=-1).view(1, -1, cpd.n_classes)
+            if logits.dim() == 2:
+                logits = logits.view(1, -1, cpd.n_classes)
+            elif logits.dim() == 4:
+                logits = logits.reshape(logits.shape[0], -1, cpd.n_classes)
+            elif logits.dim() != 3:
+                return None
+            probs = torch.softmax(logits, dim=-1)
             probs = probs.expand(batch_size, -1, -1)
         else:
             if parents_tensor.dim() == 2:
