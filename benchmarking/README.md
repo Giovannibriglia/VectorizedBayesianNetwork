@@ -41,7 +41,7 @@ python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --
 ```bash
 CPDS_RUN_DIR=$(ls -td benchmarking/out/bnlearn/benchmark_cpds_* | head -n 1)
 
-python -m benchmarking.scripts.05_report_results --run_dir "$CPDS_RUN_DIR" --summary_style robust
+python -m benchmarking.scripts.05_report_results --run_dir "$CPDS_RUN_DIR" --summary_style robust --cmap tab20
 ```
 
 ### Inference benchmark
@@ -61,7 +61,7 @@ python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --
 ```bash
 INFERENCE_RUN_DIR=$(ls -td benchmarking/out/bnlearn/benchmark_inference_* | head -n 1)
 
-python -m benchmarking.scripts.05_report_results --run_dir "$INFERENCE_RUN_DIR" --summary_style robust
+python -m benchmarking.scripts.05_report_results --run_dir "$INFERENCE_RUN_DIR" --summary_style robust --cmap tab20
 ```
 
 ---
@@ -131,7 +131,8 @@ python -m benchmarking.scripts.04_run_benchmark \
 
 python -m benchmarking.scripts.05_report_results \
   --run_dir benchmarking/out/bnlearn/benchmark_inference_20260413_190932 \
-  --summary_style robust
+  --summary_style robust \
+  --cmap tab20
 ```
 
 ---
@@ -248,7 +249,8 @@ Developer guide: `benchmarking/scripts/04_run_benchmark_readme.md`.
 ```bash
 python -m benchmarking.scripts.05_report_results \
   --run_dir benchmarking/out/bnlearn/benchmark_cpds_YYYYMMDD_HHMMSS \
-  --summary_style robust
+  --summary_style robust \
+  --cmap tab20
 ```
 
 Outputs:
@@ -260,6 +262,6 @@ Outputs:
   single/<problem_id>/...
 ```
 
-Use `--summary_style mean` for mean ± std instead of IQM ± IQRStd.
+Use `--summary_style mean` for mean ± std instead of IQM ± IQRStd. Use `--cmap <name>` to choose a matplotlib colormap (method colors are deterministic and consistent across generated figures).
 
 Developer guide: `benchmarking/scripts/05_report_results_readme.md`.

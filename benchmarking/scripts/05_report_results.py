@@ -159,6 +159,7 @@ NON_NEGATIVE_METRICS = {
     "mean_abs_err",
     "std_abs_err",
 }
+DEFAULT_REPORT_CMAP = "tab20"
 
 
 class GTComputer:
@@ -2447,6 +2448,30 @@ def _two_stage_aggregate(
     return pd.DataFrame(rows)
 
 
+def _resolve_cmap(cmap: str | None):
+    cmap_name = (cmap or DEFAULT_REPORT_CMAP).strip() or DEFAULT_REPORT_CMAP
+    try:
+        return matplotlib.colormaps[cmap_name]
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Unknown cmap '%s'; falling back to '%s'",
+            cmap_name,
+            DEFAULT_REPORT_CMAP,
+        )
+        return matplotlib.colormaps[DEFAULT_REPORT_CMAP]
+
+
+def _stable_color_for_label(label: Any, *, cmap: str | None):
+    if label is None:
+        return None
+    label_str = str(label).strip()
+    if not label_str:
+        return None
+    digest = hashlib.sha256(label_str.encode("utf-8")).digest()
+    ratio = int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+    return _resolve_cmap(cmap)(ratio)
+
+
 def _plot_error_vs_size(
     df: pd.DataFrame,
     *,
@@ -2456,6 +2481,7 @@ def _plot_error_vs_size(
     out_dir: Path,
     title_prefix: str,
     filename_prefix: str,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2488,7 +2514,15 @@ def _plot_error_vs_size(
             x = group[size_col].astype(int).tolist()
             y = pd.to_numeric(group[center_col], errors="coerce").astype(float).tolist()
             yerr = _metric_errorbars(group, metric=metric, summary_style=summary_style)
-            ax.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
+            ax.errorbar(
+                x,
+                y,
+                yerr=yerr,
+                fmt="-o",
+                capsize=3,
+                label=method_id,
+                color=_stable_color_for_label(method_id, cmap=cmap),
+            )
         if metric in NON_NEGATIVE_METRICS:
             ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.3)
@@ -2517,6 +2551,7 @@ def _plot_error_vs_evidence_size(
     out_dir: Path,
     filename_prefix: str,
     mode: str | None = None,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2550,7 +2585,15 @@ def _plot_error_vs_evidence_size(
             x = sub["evidence_size"].astype(int).tolist()
             y = pd.to_numeric(sub[center_col], errors="coerce").astype(float).tolist()
             yerr = _metric_errorbars(sub, metric=metric, summary_style=summary_style)
-            ax.errorbar(x, y, yerr=yerr, fmt="-o", capsize=3, label=method_id)
+            ax.errorbar(
+                x,
+                y,
+                yerr=yerr,
+                fmt="-o",
+                capsize=3,
+                label=method_id,
+                color=_stable_color_for_label(method_id, cmap=cmap),
+            )
         title = f"Inference {_metric_label(metric)} vs Evidence Size"
         if mode is not None:
             title = f"{title} ({mode})"
@@ -2584,6 +2627,7 @@ def _plot_category_bars(
     filename_prefix: str,
     title_prefix: str,
     category_order: list[str],
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2652,7 +2696,15 @@ def _plot_category_bars(
                 else None
             )
             offset = (idx - (len(method_ids) - 1) / 2) * width
-            ax.bar(x + offset, y, width=width, yerr=yerr, capsize=3, label=method_id)
+            ax.bar(
+                x + offset,
+                y,
+                width=width,
+                yerr=yerr,
+                capsize=3,
+                label=method_id,
+                color=_stable_color_for_label(method_id, cmap=cmap),
+            )
         ax.set_xticks(x)
         ax.set_xticklabels(ordered, rotation=30, ha="right")
         if metric in NON_NEGATIVE_METRICS:
@@ -2683,6 +2735,7 @@ def plot_success_rate_bar(
     filename_prefix: str,
     title_prefix: str,
     category_order: list[str] | None = None,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2721,7 +2774,13 @@ def plot_success_rate_bar(
             y_map = dict(zip(sub[category_col], sub["success_rate"]))
             y = [y_map.get(cat, np.nan) for cat in ordered]
             offset = (idx - (len(method_ids) - 1) / 2) * width
-            ax.bar(x + offset, y, width=width, label=method_id)
+            ax.bar(
+                x + offset,
+                y,
+                width=width,
+                label=method_id,
+                color=_stable_color_for_label(method_id, cmap=cmap),
+            )
         ax.set_xticks(x)
         ax.set_xticklabels(ordered, rotation=30, ha="right")
         ax.set_ylim(0.0, 1.0)
@@ -2750,6 +2809,7 @@ def plot_success_rate_line(
     out_dir: Path,
     filename: str,
     title: str,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2770,6 +2830,7 @@ def plot_success_rate_line(
                 fmt="-o",
                 capsize=3,
                 label=model,
+                color=_stable_color_for_label(model, cmap=cmap),
             )
         out_path = out_dir / filename
         ax.set_ylim(0.0, 1.0)
@@ -2798,6 +2859,7 @@ def plot_coverage_line(
     out_dir: Path,
     filename: str,
     title: str,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2818,6 +2880,7 @@ def plot_coverage_line(
                 fmt="-o",
                 capsize=3,
                 label=model,
+                color=_stable_color_for_label(model, cmap=cmap),
             )
         out_path = out_dir / filename
         ax.grid(True, alpha=0.3)
@@ -2845,6 +2908,7 @@ def _plot_error_type_distribution(
     filename: str,
     title: str,
     top_k: int = 6,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2864,12 +2928,21 @@ def _plot_error_type_distribution(
         if pivot.empty:
             return None
         pivot = pivot.sort_index()
+        error_type_colors = {
+            str(col): _stable_color_for_label(col, cmap=cmap) for col in pivot.columns
+        }
         fig = plt.figure(figsize=(10, 4.5))
         ax = fig.gca()
         bottoms = np.zeros(len(pivot))
         for col in pivot.columns:
             values = pivot[col].values
-            ax.bar(pivot.index, values, bottom=bottoms, label=str(col))
+            ax.bar(
+                pivot.index,
+                values,
+                bottom=bottoms,
+                label=str(col),
+                color=error_type_colors.get(str(col)),
+            )
             bottoms = bottoms + values
         ax.tick_params(axis="x", rotation=30)
         ax.grid(axis="y", alpha=0.3)
@@ -2912,6 +2985,7 @@ def _plot_pareto(
     out_dir: Path,
     filename: str,
     title: str,
+    cmap: str | None = None,
 ) -> Path | None:
     if df.empty:
         return None
@@ -2929,6 +3003,7 @@ def _plot_pareto(
             zip(sub[time_center].astype(float), sub[metric_center].astype(float))
         )
         pareto_mask = _pareto_frontier(points)
+        pareto_color = _resolve_cmap(cmap)(0.8)
         fig = plt.figure(figsize=(7.5, 5))
         ax = fig.gca()
         pareto_label_added = False
@@ -2950,7 +3025,7 @@ def _plot_pareto(
                     xerr=xerr,
                     yerr=yerr,
                     fmt="o",
-                    color="C1",
+                    color=pareto_color,
                     capsize=3,
                     label="Pareto" if not pareto_label_added else None,
                 )
@@ -2979,7 +3054,7 @@ def _plot_pareto(
             ax.plot(
                 [p[0] for p in pareto_points],
                 [p[1] for p in pareto_points],
-                color="C1",
+                color=pareto_color,
                 alpha=0.5,
             )
         if "time" in NON_NEGATIVE_METRICS:
@@ -3088,7 +3163,9 @@ def generate_report_for_partition(
     include_coverage: bool,
     allowed_query_types: set[str] | None = None,
     methods_to_show: list[str] | None = None,
+    cmap: str = DEFAULT_REPORT_CMAP,
 ) -> tuple[list[Path], list[Path]]:
+    cmap = (cmap or DEFAULT_REPORT_CMAP).strip() or DEFAULT_REPORT_CMAP
     if allowed_query_types:
         if not df.empty:
             df = df[df["query_type"].isin(allowed_query_types)]
@@ -3682,6 +3759,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     title_prefix=f"CPD {_metric_label(metric)} vs {size_label}",
                     filename_prefix=f"cpd_{metric}_vs_{tag}",
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -3701,6 +3779,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     title_prefix=f"Inference {_metric_label(metric)} vs {size_label}",
                     filename_prefix=f"inference_{metric}_vs_{tag}",
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -3722,6 +3801,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     filename_prefix=f"inference_{metric}_vs_evidence_size",
                     mode=mode,
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -3744,6 +3824,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     filename=f"pareto_cpd_{metric}_vs_time.png",
                     title=f"CPD {_metric_label(metric)} vs Time",
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -3757,6 +3838,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     filename=f"pareto_inference_{metric}_vs_time.png",
                     title=f"Inference {_metric_label(metric)} vs Time",
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -3794,6 +3876,7 @@ def generate_report_for_partition(
                             out_dir=figures_dir,
                             filename=f"pareto_{qtype}_{metric}_vs_time__{tag}.png",
                             title=f"{qtype.capitalize()} {_metric_label(metric)} vs Time ({split_col}={split_val})",
+                            cmap=cmap,
                         )
                         if fig:
                             figures.append(fig)
@@ -3808,6 +3891,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="CPD Time vs Markov Blanket Size",
                 filename_prefix="cpd_time_vs_mb_size",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3819,6 +3903,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="CPD Time vs Parent Set Size",
                 filename_prefix="cpd_time_vs_parent_size",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3830,6 +3915,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="CPD Time vs #Nodes",
                 filename_prefix="cpd_time_vs_n_nodes",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3841,6 +3927,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="CPD Time vs #Edges",
                 filename_prefix="cpd_time_vs_n_edges",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3852,6 +3939,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="CPD Time vs Evidence Size",
                 filename_prefix="cpd_time_vs_evidence_size",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3864,6 +3952,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="Inference Time vs Evidence Size",
                 filename_prefix="inference_time_vs_evidence_size",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3875,6 +3964,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="Inference Time vs #Nodes",
                 filename_prefix="inference_time_vs_n_nodes",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3886,6 +3976,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 title_prefix="Inference Time vs #Edges",
                 filename_prefix="inference_time_vs_n_edges",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3954,6 +4045,7 @@ def generate_report_for_partition(
                 filename_prefix=f"{file_prefix}_{metric}_by_{file_suffix}",
                 title_prefix=f"{title_prefix} {_metric_label(metric)} by {title_suffix}",
                 category_order=category_order,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3969,6 +4061,7 @@ def generate_report_for_partition(
                 filename_prefix="cpd_time_by_target_category",
                 title_prefix="CPD Time by Target Category",
                 category_order=CPD_TARGET_CATEGORIES,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3981,6 +4074,7 @@ def generate_report_for_partition(
                 filename_prefix="cpd_time_by_evidence_strategy",
                 title_prefix="CPD Time by Evidence Strategy",
                 category_order=CPD_EVIDENCE_STRATEGIES,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -3994,6 +4088,7 @@ def generate_report_for_partition(
                 filename_prefix="inference_time_by_target_category",
                 title_prefix="Inference Time by Target Category",
                 category_order=INF_TARGET_CATEGORIES,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4006,6 +4101,7 @@ def generate_report_for_partition(
                 filename_prefix="inference_time_by_task",
                 title_prefix="Inference Time by Task",
                 category_order=INF_TASKS,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4018,6 +4114,7 @@ def generate_report_for_partition(
                 filename_prefix="inference_time_by_evidence_mode",
                 title_prefix="Inference Time by Evidence Mode",
                 category_order=INF_EVIDENCE_MODES,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4034,6 +4131,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 filename=f"{tag}_success_rate_vs_n_nodes.png",
                 title=f"{title_label} Success Rate vs #Nodes",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4049,6 +4147,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 filename=f"{tag}_success_rate_vs_n_edges.png",
                 title=f"{title_label} Success Rate vs #Edges",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4060,6 +4159,7 @@ def generate_report_for_partition(
             out_dir=figures_dir,
             filename="inference_success_rate_vs_evidence_size.png",
             title="Inference Success Rate vs Evidence Size",
+            cmap=cmap,
         )
         if fig:
             figures.append(fig)
@@ -4074,6 +4174,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 filename=f"inference_success_rate_vs_evidence_size__mode_{tag}.png",
                 title=f"Inference Success Rate vs Evidence Size (mode={mode})",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4089,6 +4190,7 @@ def generate_report_for_partition(
                 filename_prefix=f"{qtype}_success_rate_by_target_category",
                 title_prefix=f"{qtype.capitalize()} Success Rate by Target Category",
                 category_order=order,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4104,6 +4206,7 @@ def generate_report_for_partition(
                 filename_prefix=f"{qtype}_success_rate_by_evidence_strategy",
                 title_prefix=f"{qtype.capitalize()} Success Rate by Evidence Strategy",
                 category_order=order,
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4117,6 +4220,7 @@ def generate_report_for_partition(
             filename_prefix="inference_success_rate_by_task",
             title_prefix="Inference Success Rate by Task",
             category_order=INF_TASKS,
+            cmap=cmap,
         )
         if fig:
             figures.append(fig)
@@ -4130,6 +4234,7 @@ def generate_report_for_partition(
             filename_prefix="inference_success_rate_by_evidence_mode",
             title_prefix="Inference Success Rate by Evidence Mode",
             category_order=INF_EVIDENCE_MODES,
+            cmap=cmap,
         )
         if fig:
             figures.append(fig)
@@ -4146,6 +4251,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     filename=f"{tag}_coverage_vs_n_nodes.png",
                     title=f"{title_label} Coverage vs #Nodes",
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -4160,6 +4266,7 @@ def generate_report_for_partition(
                     out_dir=figures_dir,
                     filename=f"{tag}_coverage_vs_n_edges.png",
                     title=f"{title_label} Coverage vs #Edges",
+                    cmap=cmap,
                 )
                 if fig:
                     figures.append(fig)
@@ -4170,6 +4277,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 filename="inference_coverage_vs_evidence_size.png",
                 title="Inference Coverage vs Evidence Size",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4183,6 +4291,7 @@ def generate_report_for_partition(
                 out_dir=figures_dir,
                 filename=f"errors_by_type_{qtype}.png",
                 title=f"{qtype.capitalize()} Error Type Distribution",
+                cmap=cmap,
             )
             if fig:
                 figures.append(fig)
@@ -4209,6 +4318,7 @@ def _generate_partition_reports(
     mode_label: str,
     run_dir: Path,
     problem_id: str | None = None,
+    cmap: str = DEFAULT_REPORT_CMAP,
 ) -> pd.DataFrame:
     ensure_dir(out_dir)
     partition_sets, inventory_df = compute_partitions(
@@ -4242,6 +4352,7 @@ def _generate_partition_reports(
         include_coverage=False,
         allowed_query_types=allowed_query_types,
         methods_to_show=methods,
+        cmap=cmap,
     )
 
     _write_partition_inventory(
@@ -4286,6 +4397,7 @@ def _generate_partition_reports(
             include_coverage=True,
             allowed_query_types=allowed_query_types,
             methods_to_show=methods_to_show,
+            cmap=cmap,
         )
 
         if partition_type == "subset":
@@ -4395,6 +4507,12 @@ def main() -> None:
         help="Summary style for aggregate metrics (robust or mean)",
     )
     parser.add_argument(
+        "--cmap",
+        type=str,
+        default=DEFAULT_REPORT_CMAP,
+        help=f"Matplotlib colormap for benchmark figures (default: {DEFAULT_REPORT_CMAP})",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -4424,6 +4542,7 @@ def main() -> None:
     if bundle_path is not None:
         logging.info("Bundle dir=%s", bundle_path)
     logging.info("Summary style=%s", summary_style.name)
+    logging.info("Figure cmap=%s", args.cmap)
 
     model_filter = None
     if args.models:
@@ -4501,6 +4620,7 @@ def main() -> None:
         max_subsets=max_subsets,
         mode_label=mode_label,
         run_dir=run_dir,
+        cmap=args.cmap,
     )
 
     problem_ids = sorted(
@@ -4536,6 +4656,7 @@ def main() -> None:
                 mode_label=mode_label,
                 run_dir=run_dir,
                 problem_id=str(problem_id),
+                cmap=args.cmap,
             )
 
     problem_categories = sorted(
@@ -4578,6 +4699,7 @@ def main() -> None:
                 max_subsets=max_subsets,
                 mode_label=mode_label,
                 run_dir=run_dir,
+                cmap=args.cmap,
             )
 
     _write_root_report_index(

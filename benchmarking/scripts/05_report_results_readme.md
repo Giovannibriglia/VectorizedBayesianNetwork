@@ -7,7 +7,8 @@ This step summarizes a completed benchmark run by joining predictions with groun
 ```bash
 python -m benchmarking.scripts.05_report_results \
   --run_dir benchmarking/out/<generator>/benchmark_<mode>_<timestamp> \
-  --summary_style robust
+  --summary_style robust \
+  --cmap tab20
 ```
 
 Key flags:
@@ -17,6 +18,7 @@ Key flags:
 - `--gt_source` (default: `folder`): `embedded|folder|compute`.
 - `--gt_key` (default: `result.ground_truth.output.probs`).
 - `--summary_style` (default: `robust`): `robust` (IQM ± IQRStd) or `mean` (mean ± std).
+- `--cmap` (default: `tab20`): matplotlib colormap used for all generated figures.
 - `--include_time` / `--no-include_time`: include time tables/plots.
 - `--include_pareto` / `--no-include_pareto`: include Pareto plots.
 - `--pareto_split`: `none|mode|task|target_category`.
@@ -62,6 +64,8 @@ Category folders are derived from `benchmarking/metadata/<generator>.json` (for 
 - `mean`: mean ± std.
 
 The selected style affects aggregate tables and plot annotations.
+
+Figure colors are deterministic per label (method/error type) using the selected colormap, so colors stay consistent across benchmark figures.
 
 ## Notes
 
