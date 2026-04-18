@@ -26,6 +26,7 @@ def _package_version() -> str | None:
 
 def _require_numpyro():
     try:
+        import jax
         import jax.numpy as jnp
         from jax import random
         from numpyro import distributions as dist
@@ -34,7 +35,23 @@ def _require_numpyro():
             "numpyro is required for the numpyro benchmark model. "
             "Install it with 'pip install numpyro jax jaxlib'."
         ) from exc
-    return jnp, random, dist
+    return jnp, random, dist, jax
+
+
+def _resolve_jax_device(jax_mod):
+    if jax_mod is None:
+        return None
+    try:
+        gpu_devices = jax_mod.devices("gpu")
+    except Exception:
+        gpu_devices = []
+    if gpu_devices:
+        return gpu_devices[0]
+    try:
+        cpu_devices = jax_mod.devices("cpu")
+    except Exception:
+        cpu_devices = []
+    return cpu_devices[0] if cpu_devices else None
 
 
 def _extract_evidence(query: dict) -> dict:
@@ -195,7 +212,19 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
             benchmark_config=benchmark_config,
             **kwargs,
         )
-        self._jnp, self._jax_random, self._dist = _require_numpyro()
+        required_modules = _require_numpyro()
+        if len(required_modules) == 4:
+            self._jnp, self._jax_random, self._dist, self._jax = required_modules
+        else:  # pragma: no cover - backward compatibility for test doubles
+            self._jnp, self._jax_random, self._dist = required_modules
+            self._jax = None
+        self._jax_device = _resolve_jax_device(self._jax)
+        self.device = (
+            "cuda"
+            if self._jax_device is not None
+            and getattr(self._jax_device, "platform", "cpu") != "cpu"
+            else "cpu"
+        )
         self._topo = _sorted_nodes(dag)
         self._parents = {
             node: list(dag.predecessors(node)) if hasattr(dag, "predecessors") else []
@@ -205,6 +234,14 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
         self._cpds: dict[str, dict[tuple[int, ...], np.ndarray]] = {}
         self._default_probs: dict[str, np.ndarray] = {}
         self._fitted = False
+
+    def _device_put(self, value):
+        if self._jax is None or self._jax_device is None:
+            return value
+        try:
+            return self._jax.device_put(value, self._jax_device)
+        except Exception:
+            return value
 
     def supports(self) -> dict:
         return {
@@ -365,7 +402,7 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
         if overlap:
             raise ValueError("Nodes cannot be in both evidence and do")
 
-        rng_key = self._jax_random.PRNGKey(int(self.seed))
+        rng_key = self._device_put(self._jax_random.PRNGKey(int(self.seed)))
         target_k = int(self._k_by_node[target])
         target_vals = np.zeros(int(n_samples), dtype=int)
         logw = np.zeros(int(n_samples), dtype=float)
@@ -384,6 +421,7 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
                 parent_vals = {p: assignment[p] for p in self._parents.get(node, [])}
                 probs = self._cpd_probs_for(node, parent_vals)
                 probs_jax = self._jnp.asarray(probs, dtype=self._jnp.float32)
+                probs_jax = self._device_put(probs_jax)
                 dist = self._dist.Categorical(probs=probs_jax)
 
                 if node in local_evidence:
@@ -392,7 +430,7 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
                         raise ValueError(
                             f"evidence value out of range for '{node}': {val}"
                         )
-                    lp = float(dist.log_prob(self._jnp.asarray(val)))
+                    lp = float(dist.log_prob(self._device_put(self._jnp.asarray(val))))
                     if math.isfinite(lp):
                         logw[sample_idx] += lp
                     else:

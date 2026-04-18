@@ -20,6 +20,52 @@ This benchmarking suite compares VBN and other probabilistic graphical model lib
 
 ---
 
+## End-to-End Procedures (CPDs and Inference)
+
+If your environment does not expose `python`, replace `python` with `python3`.
+
+### CPDs benchmark
+
+```bash
+python -m benchmarking.scripts.01_download_data --generator bnlearn --mode cpds --seed 42 --bundle benchmark_cpds_local
+```
+```bash
+python -m benchmarking.scripts.02_generate_benchmark_queries --generator bnlearn --mode cpds --seed 42 --n_queries_cpds 1024 --bundle benchmark_cpds_local
+```
+```bash
+python -m benchmarking.scripts.03_generate_data --generator bnlearn --n_samples 9192 --seed 42 --bundle benchmark_cpds_local
+```
+```bash
+python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --mode cpds --bundle benchmark_cpds_local --batch_size_queries 256 --models vbn,pgmpy,numpyro,gpytorch,pyro
+```
+```bash
+CPDS_RUN_DIR=$(ls -td benchmarking/out/bnlearn/benchmark_cpds_* | head -n 1)
+
+python -m benchmarking.scripts.05_report_results --run_dir "$CPDS_RUN_DIR" --summary_style robust
+```
+
+### Inference benchmark
+
+```bash
+python -m benchmarking.scripts.01_download_data --generator bnlearn --mode inference --seed 42 --bundle benchmark_inference_local
+```
+```bash
+python -m benchmarking.scripts.02_generate_benchmark_queries --generator bnlearn --mode inference --seed 42 --n_queries_inference 5120 --generator-kwargs '{"n_mc": 256}' --bundle benchmark_inference_local
+```
+```bash
+python -m benchmarking.scripts.03_generate_data --generator bnlearn --n_samples 9192 --seed 42 --bundle benchmark_inference_local
+```
+```bash
+python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --mode inference --bundle benchmark_inference_local --batch_size_queries 256 --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,pgmpy:pgmpy_gaussian_exact,vbn:vbn_lg_rao,vbn:vbn_lg_exact,vbn:vbn_ct_ce,gpytorch:gpytorch_forward,gpytorch:gpytorch_posterior,pyro:pyro_lw,pyro:pyro_ais
+```
+```bash
+INFERENCE_RUN_DIR=$(ls -td benchmarking/out/bnlearn/benchmark_inference_* | head -n 1)
+
+python -m benchmarking.scripts.05_report_results --run_dir "$INFERENCE_RUN_DIR" --summary_style robust
+```
+
+---
+
 ## Benchmark Bundles (Authoritative Layout)
 
 Steps 01–03 create a **benchmark bundle** under `benchmarking/data/benchmarks/`. All datasets, queries, ground truth, and bundle metadata live in that folder.
@@ -51,7 +97,7 @@ Latest end-to-end run currently in this repository:
 - Run directory: `benchmarking/out/bnlearn/benchmark_inference_20260413_190932`
 - Networks: 31
 - Total queries: 286,720 inference queries
-- Models: `pgmpy:pgmpy_mle_ei`, `pgmpy:pgmpy_bdeu_ei`, `vbn:vbn_ex_gauss_rao`, `vbn:vbn_ex_gauss_exact`, `vbn:vbn_ct_ce`
+- Models: `pgmpy:pgmpy_mle_ei`, `pgmpy:pgmpy_bdeu_ei`, `vbn:vbn_lg_rao`, `vbn:vbn_lg_exact`, `vbn:vbn_ct_ce`
 
 Reproduce that exact flow:
 
@@ -81,7 +127,7 @@ python -m benchmarking.scripts.04_run_benchmark \
   --mode inference \
   --bundle benchmark_inference_20260407_125322 \
   --batch_size_queries 256 \
-  --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,vbn:vbn_ex_gauss_rao,vbn:vbn_ex_gauss_exact,vbn:vbn_ct_ce
+  --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,vbn:vbn_lg_rao,vbn:vbn_lg_exact,vbn:vbn_ct_ce
 
 python -m benchmarking.scripts.05_report_results \
   --run_dir benchmarking/out/bnlearn/benchmark_inference_20260413_190932 \

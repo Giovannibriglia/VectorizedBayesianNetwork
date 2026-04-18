@@ -35,6 +35,16 @@ def _require_gpytorch():
     return torch, gpytorch
 
 
+def _resolve_torch_device(torch_mod):
+    return torch_mod.device("cuda" if torch_mod.cuda.is_available() else "cpu")
+
+
+def _maybe_to_device(obj, device):
+    if hasattr(obj, "to"):
+        return obj.to(device)
+    return obj
+
+
 def _extract_evidence(query: dict) -> dict:
     values = query.get("evidence_values")
     if values is None:
@@ -323,6 +333,7 @@ class GpytorchBenchmarkModel(BaseBenchmarkModel):
         }
         self._torch = None
         self._gpytorch = None
+        self.device = None
         self._nodes: dict[str, dict[str, Any]] = {}
         self._fitted = False
 
@@ -341,7 +352,10 @@ class GpytorchBenchmarkModel(BaseBenchmarkModel):
         torch, gpytorch = _require_gpytorch()
         self._torch = torch
         self._gpytorch = gpytorch
+        self.device = _resolve_torch_device(torch)
         torch.manual_seed(int(self.seed))
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(int(self.seed))
 
         nodes_meta = _domain_nodes(self.domain)
         if not nodes_meta:
@@ -420,10 +434,11 @@ class GpytorchBenchmarkModel(BaseBenchmarkModel):
 
             x_train_np = (x_use - x_mean) / x_scale
             y_train_np = (y_use - y_mean) / y_scale
-            x_train = torch.tensor(x_train_np, dtype=torch.float32)
-            y_train = torch.tensor(y_train_np, dtype=torch.float32)
+            x_train = torch.tensor(x_train_np, dtype=torch.float32, device=self.device)
+            y_train = torch.tensor(y_train_np, dtype=torch.float32, device=self.device)
 
             likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            likelihood = _maybe_to_device(likelihood, self.device)
             try:
                 likelihood.noise_covar.noise = max(min_noise, 1e-8)
             except Exception:
@@ -436,6 +451,7 @@ class GpytorchBenchmarkModel(BaseBenchmarkModel):
                 likelihood,
                 kernel_name=kernel_name,
             )
+            model = _maybe_to_device(model, self.device)
             model.train()
             likelihood.train()
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -496,7 +512,9 @@ class GpytorchBenchmarkModel(BaseBenchmarkModel):
         parents = info["parents"]
         x_raw = np.asarray([float(parent_values[p]) for p in parents], dtype=float)
         x_std = (x_raw - info["x_mean"]) / info["x_scale"]
-        x_tensor = self._torch.tensor(x_std.reshape(1, -1), dtype=self._torch.float32)
+        x_tensor = self._torch.tensor(
+            x_std.reshape(1, -1), dtype=self._torch.float32, device=self.device
+        )
 
         model = info["model"]
         likelihood = info["likelihood"]

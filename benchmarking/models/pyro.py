@@ -39,6 +39,10 @@ def _require_pyro():
     return torch, pyro, dist
 
 
+def _resolve_torch_device(torch_mod):
+    return torch_mod.device("cuda" if torch_mod.cuda.is_available() else "cpu")
+
+
 def _extract_evidence(query: dict) -> dict:
     values = query.get("evidence_values")
     if values is None:
@@ -197,6 +201,7 @@ class PyroBenchmarkModel(BaseBenchmarkModel):
             **kwargs,
         )
         self._torch, self._pyro, self._dist = _require_pyro()
+        self.device = _resolve_torch_device(self._torch)
         self._pyro.set_rng_seed(int(self.seed))
         self._topo = _sorted_nodes(dag)
         self._parents = {
@@ -368,6 +373,8 @@ class PyroBenchmarkModel(BaseBenchmarkModel):
             raise ValueError("Nodes cannot be in both evidence and do")
 
         self._torch.manual_seed(int(self.seed))
+        if self.device.type == "cuda":
+            self._torch.cuda.manual_seed_all(int(self.seed))
         target_k = int(self._k_by_node[target])
         target_vals = np.zeros(int(n_samples), dtype=int)
         logw = np.zeros(int(n_samples), dtype=float)
@@ -385,7 +392,9 @@ class PyroBenchmarkModel(BaseBenchmarkModel):
 
                 parent_vals = {p: assignment[p] for p in self._parents.get(node, [])}
                 probs = self._cpd_probs_for(node, parent_vals)
-                probs_t = self._torch.tensor(probs, dtype=self._torch.float32)
+                probs_t = self._torch.tensor(
+                    probs, dtype=self._torch.float32, device=self.device
+                )
                 dist = self._dist.Categorical(probs=probs_t)
 
                 if node in local_evidence:
@@ -395,7 +404,9 @@ class PyroBenchmarkModel(BaseBenchmarkModel):
                             f"evidence value out of range for '{node}': {val}"
                         )
                     log_prob = dist.log_prob(
-                        self._torch.tensor(val, dtype=self._torch.int64)
+                        self._torch.tensor(
+                            val, dtype=self._torch.int64, device=self.device
+                        )
                     )
                     lp = float(log_prob.item())
                     if math.isfinite(lp):
