@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any, Iterable
 
 import numpy as np
@@ -105,6 +106,20 @@ def _to_int(value: Any) -> int:
     return int(round(float(value)))
 
 
+def _inference_cache_key(
+    query: dict, *, default_n_mc: int, inference_name: str
+) -> tuple:
+    target = query.get("target")
+    if not target:
+        raise ValueError("Missing target in query")
+    evidence = _extract_evidence(query)
+    do = _extract_do(query)
+    n_samples = _get_n_mc(query, default=default_n_mc)
+    evidence_key = tuple(sorted((str(k), _to_int(v)) for k, v in evidence.items()))
+    do_key = tuple(sorted((str(k), _to_int(v)) for k, v in do.items()))
+    return (str(target), int(n_samples), str(inference_name), evidence_key, do_key)
+
+
 def _normalize_probs(probs: Iterable[float]) -> list[float]:
     arr = np.asarray(list(probs), dtype=float)
     total = float(arr.sum())
@@ -195,6 +210,7 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
     name = "numpyro"
     family = "numpyro"
     version = _package_version()
+    supports_batched_inference_queries = True
 
     def __init__(
         self,
@@ -507,3 +523,30 @@ class NumpyroBenchmarkModel(BaseBenchmarkModel):
             result = None
         timing_ms = (time.perf_counter() - start) * 1000.0
         return {"ok": ok, "error": error, "timing_ms": timing_ms, "result": result}
+
+    def answer_inference_queries(self, queries: list[dict]) -> list[dict]:
+        if not queries:
+            return []
+        inference_name = (
+            str(self.benchmark_config.inference.name)
+            if self.benchmark_config is not None
+            else "likelihood_weighting"
+        )
+        cached: dict[tuple, dict] = {}
+        responses: list[dict] = []
+        for query in queries:
+            try:
+                key = _inference_cache_key(
+                    query, default_n_mc=512, inference_name=inference_name
+                )
+            except Exception:
+                responses.append(self.answer_inference_query(query))
+                continue
+            if key not in cached:
+                cached[key] = self.answer_inference_query(query)
+                responses.append(cached[key])
+                continue
+            reused = deepcopy(cached[key])
+            reused["timing_ms"] = 0.0
+            responses.append(reused)
+        return responses

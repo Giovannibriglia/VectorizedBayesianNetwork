@@ -56,7 +56,7 @@ python -m benchmarking.scripts.02_generate_benchmark_queries --generator bnlearn
 python -m benchmarking.scripts.03_generate_data --generator bnlearn --n_samples 9192 --seed 42 --bundle benchmark_inference_local
 ```
 ```bash
-python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --mode inference --bundle benchmark_inference_local --batch_size_queries 256 --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,pgmpy:pgmpy_gaussian_exact,vbn:vbn_lg_rao,vbn:vbn_lg_exact,vbn:vbn_ct_ce,gpytorch:gpytorch_forward,gpytorch:gpytorch_posterior,pyro:pyro_lw,pyro:pyro_ais
+python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --mode inference --bundle benchmark_inference_local --batch_size_queries 256 --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,pgmpy:pgmpy_gaussian_exact,vbn:vbn_lg_rao,vbn:vbn_lg_exact,vbn:vbn_ct_ce,pyro:pyro_lw,pyro:pyro_ais,numpyro:numpyro_lw,numpyro:numpyro_ais,gpytorch:gpytorch_forward,gpytorch:gpytorch_posterior
 ```
 ```bash
 INFERENCE_RUN_DIR=$(ls -td benchmarking/out/bnlearn/benchmark_inference_* | head -n 1)

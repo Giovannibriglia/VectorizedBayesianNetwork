@@ -154,3 +154,57 @@ def test_gpytorch_model_fit_and_queries(monkeypatch) -> None:
     assert inf_result["format"] == "categorical_probs"
     assert inf_result["k"] == 2
     assert abs(float(sum(inf_result["probs"])) - 1.0) < 1e-8
+
+
+def test_gpytorch_model_batch_inference_deduplicates(monkeypatch) -> None:
+    import benchmarking.models.gpytorch as module
+
+    fake_gpytorch = SimpleNamespace(
+        likelihoods=SimpleNamespace(GaussianLikelihood=_FakeLikelihood),
+        mlls=SimpleNamespace(ExactMarginalLogLikelihood=_FakeMll),
+        settings=_FakeSettings,
+    )
+    monkeypatch.setattr(module, "_require_gpytorch", lambda: (torch, fake_gpytorch))
+    monkeypatch.setattr(
+        module, "_make_exact_gp_model", lambda *args, **kwargs: _FakeModel()
+    )
+
+    domain = {
+        "nodes": {
+            "A": {"type": "discrete", "states": ["0", "1"]},
+            "B": {"type": "discrete", "states": ["0", "1"]},
+        }
+    }
+    data = pd.DataFrame(
+        {
+            "A": [0, 0, 1, 1, 0, 1, 0, 1],
+            "B": [0, 1, 1, 1, 0, 1, 0, 1],
+        }
+    )
+
+    model = GpytorchBenchmarkModel(
+        dag=_FakeDag(),
+        seed=0,
+        domain=domain,
+        benchmark_config=_config(),
+    )
+    model.fit(data)
+    assert model.supports_batched_inference_queries is True
+
+    calls = {"n": 0}
+    original = model._infer_distribution
+
+    def _wrapped(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_infer_distribution", _wrapped)
+    queries = [
+        {"target": "B", "evidence_values": {"A": 0}, "n_mc": 16},
+        {"target": "B", "evidence_values": {"A": 0}, "n_mc": 16},
+        {"target": "B", "evidence_values": {"A": 1}, "n_mc": 16},
+    ]
+    responses = model.answer_inference_queries(queries)
+    assert len(responses) == len(queries)
+    assert all(bool(r.get("ok")) for r in responses)
+    assert calls["n"] == 2
