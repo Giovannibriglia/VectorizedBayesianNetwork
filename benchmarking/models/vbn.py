@@ -145,6 +145,7 @@ def _build_nodes_cpds(
     cpd_name: str,
     cpd_kwargs: dict,
     *,
+    dag: Any | None = None,
     per_node: dict | None = None,
 ) -> dict:
     nodes_cpds: dict[str, dict] = {}
@@ -165,10 +166,35 @@ def _build_nodes_cpds(
         conf = {"cpd": method}
         if kwargs:
             conf.update(kwargs)
-        if node_type == "discrete" and method == "softmax_nn":
+        if node_type == "discrete" and method in {
+            "softmax_nn",
+            "categorical_table",
+            "categorical_embedded_softmax",
+        }:
             k = len(meta.get("states") or [])
-            if k > 0:
+            if k > 0 and "n_classes" not in conf:
                 conf["n_classes"] = k
+            if (
+                method in {"categorical_table", "categorical_embedded_softmax"}
+                and "parent_n_classes" not in conf
+                and dag is not None
+            ):
+                parent_n_classes: list[int] = []
+                if hasattr(dag, "predecessors"):
+                    parents = list(dag.predecessors(node))
+                elif hasattr(dag, "parents"):
+                    parents = list(dag.parents(node))
+                else:
+                    parents = []
+                for parent in parents:
+                    p_meta = nodes.get(parent, {})
+                    p_states = list(p_meta.get("states") or [])
+                    if p_meta.get("type") != "discrete" or not p_states:
+                        parent_n_classes = []
+                        break
+                    parent_n_classes.append(len(p_states))
+                if parent_n_classes:
+                    conf["parent_n_classes"] = parent_n_classes
         nodes_cpds[node] = conf
     return nodes_cpds
 
@@ -253,6 +279,7 @@ class VBNBenchmarkModel(BaseBenchmarkModel):
                     domain,
                     benchmark_config.cpd.name,
                     cpd_kwargs,
+                    dag=dag,
                     per_node=per_node,
                 )
             self._vbn.set_learning_method(

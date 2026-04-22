@@ -31,6 +31,7 @@ class CategoricalTableCPD(BaseCPD):
         device: torch.device,
         seed: Optional[int] = None,
         n_classes: int = 0,
+        parent_n_classes: Optional[list[int]] = None,
         alpha: float = 1.0,
         alpha_mode: str = "per_class",
         prior: str = "uniform",
@@ -39,6 +40,9 @@ class CategoricalTableCPD(BaseCPD):
             input_dim=input_dim, output_dim=output_dim, device=device, seed=seed
         )
         self.n_classes = int(n_classes)
+        self.parent_n_classes = (
+            [int(v) for v in parent_n_classes] if parent_n_classes is not None else None
+        )
         self.alpha = float(alpha)
         self.alpha_mode = str(alpha_mode).lower().strip()
         self.prior = str(prior).lower().strip()
@@ -64,6 +68,7 @@ class CategoricalTableCPD(BaseCPD):
     def get_init_kwargs(self) -> dict:
         return {
             "n_classes": self.n_classes,
+            "parent_n_classes": self.parent_n_classes,
             "alpha": self.alpha,
             "alpha_mode": self.alpha_mode,
             "prior": self.prior,
@@ -130,6 +135,34 @@ class CategoricalTableCPD(BaseCPD):
         return parents, x_flat
 
     def _infer_parent_support(self, parents: torch.Tensor) -> None:
+        if self.parent_n_classes is not None:
+            if len(self.parent_n_classes) != self.input_dim:
+                raise ValueError(
+                    f"parent_n_classes length {len(self.parent_n_classes)} does not "
+                    f"match input_dim {self.input_dim}."
+                )
+            parent_values = []
+            parent_cards = []
+            for d, card in enumerate(self.parent_n_classes):
+                if int(card) <= 0:
+                    raise ValueError(f"Invalid parent cardinality {card} at index {d}.")
+                support = torch.arange(
+                    int(card), device=self.device, dtype=parents.dtype
+                )
+                _map_values_to_indices(parents[:, d], support)
+                parent_values.append(support)
+                parent_cards.append(int(card))
+            strides = []
+            stride = 1
+            for card in reversed(parent_cards):
+                strides.append(stride)
+                stride *= card
+            strides = list(reversed(strides))
+            self._parent_values = parent_values
+            self._parent_cards = parent_cards
+            self._parent_strides = strides
+            return
+
         parent_values = []
         parent_cards = []
         for d in range(self.input_dim):
@@ -150,6 +183,22 @@ class CategoricalTableCPD(BaseCPD):
         self, x_flat: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n_classes = self.n_classes if self.n_classes > 0 else None
+        if n_classes is not None:
+            class_values = []
+            class_mask = []
+            for d in range(self.output_dim):
+                support = torch.arange(
+                    int(n_classes), device=self.device, dtype=x_flat.dtype
+                )
+                _map_values_to_indices(x_flat[:, d], support)
+                class_values.append(support)
+                class_mask.append(
+                    torch.ones(int(n_classes), device=self.device, dtype=torch.bool)
+                )
+            class_values_tensor = torch.stack(class_values, dim=0)
+            class_mask_tensor = torch.stack(class_mask, dim=0)
+            return class_values_tensor, class_mask_tensor
+
         class_values = []
         class_mask = []
         max_classes = 0

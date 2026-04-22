@@ -152,12 +152,14 @@ CPD_SCHEMAS = {
     },
     "categorical_table": {
         "n_classes": int,
+        "parent_n_classes": list_of(int),
         "alpha": float,
         "alpha_mode": lambda v, k: str(coerce_scalar(v)),
         "prior": lambda v, k: str(coerce_scalar(v)),
     },
     "categorical_embedded_softmax": {
         "n_classes": int,
+        "parent_n_classes": list_of(int),
         "embedding_dim": int,
         "hidden_dims": list_of(int),
         "label_smoothing": float,
