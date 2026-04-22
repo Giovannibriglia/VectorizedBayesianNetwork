@@ -464,6 +464,7 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
                 )
             self.state_map[node] = states
             df_states[node] = _map_codes_to_states(df_states[node], states, node)
+        state_names = {node: list(states) for node, states in self.state_map.items()}
 
         (
             BayesianNetwork,
@@ -479,11 +480,21 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
         df_states = df_states[model_nodes]
 
         if learning_name_norm == "mle":
-            estimator = MaximumLikelihoodEstimator(self._model, data=df_states)
+            try:
+                estimator = MaximumLikelihoodEstimator(
+                    self._model, data=df_states, state_names=state_names
+                )
+            except TypeError:
+                estimator = MaximumLikelihoodEstimator(self._model, data=df_states)
             cpds = estimator.get_parameters()
         elif learning_name_norm == "bdeu":
             ess = learning_kwargs.get("equivalent_sample_size", 10)
-            estimator = BayesianEstimator(self._model, data=df_states)
+            try:
+                estimator = BayesianEstimator(
+                    self._model, data=df_states, state_names=state_names
+                )
+            except TypeError:
+                estimator = BayesianEstimator(self._model, data=df_states)
             cpds = estimator.get_parameters(
                 prior_type="BDeu",
                 equivalent_sample_size=float(ess),
@@ -521,7 +532,10 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             raise NotImplementedError(
                 "pgmpy gaussian backend requires LinearGaussianBayesianNetwork.fit"
             )
-        lg.fit(data_df[nodes_list])
+        try:
+            lg.fit(data_df[nodes_list])
+        except NotImplementedError:
+            self._fit_gaussian_fallback(lg, data_df[nodes_list], nodes_list)
         self._lg_model = lg
         if hasattr(lg, "check_model") and not lg.check_model():
             raise ValueError("pgmpy LinearGaussianBayesianNetwork validation failed")
@@ -547,6 +561,54 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
         n_vars = len(self._lg_order)
         if mu.shape[0] != n_vars or cov.shape != (n_vars, n_vars):
             raise ValueError("Joint Gaussian mean/cov dimensions do not match nodes")
+
+    def _fit_gaussian_fallback(
+        self, lg_model: Any, data_df: pd.DataFrame, nodes_list: list[str]
+    ) -> None:
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            LinearGaussianCPD,
+        ) = _require_pgmpy()
+        if LinearGaussianCPD is None:
+            raise NotImplementedError(
+                "pgmpy gaussian fallback requires LinearGaussianCPD"
+            )
+
+        graph = self._nx_graph()
+        cpds = []
+        for node in nodes_list:
+            parents = list(graph.predecessors(node))
+            y = np.asarray(data_df[node], dtype=float).reshape(-1)
+            if parents:
+                parent_cols = [
+                    np.asarray(data_df[parent], dtype=float).reshape(-1)
+                    for parent in parents
+                ]
+                x_design = np.column_stack(
+                    [np.ones(y.shape[0], dtype=float), *parent_cols]
+                )
+            else:
+                x_design = np.ones((y.shape[0], 1), dtype=float)
+
+            beta, *_ = np.linalg.lstsq(x_design, y, rcond=None)
+            residuals = y - x_design @ beta
+            dof = max(1, int(y.shape[0] - x_design.shape[1]))
+            variance = float(np.dot(residuals, residuals) / dof)
+            std = math.sqrt(max(variance, 1e-12))
+            cpds.append(
+                LinearGaussianCPD(
+                    variable=node,
+                    beta=np.asarray(beta, dtype=float),
+                    std=std,
+                    evidence=parents,
+                )
+            )
+
+        lg_model.add_cpds(*cpds)
 
     def _coerce_continuous_output_for_target(
         self, *, target: str, result: dict
@@ -769,6 +831,16 @@ class PgmpyBenchmarkModel(BaseBenchmarkModel):
             if var not in self.state_map:
                 raise ValueError(f"Unknown evidence variable '{var}'")
             states = self.state_map[var]
+            if isinstance(value, str):
+                if value in states:
+                    mapped[var] = value
+                    continue
+                lookup = {str(state).lower(): state for state in states}
+                resolved = lookup.get(value.lower())
+                if resolved is None:
+                    raise ValueError(f"Evidence state '{value}' not found for '{var}'")
+                mapped[var] = resolved
+                continue
             idx = _to_int(value)
             if idx < 0 or idx >= len(states):
                 raise ValueError(f"Evidence code out of range for '{var}': {idx}")

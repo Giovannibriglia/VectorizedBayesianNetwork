@@ -138,3 +138,29 @@ def test_linear_gaussian_fit_and_sample():
     sample_mean = samples.mean(dim=1)
     pred_mean = parents_small @ cpd._weight + cpd._bias
     assert torch.allclose(sample_mean, pred_mean, atol=0.2, rtol=0.2)
+
+
+def test_categorical_table_declared_support_handles_unseen_values():
+    device = torch.device("cpu")
+    cpd = CPD_REGISTRY["categorical_table"](
+        input_dim=1,
+        output_dim=1,
+        device=device,
+        n_classes=4,
+        parent_n_classes=[4],
+        alpha=1.0,
+    )
+    parents = torch.tensor([[0], [0], [1], [1], [2], [2]], device=device).float()
+    x = torch.tensor([[0], [1], [0], [1], [2], [2]], device=device).float()
+    cpd.fit(parents, x)
+
+    unseen_parent = torch.tensor([[3]], device=device).float()
+    unseen_target = torch.tensor([[3]], device=device).float()
+    log_prob = cpd.log_prob(unseen_target, unseen_parent)
+    assert torch.isfinite(log_prob).all()
+
+    samples = cpd.sample(unseen_parent, n_samples=16)
+    assert samples.shape == (1, 16, 1)
+    assert torch.isin(
+        samples.flatten(), torch.tensor([0.0, 1.0, 2.0, 3.0], device=device)
+    ).all()
