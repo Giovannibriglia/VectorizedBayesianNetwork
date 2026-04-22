@@ -60,7 +60,8 @@ python -m benchmarking.scripts.04_run_benchmark --generator bnlearn --seed 42 --
 ```
 ```bash
 INFERENCE_RUN_DIR=$(ls -td benchmarking/out/bnlearn/benchmark_inference_* | head -n 1)
-
+```
+```bash
 python -m benchmarking.scripts.05_report_results --run_dir "$INFERENCE_RUN_DIR" --summary_style robust --cmap tab20
 ```
 
@@ -86,54 +87,6 @@ benchmarking/data/benchmarks/benchmark_<mode>_<timestamp>/
 ```
 
 `mode` is `cpds` or `inference`. The bundle metadata records generator, seeds, dataset selection, query/data generation parameters, and paths to artifacts.
-
----
-
-## Last Validated Usage (2026-04-13, Inference)
-
-Latest end-to-end run currently in this repository:
-
-- Bundle: `benchmark_inference_20260407_125322`
-- Run directory: `benchmarking/out/bnlearn/benchmark_inference_20260413_190932`
-- Networks: 31
-- Total queries: 286,720 inference queries
-- Models: `pgmpy:pgmpy_mle_ei`, `pgmpy:pgmpy_bdeu_ei`, `vbn:vbn_lg_rao`, `vbn:vbn_lg_exact`, `vbn:vbn_ct_ce`
-
-Reproduce that exact flow:
-
-```bash
-python -m benchmarking.scripts.01_download_data \
-  --generator bnlearn \
-  --mode inference \
-  --seed 42
-
-python -m benchmarking.scripts.02_generate_benchmark_queries \
-  --generator bnlearn \
-  --mode inference \
-  --seed 42 \
-  --n_queries_inference 10240 \
-  --generator-kwargs '{"n_mc": 256}' \
-  --bundle benchmark_inference_20260407_125322
-
-python -m benchmarking.scripts.03_generate_data \
-  --generator bnlearn \
-  --n_samples 4096 \
-  --seed 42 \
-  --bundle benchmark_inference_20260407_125322
-
-python -m benchmarking.scripts.04_run_benchmark \
-  --generator bnlearn \
-  --seed 42 \
-  --mode inference \
-  --bundle benchmark_inference_20260407_125322 \
-  --batch_size_queries 256 \
-  --models pgmpy:pgmpy_mle_ei,pgmpy:pgmpy_bdeu_ei,vbn:vbn_lg_rao,vbn:vbn_lg_exact,vbn:vbn_ct_ce
-
-python -m benchmarking.scripts.05_report_results \
-  --run_dir benchmarking/out/bnlearn/benchmark_inference_20260413_190932 \
-  --summary_style robust \
-  --cmap tab20
-```
 
 ---
 
@@ -170,7 +123,6 @@ python -m benchmarking.scripts.02_generate_benchmark_queries \
   --mode cpds \
   --seed 42 \
   --n_queries_cpds 1024 \
-  --generator-kwargs '{"n_mc": 1}' \
   --bundle benchmark_cpds_YYYYMMDD_HHMMSS
 ```
 
