@@ -1205,12 +1205,12 @@ def _as_named_list(obj: Any) -> Dict[str, Any]:
                 return dict(zip(names, value))
             return {str(i): v for i, v in enumerate(value)}
     if isinstance(obj, dict):
-        if "type" in obj and obj.get("type") in {"list", "pairlist"}:
+        if "type" in obj and obj.get("type") in {"list", "pairlist", "vector"}:
             data = obj.get("data") or []
             names = _as_str_list(_r_attr(obj, "names"))
             if isinstance(data, dict):
                 return {str(k): v for k, v in data.items()}
-            if names and len(names) == len(data):
+            if names and isinstance(data, (list, tuple)) and len(names) == len(data):
                 return dict(zip(names, data))
             return {str(i): v for i, v in enumerate(data)}
         return {str(k): v for k, v in obj.items()}
@@ -1238,10 +1238,10 @@ def _r_list_get(obj: Any, key: str) -> Any:
                     return None
                 return value[idx]
     if isinstance(obj, dict):
-        if "type" in obj and obj.get("type") in {"list", "pairlist"}:
+        if "type" in obj and obj.get("type") in {"list", "pairlist", "vector"}:
             data = obj.get("data") or []
             names = _as_str_list(_r_attr(obj, "names"))
-            if names and len(names) == len(data):
+            if names and isinstance(data, (list, tuple)) and len(names) == len(data):
                 try:
                     idx = names.index(key)
                 except ValueError:
@@ -1320,7 +1320,8 @@ def _as_list(obj: Any) -> List[Any]:
     if isinstance(obj, np.ndarray):
         return obj.reshape(-1).tolist()
     if isinstance(obj, dict):
-        if "type" in obj and obj.get("type") in {"character", "integer", "double"}:
+        rtype = str(obj.get("type") or "").lower()
+        if rtype in {"character", "integer", "double", "string", "logical"}:
             data = obj.get("data")
             if isinstance(data, list):
                 return data
@@ -1339,7 +1340,7 @@ def _as_list(obj: Any) -> List[Any]:
                     except Exception:
                         continue
                 return out
-        if "data" in obj and obj.get("type") in {"list", "pairlist"}:
+        if "data" in obj and obj.get("type") in {"list", "pairlist", "vector"}:
             data = obj.get("data")
             if isinstance(data, list):
                 return data
@@ -1383,6 +1384,12 @@ def _as_array_with_dimnames(
 ) -> tuple[np.ndarray | None, List[List[str]] | None]:
     if obj is None:
         return None, None
+    if _is_xarray_dataarray(obj):
+        try:
+            arr = np.asarray(obj.to_numpy(), dtype=float)
+        except Exception:
+            arr = np.asarray(getattr(obj, "values"), dtype=float)
+        return arr, _xarray_dimnames(obj)
     value = _r_value(obj)
     if value is not None and value is not obj:
         if isinstance(value, np.ndarray):
@@ -1459,6 +1466,13 @@ def _normalize_dimnames(dimnames: Any) -> List[List[str]] | None:
 def _as_named_vector(obj: Any) -> tuple[np.ndarray | None, List[str] | None]:
     if obj is None:
         return None, None
+    if _is_xarray_dataarray(obj):
+        arr = np.asarray(obj.to_numpy(), dtype=float).reshape(-1)
+        dimnames = _xarray_dimnames(obj)
+        names = None
+        if dimnames and len(dimnames) >= 1 and len(dimnames[0]) == arr.size:
+            names = dimnames[0]
+        return arr, names
     value = _r_value(obj)
     if value is not None and value is not obj:
         if isinstance(value, np.ndarray):
@@ -1491,4 +1505,45 @@ def _as_list_of_str_lists(obj: Any) -> List[List[str]]:
     out: List[List[str]] = []
     for entry in values:
         out.append([str(v) for v in _as_list(entry)])
+    return out
+
+
+def _is_xarray_dataarray(obj: Any) -> bool:
+    mod = type(obj).__module__
+    return (
+        mod.startswith("xarray") and hasattr(obj, "to_numpy") and hasattr(obj, "dims")
+    )
+
+
+def _xarray_dimnames(obj: Any) -> List[List[str]] | None:
+    try:
+        dims = list(getattr(obj, "dims", []))
+    except Exception:
+        return None
+    if not dims:
+        return None
+    try:
+        shape = tuple(getattr(obj, "shape", ()))
+    except Exception:
+        shape = tuple()
+    try:
+        coords = getattr(obj, "coords", {})
+    except Exception:
+        coords = {}
+
+    out: List[List[str]] = []
+    for idx, dim in enumerate(dims):
+        labels: List[str] | None = None
+        try:
+            if dim in coords:
+                coord = coords[dim]
+                coord_vals = getattr(coord, "values", coord)
+                labels = [str(v) for v in np.asarray(coord_vals).reshape(-1).tolist()]
+        except Exception:
+            labels = None
+        if labels is None:
+            if idx >= len(shape):
+                return None
+            labels = [str(i) for i in range(int(shape[idx]))]
+        out.append(labels)
     return out

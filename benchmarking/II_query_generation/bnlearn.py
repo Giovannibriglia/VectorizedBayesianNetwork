@@ -1565,6 +1565,7 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
             name="download.json",
         )
         download_meta: dict = {}
+        stale_capability_reason: str | None = None
         if download_meta_path.exists():
             try:
                 download_meta = read_json(download_meta_path)
@@ -1575,9 +1576,13 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
                 download_meta = {}
             capabilities = download_meta.get("capabilities", {})
             if not capabilities.get("can_generate_queries", True):
-                reason = download_meta.get("reason") or "unsupported dataset format"
-                logger.warning("Skipping %s: %s", dataset_id, reason)
-                return None
+                stale_capability_reason = (
+                    download_meta.get("reason") or "unsupported dataset format"
+                )
+                logger.info(
+                    "Metadata marks %s as non-queryable; attempting best-effort parse from local artifacts.",
+                    dataset_id,
+                )
 
         dataset_type = self._resolve_dataset_type(dataset_id, download_meta)
 
@@ -1632,6 +1637,12 @@ class BNLearnQueryGenerator(BaseQueryGenerator):
         use_bnfit = bnfit_model is not None and (needs_bnfit or bif_path is None)
         if not use_bnfit:
             bnfit_model = None
+        if stale_capability_reason and (use_bnfit or bif_path is not None):
+            logger.info(
+                "Proceeding with %s despite stale capability flag: %s",
+                dataset_id,
+                stale_capability_reason,
+            )
 
         if not nodes:
             origin = "bn.fit" if bnfit_model is not None else "BIF"
